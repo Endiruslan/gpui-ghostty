@@ -175,11 +175,28 @@ pub mod view {
 
     actions!(terminal_view, [Copy, Paste]);
 
+    pub struct TerminalInput {
+        send: Box<dyn Fn(&[u8]) + Send + Sync + 'static>,
+    }
+
+    impl TerminalInput {
+        pub fn new(send: impl Fn(&[u8]) + Send + Sync + 'static) -> Self {
+            Self {
+                send: Box::new(send),
+            }
+        }
+
+        pub fn send(&self, bytes: &[u8]) {
+            (self.send)(bytes);
+        }
+    }
+
     pub struct TerminalView {
         session: TerminalSession,
         viewport: String,
         focus_handle: FocusHandle,
         last_window_title: Option<String>,
+        input: Option<TerminalInput>,
     }
 
     impl TerminalView {
@@ -189,6 +206,22 @@ pub mod view {
                 viewport: String::new(),
                 focus_handle,
                 last_window_title: None,
+                input: None,
+            }
+            .with_refreshed_viewport()
+        }
+
+        pub fn new_with_input(
+            session: TerminalSession,
+            focus_handle: FocusHandle,
+            input: TerminalInput,
+        ) -> Self {
+            Self {
+                session,
+                viewport: String::new(),
+                focus_handle,
+                last_window_title: None,
+                input: Some(input),
             }
             .with_refreshed_viewport()
         }
@@ -208,10 +241,28 @@ pub mod view {
             }
         }
 
+        pub fn feed_output_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+            let _ = self.session.feed(bytes);
+            self.refresh_viewport();
+            self.apply_side_effects(cx);
+            cx.notify();
+        }
+
         fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
             let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
                 return;
             };
+
+            if let Some(input) = self.input.as_ref() {
+                if self.session.bracketed_paste_enabled() {
+                    input.send(b"\x1b[200~");
+                    input.send(text.as_bytes());
+                    input.send(b"\x1b[201~");
+                } else {
+                    input.send(text.as_bytes());
+                }
+                return;
+            }
 
             if self.session.bracketed_paste_enabled() {
                 let _ = self.session.feed(b"\x1b[200~");
@@ -247,10 +298,34 @@ pub mod view {
             let keystroke = event.keystroke.clone().with_simulated_ime();
 
             if keystroke.modifiers.platform
-                || keystroke.modifiers.control
                 || keystroke.modifiers.alt
                 || keystroke.modifiers.function
             {
+                return;
+            }
+
+            if keystroke.modifiers.control {
+                if let Some(text) = keystroke.key_char.as_deref() {
+                    let bytes = text.as_bytes();
+                    if bytes.len() == 1 {
+                        let b = bytes[0];
+                        let b = match b {
+                            b'a'..=b'z' => b - b'a' + 1,
+                            b'A'..=b'Z' => b - b'A' + 1,
+                            _ => return,
+                        };
+
+                        if let Some(input) = self.input.as_ref() {
+                            input.send(&[b]);
+                            return;
+                        }
+
+                        let _ = self.session.feed(&[b]);
+                        self.refresh_viewport();
+                        self.apply_side_effects(cx);
+                        cx.notify();
+                    }
+                }
                 return;
             }
 
@@ -270,10 +345,26 @@ pub mod view {
                     cx.notify();
                     return;
                 }
+                "enter" => {
+                    if let Some(input) = self.input.as_ref() {
+                        input.send(b"\r");
+                        return;
+                    }
+                }
+                "tab" => {
+                    if let Some(input) = self.input.as_ref() {
+                        input.send(b"\t");
+                        return;
+                    }
+                }
                 _ => {}
             }
 
             if let Some(text) = keystroke.key_char.as_deref() {
+                if let Some(input) = self.input.as_ref() {
+                    input.send(text.as_bytes());
+                    return;
+                }
                 let _ = self.session.feed(text.as_bytes());
                 self.refresh_viewport();
                 self.apply_side_effects(cx);
@@ -282,6 +373,10 @@ pub mod view {
             }
 
             if keystroke.key == "backspace" {
+                if let Some(input) = self.input.as_ref() {
+                    input.send(&[0x08]);
+                    return;
+                }
                 let _ = self.session.feed(&[0x08]);
                 self.refresh_viewport();
                 self.apply_side_effects(cx);
