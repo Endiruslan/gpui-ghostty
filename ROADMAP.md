@@ -77,6 +77,11 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Track OSC window title updates (`OSC 0` / `OSC 2`) from output bytes.
 - [x] Apply the tracked title to the GPUI window title.
 
+### M2.2: OSC Clipboard (Minimal)
+
+- [x] Track `OSC 52` clipboard updates from output bytes.
+- [x] Decode Base64 payload and write to the system clipboard.
+
 ## User Work
 
 - [x] Cleanup features: make gpui and Zig build required.
@@ -85,6 +90,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Do not proactively add new `User Work` items (documented in `AGENTS.md`).
 - [x] Always load and follow the latest user instructions (documented in `AGENTS.md`).
 - [x] Fix `basic_terminal` rendering when text is not visible (avoid black-on-black).
+- [ ] Ask agents to do refactors while needed to make sure this projects can be well-maintained, write this requirement in AGENTS.md
 
 ## Future Work
 

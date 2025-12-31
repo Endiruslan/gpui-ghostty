@@ -17,6 +17,7 @@ pub struct TerminalSession {
     terminal: Terminal,
     bracketed_paste_enabled: bool,
     title: Option<String>,
+    clipboard_write: Option<String>,
     parse_tail: Vec<u8>,
 }
 
@@ -27,6 +28,7 @@ impl TerminalSession {
             terminal: Terminal::new(config.cols, config.rows)?,
             bracketed_paste_enabled: false,
             title: None,
+            clipboard_write: None,
             parse_tail: Vec::new(),
         })
     }
@@ -45,6 +47,10 @@ impl TerminalSession {
 
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    pub fn take_clipboard_write(&mut self) -> Option<String> {
+        self.clipboard_write.take()
     }
 
     fn update_state_from_output(&mut self, bytes: &[u8]) {
@@ -78,6 +84,7 @@ impl TerminalSession {
         }
 
         let mut last_title: Option<String> = None;
+        let mut last_clipboard: Option<String> = None;
         let mut j = 0usize;
         while j + 1 < buf.len() {
             if buf[j] != 0x1b || buf[j + 1] != b']' {
@@ -114,6 +121,8 @@ impl TerminalSession {
                         if ps == 0 || ps == 2 {
                             last_title =
                                 Some(String::from_utf8_lossy(&buf[title_start..k]).into_owned());
+                        } else if ps == 52 {
+                            last_clipboard = decode_osc_52(&buf[title_start..k]);
                         }
                         k += 1;
                         break;
@@ -122,6 +131,8 @@ impl TerminalSession {
                         if ps == 0 || ps == 2 {
                             last_title =
                                 Some(String::from_utf8_lossy(&buf[title_start..k]).into_owned());
+                        } else if ps == 52 {
+                            last_clipboard = decode_osc_52(&buf[title_start..k]);
                         }
                         k += 2;
                         break;
@@ -135,6 +146,9 @@ impl TerminalSession {
 
         if let Some(title) = last_title {
             self.title = Some(title);
+        }
+        if let Some(clipboard) = last_clipboard {
+            self.clipboard_write = Some(clipboard);
         }
     }
 
@@ -188,6 +202,12 @@ pub mod view {
             self.viewport = self.session.dump_viewport().unwrap_or_default();
         }
 
+        fn apply_side_effects(&mut self, cx: &mut Context<Self>) {
+            if let Some(text) = self.session.take_clipboard_write() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        }
+
         fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
             let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
                 return;
@@ -201,6 +221,7 @@ pub mod view {
                 let _ = self.session.feed(text.as_bytes());
             }
             self.refresh_viewport();
+            self.apply_side_effects(cx);
             cx.notify();
         }
 
@@ -238,12 +259,14 @@ pub mod view {
                 "pageup" | "page_up" | "page-up" => {
                     let _ = self.session.scroll_viewport(-scroll_step);
                     self.refresh_viewport();
+                    self.apply_side_effects(cx);
                     cx.notify();
                     return;
                 }
                 "pagedown" | "page_down" | "page-down" => {
                     let _ = self.session.scroll_viewport(scroll_step);
                     self.refresh_viewport();
+                    self.apply_side_effects(cx);
                     cx.notify();
                     return;
                 }
@@ -253,6 +276,7 @@ pub mod view {
             if let Some(text) = keystroke.key_char.as_deref() {
                 let _ = self.session.feed(text.as_bytes());
                 self.refresh_viewport();
+                self.apply_side_effects(cx);
                 cx.notify();
                 return;
             }
@@ -260,6 +284,7 @@ pub mod view {
             if keystroke.key == "backspace" {
                 let _ = self.session.feed(&[0x08]);
                 self.refresh_viewport();
+                self.apply_side_effects(cx);
                 cx.notify();
             }
         }
@@ -282,6 +307,7 @@ pub mod view {
 
             let _ = self.session.scroll_viewport(delta_lines);
             self.refresh_viewport();
+            self.apply_side_effects(cx);
             cx.notify();
         }
     }
@@ -314,4 +340,23 @@ pub mod view {
                 .child(self.viewport.clone())
         }
     }
+}
+
+fn decode_osc_52(payload: &[u8]) -> Option<String> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+
+    let mut split = payload.splitn(2, |b| *b == b';');
+    let selection = split.next()?;
+    let data = split.next()?;
+
+    if !selection.iter().any(|b| *b == b'c') {
+        return None;
+    }
+    if data.is_empty() {
+        return None;
+    }
+
+    let decoded = STANDARD.decode(data).ok()?;
+    Some(String::from_utf8_lossy(&decoded).into_owned())
 }
