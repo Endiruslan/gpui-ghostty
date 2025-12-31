@@ -90,7 +90,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Do not proactively add new `User Work` items (documented in `AGENTS.md`).
 - [x] Always load and follow the latest user instructions (documented in `AGENTS.md`).
 - [x] Fix `basic_terminal` rendering when text is not visible (avoid black-on-black).
-- [ ] Ask agents to do refactors while needed to make sure this projects can be well-maintained, write this requirement in AGENTS.md
+- [x] Ask agents to do refactors while needed to make sure this projects can be well-maintained (documented in `AGENTS.md`).
 
 ## Future Work
 

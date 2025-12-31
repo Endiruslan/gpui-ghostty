@@ -16,6 +16,7 @@
 
 - Keep scope tight: implement only what is explicitly required for the current `ROADMAP.md` scope.
 - Prefer small, reviewable patches.
+- Do refactors when needed to keep the project maintainable.
 - Provide clear verification steps (commands + expected outcomes).
 - Do not claim to have executed commands unless the execution is visible in the tool logs.
 
