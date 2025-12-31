@@ -186,7 +186,7 @@ pub mod view {
         MouseDownEvent, Render, ScrollDelta, ScrollWheelEvent, Window, actions, div, prelude::*,
     };
 
-    actions!(terminal_view, [Copy, Paste]);
+    actions!(terminal_view, [Copy, Paste, SelectAll]);
 
     pub struct TerminalInput {
         send: Box<dyn Fn(&[u8]) + Send + Sync + 'static>,
@@ -335,7 +335,14 @@ pub mod view {
         }
 
         fn on_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.viewport.clone()));
+            let item = ClipboardItem::new_string(self.viewport.clone());
+            cx.write_to_clipboard(item.clone());
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            cx.write_to_primary(item);
+        }
+
+        fn on_select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
+            self.on_copy(&Copy, window, cx);
         }
 
         fn on_mouse_down(
@@ -641,6 +648,7 @@ pub mod view {
                 .flex()
                 .track_focus(&self.focus_handle)
                 .on_action(cx.listener(Self::on_copy))
+                .on_action(cx.listener(Self::on_select_all))
                 .on_action(cx.listener(Self::on_paste))
                 .on_key_down(cx.listener(Self::on_key_down))
                 .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))

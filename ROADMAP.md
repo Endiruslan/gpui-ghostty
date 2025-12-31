@@ -31,6 +31,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M3.2: Output Backpressure (bound pending buffer)
 - [x] M4.1: PTY Login Shell Example
 - [x] M4.2: PTY Resize (bounds observer)
+- [x] M1.6: Select All + Primary Selection (cmd-a)
 
 ## User Work
 

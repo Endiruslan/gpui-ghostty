@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use gpui::{App, AppContext, Application, KeyBinding, WindowOptions};
-use gpui_ghostty_terminal::view::{Copy, Paste, TerminalInput, TerminalView};
+use gpui_ghostty_terminal::view::{Copy, Paste, SelectAll, TerminalInput, TerminalView};
 use gpui_ghostty_terminal::{TerminalConfig, TerminalSession};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use std::sync::Arc;
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
+            KeyBinding::new("cmd-a", SelectAll, None),
             KeyBinding::new("cmd-c", Copy, None),
             KeyBinding::new("cmd-v", Paste, None),
         ]);
