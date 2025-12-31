@@ -9,7 +9,10 @@ fn main() {
         .expect("ghostty_vt_sys must live under crates/*");
 
     let ghostty_dir = workspace_root.join("vendor/ghostty");
-    println!("cargo:rerun-if-changed={}", ghostty_dir.join("build.zig.zon").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        ghostty_dir.join("build.zig.zon").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir.join("include/ghostty_vt.h").display()
@@ -57,7 +60,10 @@ to install Zig 0.14.1 into .context/zig/zig"
         panic!("zig build failed");
     }
 
-    println!("cargo:rustc-link-search=native={}", prefix.join("lib").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        prefix.join("lib").display()
+    );
     println!("cargo:rustc-link-lib=static=ghostty_vt");
     println!("cargo:rustc-link-lib=c");
 }

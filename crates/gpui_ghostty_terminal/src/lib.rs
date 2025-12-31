@@ -30,11 +30,18 @@ impl TerminalSession {
     pub fn dump_viewport(&self) -> Result<String, Error> {
         self.terminal.dump_viewport()
     }
+
+    pub fn scroll_viewport(&mut self, delta_lines: i32) -> Result<(), Error> {
+        self.terminal.scroll_viewport(delta_lines)
+    }
 }
 
 pub mod view {
     use super::TerminalSession;
-    use gpui::{div, prelude::*, Context, FocusHandle, IntoElement, KeyDownEvent, Render, Window};
+    use gpui::{
+        div, prelude::*, Context, FocusHandle, IntoElement, KeyDownEvent, Render, ScrollDelta,
+        ScrollWheelEvent, Window,
+    };
 
     pub struct TerminalView {
         session: TerminalSession,
@@ -79,6 +86,26 @@ pub mod view {
                 cx.notify();
             }
         }
+
+        fn on_scroll_wheel(
+            &mut self,
+            event: &ScrollWheelEvent,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            let dy_lines: f32 = match event.delta {
+                ScrollDelta::Lines(p) => p.y,
+                ScrollDelta::Pixels(p) => f32::from(p.y) / 16.0,
+            };
+
+            let delta_lines = (-dy_lines).round() as i32;
+            if delta_lines == 0 {
+                return;
+            }
+
+            let _ = self.session.scroll_viewport(delta_lines);
+            cx.notify();
+        }
     }
 
     impl Render for TerminalView {
@@ -90,6 +117,7 @@ pub mod view {
                 .flex()
                 .track_focus(&self.focus_handle)
                 .on_key_down(cx.listener(Self::on_key_down))
+                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                 .font_family("monospace")
                 .whitespace_nowrap()
                 .child(self.viewport.clone())

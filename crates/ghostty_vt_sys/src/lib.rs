@@ -17,6 +17,11 @@ extern "C" {
         len: usize,
     ) -> core::ffi::c_int;
 
+    pub fn ghostty_vt_terminal_scroll_viewport(
+        terminal: *mut core::ffi::c_void,
+        delta_lines: i32,
+    ) -> core::ffi::c_int;
+
     pub fn ghostty_vt_terminal_dump_viewport(
         terminal: *mut core::ffi::c_void,
     ) -> ghostty_vt_bytes_t;

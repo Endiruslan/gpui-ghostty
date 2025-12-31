@@ -9,4 +9,3 @@ fn viewport_dump_contains_text() {
     assert!(s.contains("world"));
     assert!(s.contains("red"));
 }
-

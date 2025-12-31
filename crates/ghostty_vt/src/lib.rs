@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 pub enum Error {
     CreateFailed,
     FeedFailed(i32),
+    ScrollFailed(i32),
     DumpFailed,
 }
 
@@ -14,6 +15,7 @@ impl fmt::Display for Error {
         match self {
             Error::CreateFailed => write!(f, "terminal create failed"),
             Error::FeedFailed(code) => write!(f, "terminal feed failed: {code}"),
+            Error::ScrollFailed(code) => write!(f, "terminal scroll failed: {code}"),
             Error::DumpFailed => write!(f, "terminal dump failed"),
         }
     }
@@ -53,6 +55,17 @@ impl Terminal {
         let s = String::from_utf8_lossy(slice).into_owned();
         unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
         Ok(s)
+    }
+
+    pub fn scroll_viewport(&mut self, delta_lines: i32) -> Result<(), Error> {
+        let rc = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_scroll_viewport(self.ptr.as_ptr(), delta_lines)
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error::ScrollFailed(rc))
+        }
     }
 }
 

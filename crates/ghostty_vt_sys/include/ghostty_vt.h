@@ -22,6 +22,8 @@ int ghostty_vt_terminal_feed(ghostty_vt_terminal_t terminal,
                              const uint8_t* bytes,
                              size_t len);
 
+int ghostty_vt_terminal_scroll_viewport(ghostty_vt_terminal_t terminal, int32_t delta_lines);
+
 ghostty_vt_bytes_t ghostty_vt_terminal_dump_viewport(ghostty_vt_terminal_t terminal);
 void ghostty_vt_bytes_free(ghostty_vt_bytes_t bytes);
 
@@ -30,4 +32,3 @@ void ghostty_vt_bytes_free(ghostty_vt_bytes_t bytes);
 #endif
 
 #endif /* GHOSTTY_VT_H */
-

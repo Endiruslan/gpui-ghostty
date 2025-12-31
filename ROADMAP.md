@@ -14,7 +14,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - GPUI is consumed from Zed via git dependency pinned to commit `6016d0b8c6a22e586158d3b6f810b3cebb136118`.
 - Public API surface stays minimal to tolerate upstream API churn.
 
-## Scope (This Task)
+## Agent Work
 
 ### M0: Workspace Bootstrap (Must Finish)
 
@@ -48,13 +48,19 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Add a validation path:
   - `cargo check -p ghostty_vt_sys`
   - `cargo test -p ghostty_vt`
-  
+
+### M1.1: Viewport Scrolling (Minimal)
+
+- [x] Add a VT API to scroll the viewport by line delta.
+- [x] Wire mouse-wheel scrolling in `basic_terminal`.
+
 ## User Work
 
 - [x] Cleanup features: make gpui and Zig build required.
 - [x] Auto push to remote after commit (documented in `AGENTS.md`).
 - [x] Add basic keyboard input to `basic_terminal` (type-to-echo).
 - [x] Do not proactively add new `User Work` items (documented in `AGENTS.md`).
+- [x] Always load and follow the latest user instructions (documented in `AGENTS.md`).
 
 ## Future Work
 
