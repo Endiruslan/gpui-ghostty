@@ -72,6 +72,11 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] When bracketed paste mode is enabled, wrap pasted content with `ESC[200~` and `ESC[201~`.
 - [x] Focus the view on mouse click.
 
+### M2.1: OSC Title (Minimal)
+
+- [x] Track OSC window title updates (`OSC 0` / `OSC 2`) from output bytes.
+- [x] Apply the tracked title to the GPUI window title.
+
 ## User Work
 
 - [x] Cleanup features: make gpui and Zig build required.
@@ -79,6 +84,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Add basic keyboard input to `basic_terminal` (type-to-echo).
 - [x] Do not proactively add new `User Work` items (documented in `AGENTS.md`).
 - [x] Always load and follow the latest user instructions (documented in `AGENTS.md`).
+- [x] Fix `basic_terminal` rendering when text is not visible (avoid black-on-black).
 
 ## Future Work
 

@@ -16,6 +16,8 @@ pub struct TerminalSession {
     config: TerminalConfig,
     terminal: Terminal,
     bracketed_paste_enabled: bool,
+    title: Option<String>,
+    parse_tail: Vec<u8>,
 }
 
 impl TerminalSession {
@@ -24,6 +26,8 @@ impl TerminalSession {
             config,
             terminal: Terminal::new(config.cols, config.rows)?,
             bracketed_paste_enabled: false,
+            title: None,
+            parse_tail: Vec::new(),
         })
     }
 
@@ -39,14 +43,26 @@ impl TerminalSession {
         self.bracketed_paste_enabled
     }
 
-    fn update_modes_from_output(&mut self, bytes: &[u8]) {
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    fn update_state_from_output(&mut self, bytes: &[u8]) {
         const ENABLE: &[u8] = b"\x1b[?2004h";
         const DISABLE: &[u8] = b"\x1b[?2004l";
+        const TAIL_LIMIT: usize = 2048;
+
+        self.parse_tail.extend_from_slice(bytes);
+        if self.parse_tail.len() > TAIL_LIMIT {
+            let drop_len = self.parse_tail.len() - TAIL_LIMIT;
+            self.parse_tail.drain(0..drop_len);
+        }
+        let buf = self.parse_tail.as_slice();
 
         let mut i = 0usize;
-        while i + 3 < bytes.len() {
-            if bytes[i] == 0x1b && bytes[i + 1] == b'[' && bytes[i + 2] == b'?' {
-                let tail = &bytes[i..];
+        while i + 3 < buf.len() {
+            if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
+                let tail = &buf[i..];
                 if tail.starts_with(ENABLE) {
                     self.bracketed_paste_enabled = true;
                     i += ENABLE.len();
@@ -60,10 +76,70 @@ impl TerminalSession {
             }
             i += 1;
         }
+
+        let mut last_title: Option<String> = None;
+        let mut j = 0usize;
+        while j + 1 < buf.len() {
+            if buf[j] != 0x1b || buf[j + 1] != b']' {
+                j += 1;
+                continue;
+            }
+
+            let mut k = j + 2;
+            let mut ps: u32 = 0;
+            let mut saw_digit = false;
+            while k < buf.len() {
+                let b = buf[k];
+                if b.is_ascii_digit() {
+                    saw_digit = true;
+                    ps = ps.saturating_mul(10).saturating_add((b - b'0') as u32);
+                    k += 1;
+                    continue;
+                }
+                if b == b';' {
+                    k += 1;
+                    break;
+                }
+                break;
+            }
+            if !saw_digit || k >= buf.len() {
+                j += 1;
+                continue;
+            }
+
+            let title_start = k;
+            while k < buf.len() {
+                match buf[k] {
+                    0x07 => {
+                        if ps == 0 || ps == 2 {
+                            last_title =
+                                Some(String::from_utf8_lossy(&buf[title_start..k]).into_owned());
+                        }
+                        k += 1;
+                        break;
+                    }
+                    0x1b if k + 1 < buf.len() && buf[k + 1] == b'\\' => {
+                        if ps == 0 || ps == 2 {
+                            last_title =
+                                Some(String::from_utf8_lossy(&buf[title_start..k]).into_owned());
+                        }
+                        k += 2;
+                        break;
+                    }
+                    _ => k += 1,
+                }
+            }
+
+            j = k.max(j + 1);
+        }
+
+        if let Some(title) = last_title {
+            self.title = Some(title);
+        }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.update_modes_from_output(bytes);
+        self.update_state_from_output(bytes);
         self.terminal.feed(bytes)
     }
 
@@ -89,6 +165,7 @@ pub mod view {
         session: TerminalSession,
         viewport: String,
         focus_handle: FocusHandle,
+        last_window_title: Option<String>,
     }
 
     impl TerminalView {
@@ -97,6 +174,7 @@ pub mod view {
                 session,
                 viewport: String::new(),
                 focus_handle,
+                last_window_title: None,
             }
             .with_refreshed_viewport()
         }
@@ -209,7 +287,17 @@ pub mod view {
     }
 
     impl Render for TerminalView {
-        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let title = self
+                .session
+                .title()
+                .unwrap_or("GPUI Embedded Terminal (Ghostty VT)");
+
+            if self.last_window_title.as_deref() != Some(title) {
+                window.set_window_title(title);
+                self.last_window_title = Some(title.to_string());
+            }
+
             div()
                 .size_full()
                 .flex()
@@ -219,6 +307,8 @@ pub mod view {
                 .on_key_down(cx.listener(Self::on_key_down))
                 .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                .bg(gpui::black())
+                .text_color(gpui::white())
                 .font_family("monospace")
                 .whitespace_nowrap()
                 .child(self.viewport.clone())
