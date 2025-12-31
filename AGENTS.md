@@ -18,6 +18,8 @@
 - Prefer small, reviewable patches.
 - Do refactors when needed to keep the project maintainable.
 - Avoid over-splitting work: when feasible, complete more scope in a single turn.
+- Periodically compact `ROADMAP.md` by summarizing completed items to keep it short and readable.
+- Keep `Agent Work` and `Future Work` aligned with the implemented code.
 - Provide clear verification steps (commands + expected outcomes).
 - Do not claim to have executed commands unless the execution is visible in the tool logs.
 

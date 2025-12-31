@@ -45,6 +45,16 @@ impl Terminal {
         }
     }
 
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Error> {
+        let rc =
+            unsafe { ghostty_vt_sys::ghostty_vt_terminal_resize(self.ptr.as_ptr(), cols, rows) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error::ScrollFailed(rc))
+        }
+    }
+
     pub fn dump_viewport(&self) -> Result<String, Error> {
         let bytes = unsafe { ghostty_vt_sys::ghostty_vt_terminal_dump_viewport(self.ptr.as_ptr()) };
         if bytes.ptr.is_null() {

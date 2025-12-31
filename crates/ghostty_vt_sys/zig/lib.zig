@@ -141,6 +141,22 @@ export fn ghostty_vt_terminal_feed(
     return 0;
 }
 
+export fn ghostty_vt_terminal_resize(
+    terminal_ptr: ?*anyopaque,
+    cols: u16,
+    rows: u16,
+) callconv(.C) c_int {
+    if (terminal_ptr == null) return 1;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    handle.terminal.resize(
+        handle.alloc,
+        @as(terminal.size.CellCountInt, @intCast(cols)),
+        @as(terminal.size.CellCountInt, @intCast(rows)),
+    ) catch return 2;
+    return 0;
+}
+
 export fn ghostty_vt_terminal_scroll_viewport(
     terminal_ptr: ?*anyopaque,
     delta_lines: i32,

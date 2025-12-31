@@ -172,6 +172,11 @@ impl TerminalSession {
     pub fn scroll_viewport_bottom(&mut self) -> Result<(), Error> {
         self.terminal.scroll_viewport_bottom()
     }
+
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Error> {
+        self.config = TerminalConfig { cols, rows };
+        self.terminal.resize(cols, rows)
+    }
 }
 
 pub mod view {
@@ -292,6 +297,12 @@ pub mod view {
             }
 
             self.pending_output.extend_from_slice(bytes);
+            cx.notify();
+        }
+
+        pub fn resize_terminal(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
+            let _ = self.session.resize(cols, rows);
+            self.pending_refresh = true;
             cx.notify();
         }
 

@@ -22,6 +22,8 @@ int ghostty_vt_terminal_feed(ghostty_vt_terminal_t terminal,
                              const uint8_t* bytes,
                              size_t len);
 
+int ghostty_vt_terminal_resize(ghostty_vt_terminal_t terminal, uint16_t cols, uint16_t rows);
+
 int ghostty_vt_terminal_scroll_viewport(ghostty_vt_terminal_t terminal, int32_t delta_lines);
 int ghostty_vt_terminal_scroll_viewport_top(ghostty_vt_terminal_t terminal);
 int ghostty_vt_terminal_scroll_viewport_bottom(ghostty_vt_terminal_t terminal);

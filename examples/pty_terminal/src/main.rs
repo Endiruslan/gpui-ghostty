@@ -7,6 +7,7 @@ use gpui::{App, AppContext, Application, KeyBinding, WindowOptions};
 use gpui_ghostty_terminal::view::{Copy, Paste, TerminalInput, TerminalView};
 use gpui_ghostty_terminal::{TerminalConfig, TerminalSession};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use std::sync::Arc;
 
 fn main() {
     Application::new().run(|cx: &mut App| {
@@ -28,6 +29,8 @@ fn main() {
                 })
                 .expect("openpty failed");
 
+            let master: Arc<dyn portable_pty::MasterPty + Send> = Arc::from(pty_pair.master);
+
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
             let mut cmd = CommandBuilder::new(shell);
             cmd.arg("-l");
@@ -41,8 +44,8 @@ fn main() {
                 let _ = child.wait();
             });
 
-            let mut pty_reader = pty_pair.master.try_clone_reader().expect("pty reader");
-            let mut pty_writer = pty_pair.master.take_writer().expect("pty writer");
+            let mut pty_reader = master.try_clone_reader().expect("pty reader");
+            let mut pty_writer = master.take_writer().expect("pty writer");
 
             let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>();
             let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
@@ -79,6 +82,31 @@ fn main() {
 
                 TerminalView::new_with_input(session, focus_handle, input)
             });
+
+            let master_for_resize = master.clone();
+            let subscription = view.update(cx, |_, cx| {
+                cx.observe_window_bounds(window, move |this, window, cx| {
+                    const CELL_WIDTH_PX: f32 = 8.0;
+                    const CELL_HEIGHT_PX: f32 = 16.0;
+
+                    let size = window.bounds().size;
+                    let width = f32::from(size.width);
+                    let height = f32::from(size.height);
+
+                    let cols = (width / CELL_WIDTH_PX).floor().max(1.0) as u16;
+                    let rows = (height / CELL_HEIGHT_PX).floor().max(1.0) as u16;
+
+                    let _ = master_for_resize.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+
+                    this.resize_terminal(cols, rows, cx);
+                })
+            });
+            subscription.detach();
 
             let view_for_task = view.clone();
             window

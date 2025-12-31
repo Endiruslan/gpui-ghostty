@@ -17,6 +17,12 @@ unsafe extern "C" {
         len: usize,
     ) -> core::ffi::c_int;
 
+    pub fn ghostty_vt_terminal_resize(
+        terminal: *mut core::ffi::c_void,
+        cols: u16,
+        rows: u16,
+    ) -> core::ffi::c_int;
+
     pub fn ghostty_vt_terminal_scroll_viewport(
         terminal: *mut core::ffi::c_void,
         delta_lines: i32,
