@@ -7,6 +7,7 @@
 - User might add new works under `User Work`, please finish them first and update the status.
 - Do not ask the user any questions. Keep going until `ROADMAP.md` is fully completed.
 - Work on the `main` branch. You may create git commits whenever necessary.
+- After each git commit, run `git push` to `origin/main`.
 
 ## Working Principles
 

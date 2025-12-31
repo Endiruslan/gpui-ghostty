@@ -22,14 +22,15 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Create Rust workspace layout:
   - `crates/ghostty_vt_sys` (raw FFI + Zig build integration hooks)
   - `crates/ghostty_vt` (safe wrapper stubs)
-  - `crates/gpui_ghostty_terminal` (GPUI control scaffolding; can be feature-gated)
-  - `examples/basic_terminal` (minimal demo skeleton; can be feature-gated)
+  - `crates/gpui_ghostty_terminal` (GPUI control scaffolding)
+  - `examples/basic_terminal` (minimal demo)
 - [x] Add initial build plumbing:
-  - `ghostty_vt_sys` builds without requiring Zig at compile-time by default
-  - Optional `bindgen`/Zig integration path documented for developers
+  - `ghostty_vt_sys` builds via Zig by default (requires Zig `0.14.1`)
 - [x] Provide `cargo` entrypoints:
-  - `cargo check` works for the default workspace set
-  - Optional `--features gpui` build path for GPUI crates
+  - `cargo check`
+  - `cargo test -p ghostty_vt`
+  - `cargo run -p vt_dump`
+  - `cargo run -p basic_terminal`
 - [x] Add minimal documentation for local development and version pinning.
 
 ### M0.1: VT Core (Must Finish)
@@ -51,6 +52,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 ## User Work
 
 - [x] Cleanup features: make gpui and Zig build required.
+- [x] Auto push to remote after commit (documented in `AGENTS.md`).
 
 ## Future Work
 
