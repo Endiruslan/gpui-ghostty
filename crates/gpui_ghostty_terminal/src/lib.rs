@@ -206,6 +206,7 @@ pub mod view {
         last_window_title: Option<String>,
         input: Option<TerminalInput>,
         pending_output: Vec<u8>,
+        pending_refresh: bool,
     }
 
     impl TerminalView {
@@ -217,6 +218,7 @@ pub mod view {
                 last_window_title: None,
                 input: None,
                 pending_output: Vec::new(),
+                pending_refresh: false,
             }
             .with_refreshed_viewport()
         }
@@ -233,6 +235,7 @@ pub mod view {
                 last_window_title: None,
                 input: Some(input),
                 pending_output: Vec::new(),
+                pending_refresh: false,
             }
             .with_refreshed_viewport()
         }
@@ -260,6 +263,34 @@ pub mod view {
         }
 
         pub fn queue_output_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+            const MAX_PENDING_OUTPUT_BYTES: usize = 256 * 1024;
+
+            if self.pending_output.len().saturating_add(bytes.len()) <= MAX_PENDING_OUTPUT_BYTES {
+                self.pending_output.extend_from_slice(bytes);
+                cx.notify();
+                return;
+            }
+
+            if !self.pending_output.is_empty() {
+                let pending = std::mem::take(&mut self.pending_output);
+                let _ = self.session.feed(&pending);
+                self.apply_side_effects(cx);
+                self.pending_refresh = true;
+            }
+
+            if bytes.len() > MAX_PENDING_OUTPUT_BYTES {
+                let mut offset = 0usize;
+                while offset < bytes.len() {
+                    let end = (offset + MAX_PENDING_OUTPUT_BYTES).min(bytes.len());
+                    let _ = self.session.feed(&bytes[offset..end]);
+                    offset = end;
+                }
+                self.apply_side_effects(cx);
+                self.pending_refresh = true;
+                cx.notify();
+                return;
+            }
+
             self.pending_output.extend_from_slice(bytes);
             cx.notify();
         }
@@ -575,8 +606,13 @@ pub mod view {
             if !self.pending_output.is_empty() {
                 let bytes = std::mem::take(&mut self.pending_output);
                 let _ = self.session.feed(&bytes);
-                self.refresh_viewport();
                 self.apply_side_effects(cx);
+                self.pending_refresh = true;
+            }
+
+            if self.pending_refresh {
+                self.refresh_viewport();
+                self.pending_refresh = false;
             }
 
             let title = self

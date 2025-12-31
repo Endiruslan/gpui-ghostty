@@ -108,6 +108,10 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 
 - [x] Coalesce PTY output updates to reduce viewport dumps under high throughput.
 
+### M3.2: Output Backpressure (Minimal)
+
+- [x] Bound pending PTY output buffer growth and feed output without dumping per chunk.
+
 ## User Work
 
 - [x] Cleanup features: make gpui and Zig build required.
