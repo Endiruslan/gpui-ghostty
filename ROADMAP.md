@@ -54,6 +54,13 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Add a VT API to scroll the viewport by line delta.
 - [x] Wire mouse-wheel scrolling in `basic_terminal`.
 
+### M1.2: Basic Paste and Scroll Keys (Minimal)
+
+- [x] Handle paste via clipboard read and VT feed.
+- [x] Bind `cmd-v` in `basic_terminal` to trigger paste.
+- [x] Support `PageUp`/`PageDown` viewport scrolling.
+- [x] Avoid unconditional viewport dumps during render.
+
 ## User Work
 
 - [x] Cleanup features: make gpui and Zig build required.

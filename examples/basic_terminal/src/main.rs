@@ -1,8 +1,10 @@
 fn main() {
-    use gpui::{App, AppContext, Application, WindowOptions};
-    use gpui_ghostty_terminal::{TerminalConfig, TerminalSession};
+    use gpui::{App, AppContext, Application, KeyBinding, WindowOptions};
+    use gpui_ghostty_terminal::{view::Paste, TerminalConfig, TerminalSession};
 
     Application::new().run(|cx: &mut App| {
+        cx.bind_keys([KeyBinding::new("cmd-v", Paste, None)]);
+
         cx.open_window(WindowOptions::default(), |window, cx| {
             cx.new(|cx| {
                 let focus_handle = cx.focus_handle();

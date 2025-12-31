@@ -13,14 +13,24 @@ impl Default for TerminalConfig {
 }
 
 pub struct TerminalSession {
+    config: TerminalConfig,
     terminal: Terminal,
 }
 
 impl TerminalSession {
     pub fn new(config: TerminalConfig) -> Result<Self, Error> {
         Ok(Self {
+            config,
             terminal: Terminal::new(config.cols, config.rows)?,
         })
+    }
+
+    pub fn cols(&self) -> u16 {
+        self.config.cols
+    }
+
+    pub fn rows(&self) -> u16 {
+        self.config.rows
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -39,9 +49,11 @@ impl TerminalSession {
 pub mod view {
     use super::TerminalSession;
     use gpui::{
-        div, prelude::*, Context, FocusHandle, IntoElement, KeyDownEvent, Render, ScrollDelta,
-        ScrollWheelEvent, Window,
+        actions, div, prelude::*, Context, FocusHandle, IntoElement, KeyDownEvent, Render,
+        ScrollDelta, ScrollWheelEvent, Window,
     };
+
+    actions!(terminal_view, [Paste]);
 
     pub struct TerminalView {
         session: TerminalSession,
@@ -51,12 +63,31 @@ pub mod view {
 
     impl TerminalView {
         pub fn new(session: TerminalSession, focus_handle: FocusHandle) -> Self {
-            let viewport = session.dump_viewport().unwrap_or_default();
             Self {
                 session,
-                viewport,
+                viewport: String::new(),
                 focus_handle,
             }
+            .with_refreshed_viewport()
+        }
+
+        fn with_refreshed_viewport(mut self) -> Self {
+            self.refresh_viewport();
+            self
+        }
+
+        fn refresh_viewport(&mut self) {
+            self.viewport = self.session.dump_viewport().unwrap_or_default();
+        }
+
+        fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+            let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                return;
+            };
+
+            let _ = self.session.feed(text.as_bytes());
+            self.refresh_viewport();
+            cx.notify();
         }
 
         fn on_key_down(
@@ -75,14 +106,33 @@ pub mod view {
                 return;
             }
 
+            let scroll_step = (self.session.rows() as i32 / 2).max(1);
+            match keystroke.key.as_str() {
+                "pageup" | "page_up" | "page-up" => {
+                    let _ = self.session.scroll_viewport(-scroll_step);
+                    self.refresh_viewport();
+                    cx.notify();
+                    return;
+                }
+                "pagedown" | "page_down" | "page-down" => {
+                    let _ = self.session.scroll_viewport(scroll_step);
+                    self.refresh_viewport();
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+
             if let Some(text) = keystroke.key_char.as_deref() {
                 let _ = self.session.feed(text.as_bytes());
+                self.refresh_viewport();
                 cx.notify();
                 return;
             }
 
             if keystroke.key == "backspace" {
                 let _ = self.session.feed(&[0x08]);
+                self.refresh_viewport();
                 cx.notify();
             }
         }
@@ -104,18 +154,18 @@ pub mod view {
             }
 
             let _ = self.session.scroll_viewport(delta_lines);
+            self.refresh_viewport();
             cx.notify();
         }
     }
 
     impl Render for TerminalView {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            self.viewport = self.session.dump_viewport().unwrap_or_default();
-
             div()
                 .size_full()
                 .flex()
                 .track_focus(&self.focus_handle)
+                .on_action(cx.listener(Self::on_paste))
                 .on_key_down(cx.listener(Self::on_key_down))
                 .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                 .font_family("monospace")
