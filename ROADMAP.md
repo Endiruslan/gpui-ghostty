@@ -53,6 +53,8 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 
 - [x] Cleanup features: make gpui and Zig build required.
 - [x] Auto push to remote after commit (documented in `AGENTS.md`).
+- [x] Add basic keyboard input to `basic_terminal` (type-to-echo).
+- [ ] 禁止主动为 User Work 增加条目，把这个要求写入 `AGENTS.md`
 
 ## Future Work
 
