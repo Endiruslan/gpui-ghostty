@@ -1437,4 +1437,41 @@ mod tests {
         assert_eq!(super::sgr_mouse_sequence(0, 1, 1, true), "\u{1b}[<0;1;1M");
         assert_eq!(super::sgr_mouse_sequence(0, 1, 1, false), "\u{1b}[<0;1;1m");
     }
+
+    #[test]
+    fn tracks_modes_across_chunk_boundaries() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+
+        session.feed(b"\x1b[?200").unwrap();
+        assert!(!session.bracketed_paste_enabled());
+        session.feed(b"4h").unwrap();
+        assert!(session.bracketed_paste_enabled());
+
+        session.feed(b"\x1b[?1000;100").unwrap();
+        assert!(!session.mouse_reporting_enabled());
+        assert!(!session.mouse_sgr_enabled());
+        session.feed(b"6h").unwrap();
+        assert!(session.mouse_reporting_enabled());
+        assert!(session.mouse_sgr_enabled());
+    }
+
+    #[test]
+    fn tracks_osc_title_across_chunk_boundaries() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+
+        session.feed(b"\x1b]2;hel").unwrap();
+        assert_eq!(session.title(), None);
+        session.feed(b"lo\x07").unwrap();
+        assert_eq!(session.title(), Some("hello"));
+    }
+
+    #[test]
+    fn tracks_osc_52_clipboard_across_chunk_boundaries() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+
+        session.feed(b"\x1b]52;c;aGV").unwrap();
+        assert_eq!(session.take_clipboard_write(), None);
+        session.feed(b"sbG8=\x07").unwrap();
+        assert_eq!(session.take_clipboard_write(), Some("hello".to_string()));
+    }
 }
