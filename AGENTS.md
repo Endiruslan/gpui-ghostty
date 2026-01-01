@@ -10,6 +10,10 @@
 - If `User Work` has no pending items, promote the next `Future Work` milestone into `Agent Work` as verifiable checklist items, then implement them in order.
 - Do not ask the user any questions. Keep going until `ROADMAP.md` is fully completed.
 - Work on the `main` branch. You may create git commits whenever necessary.
+- Before every `git commit`, run the CI-required checks locally:
+  - `cargo fmt --all -- --check`
+  - `cargo clippy -p ghostty_vt -p ghostty_vt_sys -p gpui_ghostty_terminal --all-targets -- -D warnings`
+  - `cargo test -p ghostty_vt -p ghostty_vt_sys -p gpui_ghostty_terminal`
 - After each git commit, run `git push` to `origin/main`.
 
 ## Working Principles

@@ -492,7 +492,7 @@ fn decode_osc_52(payload: &[u8]) -> Option<String> {
     let selection = split.next()?;
     let data = split.next()?;
 
-    if !selection.iter().any(|b| *b == b'c') {
+    if !selection.contains(&b'c') {
         return None;
     }
     if data.is_empty() {

@@ -48,9 +48,9 @@ pub(crate) fn ctrl_byte_for_keystroke(keystroke: &gpui::Keystroke) -> Option<u8>
     let b = bytes[0];
     if (b'@'..=b'_').contains(&b) {
         Some(b & 0x1f)
-    } else if (b'a'..=b'z').contains(&b) {
+    } else if b.is_ascii_lowercase() {
         Some(b - b'a' + 1)
-    } else if (b'A'..=b'Z').contains(&b) {
+    } else if b.is_ascii_uppercase() {
         Some(b - b'A' + 1)
     } else {
         None
@@ -166,8 +166,10 @@ fn url_at_column_in_line(line: &str, col: u16) -> Option<String> {
     url_at_byte_index(line, local)
 }
 
+type TerminalSendFn = dyn Fn(&[u8]) + Send + Sync + 'static;
+
 pub struct TerminalInput {
-    send: Box<dyn Fn(&[u8]) + Send + Sync + 'static>,
+    send: Box<TerminalSendFn>,
 }
 
 impl TerminalInput {
@@ -698,14 +700,14 @@ impl TerminalView {
             || !self.session.mouse_reporting_enabled()
             || !self.session.mouse_sgr_enabled()
         {
-            if event.button == MouseButton::Left {
-                if let Some(index) = self.mouse_position_to_viewport_index(event.position, window) {
-                    self.selection = Some(ByteSelection {
-                        anchor: index,
-                        active: index,
-                    });
-                    cx.notify();
-                }
+            if event.button == MouseButton::Left
+                && let Some(index) = self.mouse_position_to_viewport_index(event.position, window)
+            {
+                self.selection = Some(ByteSelection {
+                    anchor: index,
+                    active: index,
+                });
+                cx.notify();
             }
             return;
         }
@@ -832,11 +834,11 @@ impl TerminalView {
             return;
         };
 
-        if let Some(selection) = self.selection.as_mut() {
-            if selection.active != index {
-                selection.active = index;
-                cx.notify();
-            }
+        if let Some(selection) = self.selection.as_mut()
+            && selection.active != index
+        {
+            selection.active = index;
+            cx.notify();
         }
     }
 
@@ -884,19 +886,19 @@ impl TerminalView {
                 }
             }
 
-            if keystroke.modifiers.control {
-                if let Some(b) = ctrl_byte_for_keystroke(&keystroke) {
-                    input.send(&[b]);
-                    return;
-                }
+            if keystroke.modifiers.control
+                && let Some(b) = ctrl_byte_for_keystroke(&keystroke)
+            {
+                input.send(&[b]);
+                return;
             }
 
-            if keystroke.modifiers.alt {
-                if let Some(text) = keystroke.key_char.as_deref() {
-                    input.send(&[0x1b]);
-                    input.send(text.as_bytes());
-                    return;
-                }
+            if keystroke.modifiers.alt
+                && let Some(text) = keystroke.key_char.as_deref()
+            {
+                input.send(&[0x1b]);
+                input.send(text.as_bytes());
+                return;
             }
 
             let modifiers = KeyModifiers {
@@ -980,30 +982,29 @@ impl TerminalView {
             return;
         }
 
-        if let Some(input) = self.input.as_ref() {
-            if !event.modifiers.shift
-                && self.session.mouse_reporting_enabled()
-                && self.session.mouse_sgr_enabled()
-            {
-                let Some((col, row)) = self.mouse_position_to_cell(event.position, window) else {
-                    return;
-                };
-
-                let button = if delta_lines < 0 { 64 } else { 65 };
-                let button_value = sgr_mouse_button_value(
-                    button,
-                    false,
-                    false,
-                    event.modifiers.alt,
-                    event.modifiers.control,
-                );
-                let steps = delta_lines.unsigned_abs().min(10);
-                for _ in 0..steps {
-                    let seq = sgr_mouse_sequence(button_value, col, row, true);
-                    input.send(seq.as_bytes());
-                }
+        if let Some(input) = self.input.as_ref()
+            && !event.modifiers.shift
+            && self.session.mouse_reporting_enabled()
+            && self.session.mouse_sgr_enabled()
+        {
+            let Some((col, row)) = self.mouse_position_to_cell(event.position, window) else {
                 return;
+            };
+
+            let button = if delta_lines < 0 { 64 } else { 65 };
+            let button_value = sgr_mouse_button_value(
+                button,
+                false,
+                false,
+                event.modifiers.alt,
+                event.modifiers.control,
+            );
+            let steps = delta_lines.unsigned_abs().min(10);
+            for _ in 0..steps {
+                let seq = sgr_mouse_sequence(button_value, col, row, true);
+                input.send(seq.as_bytes());
             }
+            return;
         }
 
         let _ = self.session.scroll_viewport(delta_lines);
@@ -1882,34 +1883,6 @@ impl Element for TerminalTextElement {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{url_at_byte_index, url_at_column_in_line};
-
-    #[test]
-    fn url_detection_finds_https_links() {
-        let text = "Visit https://google.com for search";
-        let idx = text.find("google").unwrap();
-        assert_eq!(
-            url_at_byte_index(text, idx).as_deref(),
-            Some("https://google.com")
-        );
-    }
-
-    #[test]
-    fn url_detection_finds_https_links_by_cell_column() {
-        let line = "https://google.com";
-        assert_eq!(
-            url_at_column_in_line(line, 1).as_deref(),
-            Some("https://google.com")
-        );
-        assert_eq!(
-            url_at_column_in_line(line, 10).as_deref(),
-            Some("https://google.com")
-        );
-    }
-}
-
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.pending_output.is_empty() {
@@ -1995,4 +1968,32 @@ pub(crate) fn cell_metrics(window: &mut gpui::Window, font: &gpui::Font) -> Opti
     let cell_width = f32::from(line.width()).max(1.0);
     let cell_height = f32::from(line_height).max(1.0);
     Some((cell_width, cell_height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{url_at_byte_index, url_at_column_in_line};
+
+    #[test]
+    fn url_detection_finds_https_links() {
+        let text = "Visit https://google.com for search";
+        let idx = text.find("google").unwrap();
+        assert_eq!(
+            url_at_byte_index(text, idx).as_deref(),
+            Some("https://google.com")
+        );
+    }
+
+    #[test]
+    fn url_detection_finds_https_links_by_cell_column() {
+        let line = "https://google.com";
+        assert_eq!(
+            url_at_column_in_line(line, 1).as_deref(),
+            Some("https://google.com")
+        );
+        assert_eq!(
+            url_at_column_in_line(line, 10).as_deref(),
+            Some("https://google.com")
+        );
+    }
 }

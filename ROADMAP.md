@@ -102,6 +102,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Initialize CI (GitHub Actions).
 - [x] Fix auto URL detection for `https://...` links (cmd-click).
 - [x] Support precise ANSI 16-color fg/bg control (OSC 4 / OSC 104 palette updates).
+- [x] Fix main CI failures and enforce pre-commit checks (documented in `AGENTS.md`).
 
 ## Future Work
 
