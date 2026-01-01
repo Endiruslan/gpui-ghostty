@@ -98,6 +98,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Auto-detect http(s) URLs on Cmd+Click
 - [x] Add an embed-friendly option to disable `Window::set_window_title` updates from `TerminalView`.
 - [x] Add Apache-2.0 license (LICENSE + crate metadata + docs).
+- [x] Remove obsolete `.gitkeep` file.
 
 ## Future Work
 
