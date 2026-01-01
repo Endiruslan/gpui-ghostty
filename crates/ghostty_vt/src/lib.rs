@@ -147,6 +147,19 @@ impl Terminal {
         Ok(out)
     }
 
+    pub fn cursor_position(&self) -> Option<(u16, u16)> {
+        let mut col: u16 = 0;
+        let mut row: u16 = 0;
+        let ok = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_cursor_position(
+                self.ptr.as_ptr(),
+                &mut col as *mut u16,
+                &mut row as *mut u16,
+            )
+        };
+        ok.then_some((col, row))
+    }
+
     pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<String> {
         let bytes = unsafe {
             ghostty_vt_sys::ghostty_vt_terminal_hyperlink_at(self.ptr.as_ptr(), col, row)

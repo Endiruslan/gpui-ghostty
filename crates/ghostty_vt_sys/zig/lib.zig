@@ -193,6 +193,20 @@ export fn ghostty_vt_terminal_scroll_viewport_bottom(terminal_ptr: ?*anyopaque) 
     return 0;
 }
 
+export fn ghostty_vt_terminal_cursor_position(
+    terminal_ptr: ?*anyopaque,
+    col_out: ?*u16,
+    row_out: ?*u16,
+) callconv(.C) bool {
+    if (terminal_ptr == null) return false;
+    if (col_out == null or row_out == null) return false;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    col_out.?.* = @intCast(handle.terminal.screen.cursor.x + 1);
+    row_out.?.* = @intCast(handle.terminal.screen.cursor.y + 1);
+    return true;
+}
+
 export fn ghostty_vt_terminal_dump_viewport(terminal_ptr: ?*anyopaque) callconv(.C) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));

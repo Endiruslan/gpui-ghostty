@@ -47,6 +47,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M1.12: Incremental Damage Updates (reduce per-frame work)
 - [x] M3.5: Deep Behavior Regression Coverage
 - [x] M4.4: Layout + End-to-End Examples
+- [x] M5.1: IME Support (commit + preedit)
 
 ## User Work
 
@@ -61,7 +62,3 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Avoid over-splitting work (documented in `AGENTS.md`).
 - [x] Compact completed roadmap items to keep `ROADMAP.md` short (documented in `AGENTS.md`).
 - [x] Keep `Agent Work` and `Future Work` aligned with the implemented code (documented in `AGENTS.md`).
-
-## Future Work
-
-- M5: IME support (CJK input).

@@ -288,6 +288,10 @@ impl TerminalSession {
         self.terminal.dump_viewport_row(row)
     }
 
+    pub fn cursor_position(&self) -> Option<(u16, u16)> {
+        self.terminal.cursor_position()
+    }
+
     pub fn scroll_viewport(&mut self, delta_lines: i32) -> Result<(), Error> {
         self.terminal.scroll_viewport(delta_lines)
     }
@@ -316,10 +320,11 @@ pub mod view {
     use super::TerminalSession;
     use ghostty_vt::{KeyModifiers, encode_key_named};
     use gpui::{
-        App, Bounds, ClipboardItem, Context, Element, ElementId, FocusHandle, GlobalElementId,
-        IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-        MouseUpEvent, PaintQuad, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-        Style, TextRun, Window, actions, div, fill, hsla, point, prelude::*, relative,
+        App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+        EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyDownEvent, LayoutId,
+        MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Render,
+        ScrollDelta, ScrollWheelEvent, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+        Window, actions, div, fill, hsla, point, prelude::*, px, relative, size,
     };
     use std::ops::Range;
 
@@ -354,6 +359,8 @@ pub mod view {
         pending_output: Vec<u8>,
         pending_refresh: bool,
         selection: Option<ByteSelection>,
+        marked_text: Option<SharedString>,
+        marked_selected_range_utf16: Range<usize>,
         font: gpui::Font,
     }
 
@@ -388,6 +395,8 @@ pub mod view {
                 pending_output: Vec::new(),
                 pending_refresh: false,
                 selection: None,
+                marked_text: None,
+                marked_selected_range_utf16: 0..0,
                 font: crate::default_terminal_font(),
             }
             .with_refreshed_viewport()
@@ -411,9 +420,89 @@ pub mod view {
                 pending_output: Vec::new(),
                 pending_refresh: false,
                 selection: None,
+                marked_text: None,
+                marked_selected_range_utf16: 0..0,
                 font: crate::default_terminal_font(),
             }
             .with_refreshed_viewport()
+        }
+
+        fn utf16_len(s: &str) -> usize {
+            s.chars().map(|ch| ch.len_utf16()).sum()
+        }
+
+        fn utf16_range_to_utf8(s: &str, range_utf16: Range<usize>) -> Option<Range<usize>> {
+            let mut utf16_count = 0usize;
+            let mut start_utf8: Option<usize> = None;
+            let mut end_utf8: Option<usize> = None;
+
+            if range_utf16.start == 0 {
+                start_utf8 = Some(0);
+            }
+            if range_utf16.end == 0 {
+                end_utf8 = Some(0);
+            }
+
+            for (utf8_index, ch) in s.char_indices() {
+                if start_utf8.is_none() && utf16_count >= range_utf16.start {
+                    start_utf8 = Some(utf8_index);
+                }
+                if end_utf8.is_none() && utf16_count >= range_utf16.end {
+                    end_utf8 = Some(utf8_index);
+                }
+
+                utf16_count = utf16_count.saturating_add(ch.len_utf16());
+            }
+
+            if start_utf8.is_none() && utf16_count >= range_utf16.start {
+                start_utf8 = Some(s.len());
+            }
+            if end_utf8.is_none() && utf16_count >= range_utf16.end {
+                end_utf8 = Some(s.len());
+            }
+
+            Some(start_utf8?..end_utf8?)
+        }
+
+        fn clear_marked_text(&mut self, cx: &mut Context<Self>) {
+            self.marked_text = None;
+            self.marked_selected_range_utf16 = 0..0;
+            cx.notify();
+        }
+
+        fn set_marked_text(
+            &mut self,
+            text: String,
+            selected_range_utf16: Option<Range<usize>>,
+            cx: &mut Context<Self>,
+        ) {
+            if text.is_empty() {
+                self.clear_marked_text(cx);
+                return;
+            }
+
+            let total_utf16 = Self::utf16_len(&text);
+            let selected = selected_range_utf16.unwrap_or(total_utf16..total_utf16);
+            let selected = selected.start.min(total_utf16)..selected.end.min(total_utf16);
+
+            self.marked_text = Some(SharedString::from(text));
+            self.marked_selected_range_utf16 = selected;
+            cx.notify();
+        }
+
+        fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+            if text.is_empty() {
+                return;
+            }
+
+            if let Some(input) = self.input.as_ref() {
+                input.send(text.as_bytes());
+                return;
+            }
+
+            let _ = self.session.feed(text.as_bytes());
+            self.apply_side_effects(cx);
+            self.schedule_viewport_refresh(cx);
         }
 
         fn with_refreshed_viewport(mut self) -> Self {
@@ -792,7 +881,11 @@ pub mod view {
             _window: &mut Window,
             cx: &mut Context<Self>,
         ) {
-            let keystroke = event.keystroke.clone().with_simulated_ime();
+            let raw_keystroke = event.keystroke.clone();
+            if self.input.is_some() && raw_keystroke.is_ime_in_progress() {
+                return;
+            }
+            let keystroke = raw_keystroke.with_simulated_ime();
 
             if keystroke.modifiers.platform || keystroke.modifiers.function {
                 return;
@@ -1026,10 +1119,110 @@ pub mod view {
         }
     }
 
+    impl EntityInputHandler for TerminalView {
+        fn text_for_range(
+            &mut self,
+            range_utf16: Range<usize>,
+            adjusted_range: &mut Option<Range<usize>>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<String> {
+            let text = self.marked_text.as_ref()?.as_str();
+            let total_utf16 = Self::utf16_len(text);
+            let start = range_utf16.start.min(total_utf16);
+            let end = range_utf16.end.min(total_utf16);
+            let range_utf16 = start..end;
+            *adjusted_range = Some(range_utf16.clone());
+
+            let range_utf8 = Self::utf16_range_to_utf8(text, range_utf16)?;
+            Some(text.get(range_utf8)?.to_string())
+        }
+
+        fn selected_text_range(
+            &mut self,
+            _ignore_disabled_input: bool,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<UTF16Selection> {
+            Some(UTF16Selection {
+                range: self.marked_selected_range_utf16.clone(),
+                reversed: false,
+            })
+        }
+
+        fn marked_text_range(
+            &self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<Range<usize>> {
+            let text = self.marked_text.as_ref()?.as_str();
+            let len = Self::utf16_len(text);
+            (len > 0).then_some(0..len)
+        }
+
+        fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+            self.clear_marked_text(cx);
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            _range: Option<Range<usize>>,
+            text: &str,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            self.clear_marked_text(cx);
+            self.commit_text(text, cx);
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _range: Option<Range<usize>>,
+            new_text: &str,
+            new_selected_range: Option<Range<usize>>,
+            _window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
+            self.set_marked_text(new_text.to_string(), new_selected_range, cx);
+        }
+
+        fn bounds_for_range(
+            &mut self,
+            range_utf16: Range<usize>,
+            element_bounds: Bounds<Pixels>,
+            window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<Bounds<Pixels>> {
+            let (col, row) = self.session.cursor_position()?;
+            let (cell_width, cell_height) = crate::cell_metrics(window, &self.font)?;
+
+            let base_x =
+                element_bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
+            let base_y =
+                element_bounds.top() + px(cell_height * (row.saturating_sub(1)) as f32);
+
+            let x = base_x + px(cell_width * range_utf16.start as f32);
+            Some(Bounds::new(
+                point(x, base_y),
+                size(px(cell_width), px(cell_height)),
+            ))
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _point: gpui::Point<Pixels>,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> Option<usize> {
+            None
+        }
+    }
+
     struct TerminalPrepaintState {
         line_height: Pixels,
         shaped_lines: Vec<gpui::ShapedLine>,
         selection_quads: Vec<PaintQuad>,
+        marked_text: Option<(gpui::ShapedLine, gpui::Point<Pixels>)>,
     }
 
     struct TerminalTextElement {
@@ -1137,6 +1330,41 @@ pub mod view {
                 )
             };
 
+            let (marked_text, cursor_position, font) = {
+                let view = self.view.read(cx);
+                (view.marked_text.clone(), view.session.cursor_position(), view.font.clone())
+            };
+
+            let marked_text = marked_text.and_then(|text| {
+                if text.is_empty() {
+                    return None;
+                }
+                let (col, row) = cursor_position?;
+                let (cell_width, _) = crate::cell_metrics(window, &font)?;
+
+                let origin_x =
+                    bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
+                let origin_y = bounds.top() + line_height * (row.saturating_sub(1)) as f32;
+                let origin = point(origin_x, origin_y);
+
+                let run = TextRun {
+                    len: text.len(),
+                    font: run_font.clone(),
+                    color: run_color,
+                    background_color: None,
+                    underline: Some(UnderlineStyle {
+                        color: Some(run_color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                };
+                let shaped = window
+                    .text_system()
+                    .shape_line(text, font_size, &[run], None);
+                Some((shaped, origin))
+            });
+
             let selection_quads = selection
                 .map(|sel| sel.range())
                 .filter(|range| !range.is_empty())
@@ -1184,6 +1412,7 @@ pub mod view {
                 line_height,
                 shaped_lines,
                 selection_quads,
+                marked_text,
             }
         }
 
@@ -1197,6 +1426,13 @@ pub mod view {
             window: &mut Window,
             cx: &mut App,
         ) {
+            let focus_handle = { self.view.read(cx).focus_handle.clone() };
+            window.handle_input(
+                &focus_handle,
+                ElementInputHandler::new(bounds, self.view.clone()),
+                cx,
+            );
+
             for quad in prepaint.selection_quads.drain(..) {
                 window.paint_quad(quad);
             }
@@ -1205,6 +1441,10 @@ pub mod view {
             for (row, line) in prepaint.shaped_lines.iter().enumerate() {
                 let y = origin.y + prepaint.line_height * row as f32;
                 let _ = line.paint(point(origin.x, y), prepaint.line_height, window, cx);
+            }
+
+            if let Some((line, origin)) = prepaint.marked_text.as_ref() {
+                let _ = line.paint(*origin, prepaint.line_height, window, cx);
             }
         }
     }

@@ -36,6 +36,12 @@ unsafe extern "C" {
         terminal: *mut core::ffi::c_void,
     ) -> core::ffi::c_int;
 
+    pub fn ghostty_vt_terminal_cursor_position(
+        terminal: *mut core::ffi::c_void,
+        col_out: *mut u16,
+        row_out: *mut u16,
+    ) -> bool;
+
     pub fn ghostty_vt_terminal_dump_viewport(
         terminal: *mut core::ffi::c_void,
     ) -> ghostty_vt_bytes_t;

@@ -1,6 +1,7 @@
 #ifndef GHOSTTY_VT_H
 #define GHOSTTY_VT_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,6 +28,10 @@ int ghostty_vt_terminal_resize(ghostty_vt_terminal_t terminal, uint16_t cols, ui
 int ghostty_vt_terminal_scroll_viewport(ghostty_vt_terminal_t terminal, int32_t delta_lines);
 int ghostty_vt_terminal_scroll_viewport_top(ghostty_vt_terminal_t terminal);
 int ghostty_vt_terminal_scroll_viewport_bottom(ghostty_vt_terminal_t terminal);
+
+bool ghostty_vt_terminal_cursor_position(ghostty_vt_terminal_t terminal,
+                                         uint16_t* col_out,
+                                         uint16_t* row_out);
 
 ghostty_vt_bytes_t ghostty_vt_terminal_dump_viewport(ghostty_vt_terminal_t terminal);
 ghostty_vt_bytes_t ghostty_vt_terminal_dump_viewport_row(ghostty_vt_terminal_t terminal,
