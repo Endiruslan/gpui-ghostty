@@ -1,4 +1,5 @@
 const std = @import("std");
+const ghostty_input = @import("ghostty_src/input.zig");
 const terminal = @import("ghostty_src/terminal/main.zig");
 
 const Allocator = std.mem.Allocator;
@@ -256,6 +257,102 @@ export fn ghostty_vt_terminal_hyperlink_at(
     const alloc = std.heap.c_allocator;
     const duped = alloc.dupe(u8, uri) catch return .{ .ptr = null, .len = 0 };
     return .{ .ptr = duped.ptr, .len = duped.len };
+}
+
+export fn ghostty_vt_encode_key_named(
+    name_ptr: ?[*]const u8,
+    name_len: usize,
+    modifiers: u16,
+) callconv(.C) ghostty_vt_bytes_t {
+    if (name_ptr == null or name_len == 0) return .{ .ptr = null, .len = 0 };
+
+    const name = name_ptr.?[0..name_len];
+
+    const key_value: ghostty_input.Key = if (std.mem.eql(u8, name, "up"))
+        .arrow_up
+    else if (std.mem.eql(u8, name, "down"))
+        .arrow_down
+    else if (std.mem.eql(u8, name, "left"))
+        .arrow_left
+    else if (std.mem.eql(u8, name, "right"))
+        .arrow_right
+    else if (std.mem.eql(u8, name, "home"))
+        .home
+    else if (std.mem.eql(u8, name, "end"))
+        .end
+    else if (std.mem.eql(u8, name, "pageup") or std.mem.eql(u8, name, "page_up") or std.mem.eql(u8, name, "page-up"))
+        .page_up
+    else if (std.mem.eql(u8, name, "pagedown") or std.mem.eql(u8, name, "page_down") or std.mem.eql(u8, name, "page-down"))
+        .page_down
+    else if (std.mem.eql(u8, name, "insert"))
+        .insert
+    else if (std.mem.eql(u8, name, "delete"))
+        .delete
+    else if (std.mem.eql(u8, name, "backspace"))
+        .backspace
+    else if (std.mem.eql(u8, name, "enter"))
+        .enter
+    else if (std.mem.eql(u8, name, "tab"))
+        .tab
+    else if (std.mem.eql(u8, name, "escape"))
+        .escape
+    else if (name.len >= 2 and name[0] == 'f')
+        parse_function_key(name[1..]) orelse return .{ .ptr = null, .len = 0 }
+    else
+        return .{ .ptr = null, .len = 0 };
+
+    var mods: ghostty_input.Mods = .{};
+    if ((modifiers & 0x0001) != 0) mods.shift = true;
+    if ((modifiers & 0x0002) != 0) mods.ctrl = true;
+    if ((modifiers & 0x0004) != 0) mods.alt = true;
+    if ((modifiers & 0x0008) != 0) mods.super = true;
+
+    const event: ghostty_input.KeyEvent = .{
+        .action = .press,
+        .key = key_value,
+        .mods = mods,
+    };
+
+    const enc: ghostty_input.KeyEncoder = .{
+        .event = event,
+        .alt_esc_prefix = true,
+    };
+
+    var buf: [128]u8 = undefined;
+    const encoded = enc.encode(buf[0..]) catch return .{ .ptr = null, .len = 0 };
+    if (encoded.len == 0) return .{ .ptr = null, .len = 0 };
+
+    const alloc = std.heap.c_allocator;
+    const duped = alloc.dupe(u8, encoded) catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = duped.ptr, .len = duped.len };
+}
+
+fn parse_function_key(digits: []const u8) ?ghostty_input.Key {
+    if (digits.len == 1) {
+        return switch (digits[0]) {
+            '1' => .f1,
+            '2' => .f2,
+            '3' => .f3,
+            '4' => .f4,
+            '5' => .f5,
+            '6' => .f6,
+            '7' => .f7,
+            '8' => .f8,
+            '9' => .f9,
+            else => null,
+        };
+    }
+
+    if (digits.len == 2 and digits[0] == '1') {
+        return switch (digits[1]) {
+            '0' => .f10,
+            '1' => .f11,
+            '2' => .f12,
+            else => null,
+        };
+    }
+
+    return null;
 }
 
 const ghostty_vt_bytes_t = extern struct {

@@ -34,6 +34,9 @@ ghostty_vt_bytes_t ghostty_vt_terminal_take_dirty_viewport_rows(ghostty_vt_termi
 ghostty_vt_bytes_t ghostty_vt_terminal_hyperlink_at(ghostty_vt_terminal_t terminal,
                                                     uint16_t col,
                                                     uint16_t row);
+ghostty_vt_bytes_t ghostty_vt_encode_key_named(const uint8_t* name,
+                                               size_t name_len,
+                                               uint16_t modifiers);
 void ghostty_vt_bytes_free(ghostty_vt_bytes_t bytes);
 
 #ifdef __cplusplus

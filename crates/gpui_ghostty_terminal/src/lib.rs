@@ -302,6 +302,7 @@ impl TerminalSession {
 
 pub mod view {
     use super::TerminalSession;
+    use ghostty_vt::{KeyModifiers, encode_key_named};
     use gpui::{
         ClipboardItem, Context, FocusHandle, HighlightStyle, IntoElement, KeyDownEvent,
         MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollDelta,
@@ -700,211 +701,115 @@ pub mod view {
                 return;
             }
 
-            if keystroke.modifiers.control {
-                let mut ctrl_byte: Option<u8> = None;
-
-                if let Some(text) = keystroke.key_char.as_deref() {
-                    let bytes = text.as_bytes();
-                    if bytes.len() == 1 {
-                        let b = bytes[0];
-                        if (b'@'..=b'_').contains(&b) {
-                            ctrl_byte = Some(b & 0x1f);
-                        } else if (b'a'..=b'z').contains(&b) {
-                            ctrl_byte = Some(b - b'a' + 1);
-                        } else if (b'A'..=b'Z').contains(&b) {
-                            ctrl_byte = Some(b - b'A' + 1);
-                        }
-                    }
-                } else if keystroke.key == "space" {
-                    ctrl_byte = Some(0x00);
-                }
-
-                if let Some(b) = ctrl_byte {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(&[b]);
-                        return;
-                    }
-
-                    let _ = self.session.feed(&[b]);
-                    self.apply_side_effects(cx);
-                    self.schedule_viewport_refresh(cx);
-                }
-                return;
-            }
-
-            if keystroke.modifiers.alt {
-                if let Some(text) = keystroke.key_char.as_deref() {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(&[0x1b]);
-                        input.send(text.as_bytes());
-                        return;
-                    }
-                }
-                return;
-            }
-
             let scroll_step = (self.session.rows() as i32 / 2).max(1);
 
             if let Some(input) = self.input.as_ref() {
-                if !keystroke.modifiers.shift {
+                if keystroke.modifiers.shift {
                     match keystroke.key.as_str() {
                         "home" => {
-                            input.send(b"\x1b[H");
+                            let _ = self.session.scroll_viewport_top();
+                            self.apply_side_effects(cx);
+                            self.schedule_viewport_refresh(cx);
                             return;
                         }
                         "end" => {
-                            input.send(b"\x1b[F");
+                            let _ = self.session.scroll_viewport_bottom();
+                            self.apply_side_effects(cx);
+                            self.schedule_viewport_refresh(cx);
                             return;
                         }
                         "pageup" | "page_up" | "page-up" => {
-                            input.send(b"\x1b[5~");
+                            let _ = self.session.scroll_viewport(-scroll_step);
+                            self.apply_side_effects(cx);
+                            self.schedule_viewport_refresh(cx);
                             return;
                         }
                         "pagedown" | "page_down" | "page-down" => {
-                            input.send(b"\x1b[6~");
+                            let _ = self.session.scroll_viewport(scroll_step);
+                            self.apply_side_effects(cx);
+                            self.schedule_viewport_refresh(cx);
                             return;
                         }
                         _ => {}
                     }
                 }
 
-                match keystroke.key.as_str() {
-                    "f1" => {
-                        input.send(b"\x1bOP");
+                if keystroke.modifiers.control {
+                    let mut ctrl_byte: Option<u8> = None;
+
+                    if let Some(text) = keystroke.key_char.as_deref() {
+                        let bytes = text.as_bytes();
+                        if bytes.len() == 1 {
+                            let b = bytes[0];
+                            if (b'@'..=b'_').contains(&b) {
+                                ctrl_byte = Some(b & 0x1f);
+                            } else if (b'a'..=b'z').contains(&b) {
+                                ctrl_byte = Some(b - b'a' + 1);
+                            } else if (b'A'..=b'Z').contains(&b) {
+                                ctrl_byte = Some(b - b'A' + 1);
+                            }
+                        }
+                    } else if keystroke.key == "space" {
+                        ctrl_byte = Some(0x00);
+                    }
+
+                    if let Some(b) = ctrl_byte {
+                        input.send(&[b]);
                         return;
                     }
-                    "f2" => {
-                        input.send(b"\x1bOQ");
-                        return;
-                    }
-                    "f3" => {
-                        input.send(b"\x1bOR");
-                        return;
-                    }
-                    "f4" => {
-                        input.send(b"\x1bOS");
-                        return;
-                    }
-                    "f5" => {
-                        input.send(b"\x1b[15~");
-                        return;
-                    }
-                    "f6" => {
-                        input.send(b"\x1b[17~");
-                        return;
-                    }
-                    "f7" => {
-                        input.send(b"\x1b[18~");
-                        return;
-                    }
-                    "f8" => {
-                        input.send(b"\x1b[19~");
-                        return;
-                    }
-                    "f9" => {
-                        input.send(b"\x1b[20~");
-                        return;
-                    }
-                    "f10" => {
-                        input.send(b"\x1b[21~");
-                        return;
-                    }
-                    "f11" => {
-                        input.send(b"\x1b[23~");
-                        return;
-                    }
-                    "f12" => {
-                        input.send(b"\x1b[24~");
-                        return;
-                    }
-                    _ => {}
                 }
+
+                if keystroke.modifiers.alt {
+                    if let Some(text) = keystroke.key_char.as_deref() {
+                        input.send(&[0x1b]);
+                        input.send(text.as_bytes());
+                        return;
+                    }
+                }
+
+                let modifiers = KeyModifiers {
+                    shift: keystroke.modifiers.shift,
+                    control: keystroke.modifiers.control,
+                    alt: keystroke.modifiers.alt,
+                    super_key: false,
+                };
+                if let Some(encoded) = encode_key_named(&keystroke.key, modifiers) {
+                    input.send(&encoded);
+                    return;
+                }
+
+                if let Some(text) = keystroke.key_char.as_deref() {
+                    input.send(text.as_bytes());
+                    return;
+                }
+
+                return;
             }
 
             match keystroke.key.as_str() {
                 "home" => {
-                    if self.input.is_some() && !keystroke.modifiers.shift {
-                        return;
-                    }
                     let _ = self.session.scroll_viewport_top();
                     self.apply_side_effects(cx);
                     self.schedule_viewport_refresh(cx);
                     return;
                 }
                 "end" => {
-                    if self.input.is_some() && !keystroke.modifiers.shift {
-                        return;
-                    }
                     let _ = self.session.scroll_viewport_bottom();
                     self.apply_side_effects(cx);
                     self.schedule_viewport_refresh(cx);
                     return;
                 }
                 "pageup" | "page_up" | "page-up" => {
-                    if self.input.is_some() && !keystroke.modifiers.shift {
-                        return;
-                    }
                     let _ = self.session.scroll_viewport(-scroll_step);
                     self.apply_side_effects(cx);
                     self.schedule_viewport_refresh(cx);
                     return;
                 }
                 "pagedown" | "page_down" | "page-down" => {
-                    if self.input.is_some() && !keystroke.modifiers.shift {
-                        return;
-                    }
                     let _ = self.session.scroll_viewport(scroll_step);
                     self.apply_side_effects(cx);
                     self.schedule_viewport_refresh(cx);
                     return;
-                }
-                "up" => {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(b"\x1b[A");
-                        return;
-                    }
-                }
-                "down" => {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(b"\x1b[B");
-                        return;
-                    }
-                }
-                "right" => {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(b"\x1b[C");
-                        return;
-                    }
-                }
-                "left" => {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(b"\x1b[D");
-                        return;
-                    }
-                }
-                "escape" => {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(&[0x1b]);
-                        return;
-                    }
-                }
-                "delete" => {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(b"\x1b[3~");
-                        return;
-                    }
-                }
-                "enter" => {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(b"\r");
-                        return;
-                    }
-                }
-                "tab" => {
-                    if let Some(input) = self.input.as_ref() {
-                        input.send(b"\t");
-                        return;
-                    }
                 }
                 _ => {}
             }

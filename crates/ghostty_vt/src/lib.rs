@@ -27,6 +27,51 @@ pub struct Terminal {
     ptr: NonNull<c_void>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyModifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub super_key: bool,
+}
+
+impl KeyModifiers {
+    fn bits(self) -> u16 {
+        let mut bits = 0u16;
+        if self.shift {
+            bits |= 0x0001;
+        }
+        if self.control {
+            bits |= 0x0002;
+        }
+        if self.alt {
+            bits |= 0x0004;
+        }
+        if self.super_key {
+            bits |= 0x0008;
+        }
+        bits
+    }
+}
+
+pub fn encode_key_named(name: &str, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    if name.is_empty() {
+        return None;
+    }
+
+    let bytes = unsafe {
+        ghostty_vt_sys::ghostty_vt_encode_key_named(name.as_ptr(), name.len(), modifiers.bits())
+    };
+    if bytes.ptr.is_null() || bytes.len == 0 {
+        return None;
+    }
+
+    let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+    let out = slice.to_vec();
+    unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+    Some(out)
+}
+
 impl Terminal {
     pub fn new(cols: u16, rows: u16) -> Result<Self, Error> {
         let ptr = unsafe { ghostty_vt_sys::ghostty_vt_terminal_new(cols, rows) };

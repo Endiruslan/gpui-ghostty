@@ -51,5 +51,11 @@ unsafe extern "C" {
         row: u16,
     ) -> ghostty_vt_bytes_t;
 
+    pub fn ghostty_vt_encode_key_named(
+        name: *const u8,
+        name_len: usize,
+        modifiers: u16,
+    ) -> ghostty_vt_bytes_t;
+
     pub fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t);
 }
