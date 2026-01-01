@@ -77,6 +77,10 @@ impl TerminalSession {
         self.title.as_deref()
     }
 
+    pub(crate) fn window_title_updates_enabled(&self) -> bool {
+        self.config.update_window_title
+    }
+
     pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<String> {
         self.terminal.hyperlink_at(col, row)
     }

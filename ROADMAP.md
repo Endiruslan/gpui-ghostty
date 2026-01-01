@@ -95,7 +95,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Fix `htop` display issues (cursor/DSR queries)
 - [x] Fix Cmd+A select-all behavior
 - [x] Auto-detect http(s) URLs on Cmd+Click
-- [ ] Add an embed-friendly option to disable `Window::set_window_title` updates from `TerminalView`.
+- [x] Add an embed-friendly option to disable `Window::set_window_title` updates from `TerminalView`.
 
 ## Future Work
 

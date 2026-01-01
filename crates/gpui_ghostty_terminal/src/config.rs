@@ -6,6 +6,7 @@ pub struct TerminalConfig {
     pub rows: u16,
     pub default_fg: Rgb,
     pub default_bg: Rgb,
+    pub update_window_title: bool,
 }
 
 impl Default for TerminalConfig {
@@ -23,6 +24,7 @@ impl Default for TerminalConfig {
                 g: 0x00,
                 b: 0x00,
             },
+            update_window_title: true,
         }
     }
 }
