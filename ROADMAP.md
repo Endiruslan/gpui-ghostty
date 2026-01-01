@@ -55,6 +55,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M5.6: Interactive TUI Polish (clear artifacts, reduce startup cost)
 - [x] M5.7: IME Preedit Overlay (avoid text overlap)
 - [x] M5.8: Text Attributes (bold, faint, underline)
+- [x] M5.9: Line Drawing Charset (DEC Special Graphics)
 
 ## User Work
 

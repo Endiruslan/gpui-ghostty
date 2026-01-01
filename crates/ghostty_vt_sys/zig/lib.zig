@@ -79,6 +79,10 @@ const Handler = struct {
         self.terminal.invokeCharset(active, slot, single);
     }
 
+    pub fn configureCharset(self: *Handler, slot: terminal.CharsetSlot, set: terminal.Charset) !void {
+        self.terminal.configureCharset(slot, set);
+    }
+
     pub fn setCursorLeft(self: *Handler, amount: u16) !void {
         self.terminal.cursorLeft(amount);
     }
