@@ -41,6 +41,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M1.8: Mouse Selection + Copy Selection (Shift+drag, cmd-c)
 - [x] M1.9: Deferred Viewport Refresh (coalesce scroll/key updates)
 - [x] M1.10: Viewport Dirty Rows (FFI + refresh gating)
+- [x] M1.11: Incremental Viewport Updates (dirty rows -> row dumps)
 - [x] M2.5: PTY Ctrl-Key Encoding (punctuation)
 - [x] M3.3: Regression Tests (scrollback + resize)
 

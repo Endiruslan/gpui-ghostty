@@ -9,3 +9,12 @@ fn viewport_dump_contains_text() {
     assert!(s.contains("world"));
     assert!(s.contains("red"));
 }
+
+#[test]
+fn viewport_row_dump_contains_text() {
+    let mut t = ghostty_vt::Terminal::new(80, 24).unwrap();
+    t.feed(b"hello\r\n").unwrap();
+
+    let row0 = t.dump_viewport_row(0).unwrap();
+    assert!(row0.contains("hello"));
+}

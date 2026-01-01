@@ -9,6 +9,14 @@ fn update_viewport_string(current: &mut String, updated: String) -> bool {
     }
 }
 
+fn split_viewport_lines(viewport: &str) -> Vec<String> {
+    let viewport = viewport.strip_suffix('\n').unwrap_or(viewport);
+    if viewport.is_empty() {
+        return Vec::new();
+    }
+    viewport.split('\n').map(|line| line.to_string()).collect()
+}
+
 fn sgr_mouse_button_value(
     base_button: u8,
     motion: bool,
@@ -276,6 +284,10 @@ impl TerminalSession {
         self.terminal.dump_viewport()
     }
 
+    pub fn dump_viewport_row(&self, row: u16) -> Result<String, Error> {
+        self.terminal.dump_viewport_row(row)
+    }
+
     pub fn scroll_viewport(&mut self, delta_lines: i32) -> Result<(), Error> {
         self.terminal.scroll_viewport(delta_lines)
     }
@@ -331,6 +343,7 @@ pub mod view {
     pub struct TerminalView {
         session: TerminalSession,
         viewport: String,
+        viewport_lines: Vec<String>,
         focus_handle: FocusHandle,
         last_window_title: Option<String>,
         input: Option<TerminalInput>,
@@ -361,6 +374,7 @@ pub mod view {
             Self {
                 session,
                 viewport: String::new(),
+                viewport_lines: Vec::new(),
                 focus_handle,
                 last_window_title: None,
                 input: None,
@@ -380,6 +394,7 @@ pub mod view {
             Self {
                 session,
                 viewport: String::new(),
+                viewport_lines: Vec::new(),
                 focus_handle,
                 last_window_title: None,
                 input: Some(input),
@@ -399,8 +414,57 @@ pub mod view {
         fn refresh_viewport(&mut self) {
             let viewport = self.session.dump_viewport().unwrap_or_default();
             if crate::update_viewport_string(&mut self.viewport, viewport) {
+                self.viewport_lines = crate::split_viewport_lines(&self.viewport);
                 self.selection = None;
             }
+        }
+
+        fn rebuild_viewport_from_lines(&mut self) {
+            self.viewport.clear();
+            for (idx, line) in self.viewport_lines.iter().enumerate() {
+                if idx > 0 {
+                    self.viewport.push('\n');
+                }
+                self.viewport.push_str(line);
+            }
+            if !self.viewport_lines.is_empty() {
+                self.viewport.push('\n');
+            }
+        }
+
+        fn apply_dirty_viewport_rows(&mut self, dirty_rows: &[u16]) -> bool {
+            if dirty_rows.is_empty() {
+                return false;
+            }
+
+            let expected_rows = self.session.rows() as usize;
+            if self.viewport_lines.len() != expected_rows {
+                self.refresh_viewport();
+                return true;
+            }
+
+            for &row in dirty_rows {
+                let row = row as usize;
+                if row >= self.viewport_lines.len() {
+                    continue;
+                }
+
+                let line = match self.session.dump_viewport_row(row as u16) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        self.refresh_viewport();
+                        return true;
+                    }
+                };
+
+                let line = line.strip_suffix('\n').unwrap_or(line.as_str());
+                self.viewport_lines[row].clear();
+                self.viewport_lines[row].push_str(line);
+            }
+
+            self.rebuild_viewport_from_lines();
+            self.selection = None;
+            true
         }
 
         fn schedule_viewport_refresh(&mut self, cx: &mut Context<Self>) {
@@ -434,7 +498,8 @@ pub mod view {
                 let pending = std::mem::take(&mut self.pending_output);
                 let _ = self.session.feed(&pending);
                 self.apply_side_effects(cx);
-                if !self.session.take_dirty_viewport_rows().is_empty() {
+                let dirty = self.session.take_dirty_viewport_rows();
+                if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
                     self.pending_refresh = true;
                 }
             }
@@ -447,7 +512,8 @@ pub mod view {
                     offset = end;
                 }
                 self.apply_side_effects(cx);
-                if !self.session.take_dirty_viewport_rows().is_empty() {
+                let dirty = self.session.take_dirty_viewport_rows();
+                if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
                     self.pending_refresh = true;
                 }
                 cx.notify();
@@ -938,7 +1004,8 @@ pub mod view {
                 let bytes = std::mem::take(&mut self.pending_output);
                 let _ = self.session.feed(&bytes);
                 self.apply_side_effects(cx);
-                if !self.session.take_dirty_viewport_rows().is_empty() {
+                let dirty = self.session.take_dirty_viewport_rows();
+                if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
                     self.pending_refresh = true;
                 }
             }

@@ -112,6 +112,20 @@ impl Terminal {
         Ok(s)
     }
 
+    pub fn dump_viewport_row(&self, row: u16) -> Result<String, Error> {
+        let bytes = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_dump_viewport_row(self.ptr.as_ptr(), row)
+        };
+        if bytes.ptr.is_null() {
+            return Err(Error::DumpFailed);
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let s = String::from_utf8_lossy(slice).into_owned();
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Ok(s)
+    }
+
     pub fn take_dirty_viewport_rows(&mut self, rows: u16) -> Result<Vec<u16>, Error> {
         let bytes = unsafe {
             ghostty_vt_sys::ghostty_vt_terminal_take_dirty_viewport_rows(self.ptr.as_ptr(), rows)

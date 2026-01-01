@@ -205,6 +205,30 @@ export fn ghostty_vt_terminal_dump_viewport(terminal_ptr: ?*anyopaque) callconv(
     return .{ .ptr = slice.ptr, .len = slice.len };
 }
 
+export fn ghostty_vt_terminal_dump_viewport_row(
+    terminal_ptr: ?*anyopaque,
+    row: u16,
+) callconv(.C) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
+    const pin = handle.terminal.screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+
+    const alloc = std.heap.c_allocator;
+    var builder = std.ArrayList(u8).init(alloc);
+    errdefer builder.deinit();
+
+    handle.terminal.screen.pages.encodeUtf8(builder.writer(), .{
+        .tl = pin,
+        .br = pin,
+        .unwrap = false,
+    }) catch return .{ .ptr = null, .len = 0 };
+
+    const slice = builder.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
 export fn ghostty_vt_terminal_take_dirty_viewport_rows(
     terminal_ptr: ?*anyopaque,
     rows: u16,
