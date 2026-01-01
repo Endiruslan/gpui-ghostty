@@ -1,5 +1,14 @@
 use ghostty_vt::{Error, Terminal};
 
+fn update_viewport_string(current: &mut String, updated: String) -> bool {
+    if *current == updated {
+        false
+    } else {
+        *current = updated;
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalConfig {
     pub cols: u16,
@@ -338,8 +347,15 @@ pub mod view {
         }
 
         fn refresh_viewport(&mut self) {
-            self.viewport = self.session.dump_viewport().unwrap_or_default();
-            self.selection = None;
+            let viewport = self.session.dump_viewport().unwrap_or_default();
+            if crate::update_viewport_string(&mut self.viewport, viewport) {
+                self.selection = None;
+            }
+        }
+
+        fn schedule_viewport_refresh(&mut self, cx: &mut Context<Self>) {
+            self.pending_refresh = true;
+            cx.notify();
         }
 
         fn apply_side_effects(&mut self, cx: &mut Context<Self>) {
@@ -417,9 +433,8 @@ pub mod view {
             } else {
                 let _ = self.session.feed(text.as_bytes());
             }
-            self.refresh_viewport();
             self.apply_side_effects(cx);
-            cx.notify();
+            self.schedule_viewport_refresh(cx);
         }
 
         fn on_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
@@ -583,9 +598,8 @@ pub mod view {
                     }
 
                     let _ = self.session.feed(&[b]);
-                    self.refresh_viewport();
                     self.apply_side_effects(cx);
-                    cx.notify();
+                    self.schedule_viewport_refresh(cx);
                 }
                 return;
             }
@@ -685,9 +699,8 @@ pub mod view {
                         return;
                     }
                     let _ = self.session.scroll_viewport_top();
-                    self.refresh_viewport();
                     self.apply_side_effects(cx);
-                    cx.notify();
+                    self.schedule_viewport_refresh(cx);
                     return;
                 }
                 "end" => {
@@ -695,9 +708,8 @@ pub mod view {
                         return;
                     }
                     let _ = self.session.scroll_viewport_bottom();
-                    self.refresh_viewport();
                     self.apply_side_effects(cx);
-                    cx.notify();
+                    self.schedule_viewport_refresh(cx);
                     return;
                 }
                 "pageup" | "page_up" | "page-up" => {
@@ -705,9 +717,8 @@ pub mod view {
                         return;
                     }
                     let _ = self.session.scroll_viewport(-scroll_step);
-                    self.refresh_viewport();
                     self.apply_side_effects(cx);
-                    cx.notify();
+                    self.schedule_viewport_refresh(cx);
                     return;
                 }
                 "pagedown" | "page_down" | "page-down" => {
@@ -715,9 +726,8 @@ pub mod view {
                         return;
                     }
                     let _ = self.session.scroll_viewport(scroll_step);
-                    self.refresh_viewport();
                     self.apply_side_effects(cx);
-                    cx.notify();
+                    self.schedule_viewport_refresh(cx);
                     return;
                 }
                 "up" => {
@@ -777,9 +787,8 @@ pub mod view {
                     return;
                 }
                 let _ = self.session.feed(text.as_bytes());
-                self.refresh_viewport();
                 self.apply_side_effects(cx);
-                cx.notify();
+                self.schedule_viewport_refresh(cx);
                 return;
             }
 
@@ -789,9 +798,8 @@ pub mod view {
                     return;
                 }
                 let _ = self.session.feed(&[0x08]);
-                self.refresh_viewport();
                 self.apply_side_effects(cx);
-                cx.notify();
+                self.schedule_viewport_refresh(cx);
             }
         }
 
@@ -829,9 +837,8 @@ pub mod view {
             }
 
             let _ = self.session.scroll_viewport(delta_lines);
-            self.refresh_viewport();
             self.apply_side_effects(cx);
-            cx.notify();
+            self.schedule_viewport_refresh(cx);
         }
 
         fn mouse_position_to_viewport_index(
@@ -1068,5 +1075,22 @@ mod tests {
             super::viewport_index_for_cell(viewport, 3, 1),
             viewport.len()
         );
+    }
+
+    #[test]
+    fn update_viewport_string_skips_noop_updates() {
+        let mut current = "abc".to_string();
+
+        assert!(!super::update_viewport_string(
+            &mut current,
+            "abc".to_string()
+        ));
+        assert_eq!(current, "abc");
+
+        assert!(super::update_viewport_string(
+            &mut current,
+            "def".to_string()
+        ));
+        assert_eq!(current, "def");
     }
 }
