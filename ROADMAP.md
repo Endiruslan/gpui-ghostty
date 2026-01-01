@@ -35,6 +35,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M4.1: PTY Login Shell Example
 - [x] M4.2: PTY Resize (bounds observer)
 - [x] M4.3: Dynamic Grid Sizing (font metrics)
+- [x] M3.4: Font Fallbacks (default terminal font)
 - [x] M1.6: Select All + Primary Selection (cmd-a)
 - [x] M1.7: SGR Mouse Reporting (wheel + click pass-through)
 - [x] M1.8: Mouse Selection + Copy Selection (Shift+drag, cmd-c)

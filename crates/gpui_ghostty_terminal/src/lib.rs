@@ -337,6 +337,7 @@ pub mod view {
         pending_output: Vec<u8>,
         pending_refresh: bool,
         selection: Option<ByteSelection>,
+        font: gpui::Font,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -366,6 +367,7 @@ pub mod view {
                 pending_output: Vec::new(),
                 pending_refresh: false,
                 selection: None,
+                font: crate::default_terminal_font(),
             }
             .with_refreshed_viewport()
         }
@@ -384,6 +386,7 @@ pub mod view {
                 pending_output: Vec::new(),
                 pending_refresh: false,
                 selection: None,
+                font: crate::default_terminal_font(),
             }
             .with_refreshed_viewport()
         }
@@ -905,7 +908,7 @@ pub mod view {
             let cols = self.session.cols();
             let rows = self.session.rows();
 
-            let (cell_width, cell_height) = crate::cell_metrics(window)?;
+            let (cell_width, cell_height) = crate::cell_metrics(window, &self.font)?;
             let x = f32::from(position.x);
             let y = f32::from(position.y);
 
@@ -973,7 +976,7 @@ pub mod view {
                 .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
                 .bg(gpui::black())
                 .text_color(gpui::white())
-                .font_family("monospace")
+                .font(self.font.clone())
                 .whitespace_nowrap()
                 .child({
                     let highlight = HighlightStyle {
@@ -994,9 +997,11 @@ pub mod view {
     }
 }
 
-fn cell_metrics(window: &mut gpui::Window) -> Option<(f32, f32)> {
+fn cell_metrics(window: &mut gpui::Window, font: &gpui::Font) -> Option<(f32, f32)> {
     let mut style = window.text_style();
-    style.font_family = "monospace".into();
+    style.font_family = font.family.clone();
+    style.font_features = font.features.clone();
+    style.font_fallbacks = font.fallbacks.clone();
 
     let rem_size = window.rem_size();
     let font_size = style.font_size.to_pixels(rem_size);
@@ -1018,6 +1023,18 @@ fn cell_metrics(window: &mut gpui::Window) -> Option<(f32, f32)> {
     let cell_width = f32::from(line.width()).max(1.0);
     let cell_height = f32::from(line_height).max(1.0);
     Some((cell_width, cell_height))
+}
+
+pub fn default_terminal_font() -> gpui::Font {
+    let fallbacks = gpui::FontFallbacks::from_fonts(vec![
+        "Apple Color Emoji".to_string(),
+        "Noto Color Emoji".to_string(),
+        "Segoe UI Emoji".to_string(),
+    ]);
+
+    let mut font = gpui::font("monospace");
+    font.fallbacks = Some(fallbacks);
+    font
 }
 
 fn decode_osc_52(payload: &[u8]) -> Option<String> {

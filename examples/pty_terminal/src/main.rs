@@ -92,7 +92,10 @@ fn main() {
                     let height = f32::from(size.height);
 
                     let mut style = window.text_style();
-                    style.font_family = "monospace".into();
+                    let font = gpui_ghostty_terminal::default_terminal_font();
+                    style.font_family = font.family.clone();
+                    style.font_features = font.features;
+                    style.font_fallbacks = font.fallbacks.clone();
 
                     let rem_size = window.rem_size();
                     let font_size = style.font_size.to_pixels(rem_size);
