@@ -165,7 +165,10 @@ impl Terminal {
 
     pub fn dump_viewport_row_cell_styles(&self, row: u16) -> Result<Vec<CellStyle>, Error> {
         let bytes = unsafe {
-            ghostty_vt_sys::ghostty_vt_terminal_dump_viewport_row_cell_styles(self.ptr.as_ptr(), row)
+            ghostty_vt_sys::ghostty_vt_terminal_dump_viewport_row_cell_styles(
+                self.ptr.as_ptr(),
+                row,
+            )
         };
         if bytes.ptr.is_null() {
             return Err(Error::DumpFailed);

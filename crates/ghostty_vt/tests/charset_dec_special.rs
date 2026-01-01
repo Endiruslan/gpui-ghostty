@@ -14,4 +14,3 @@ fn dec_special_graphics_maps_acs_line_drawing() {
     let row = t.dump_viewport_row(0).unwrap();
     assert!(row.contains('q'), "row={row:?}");
 }
-

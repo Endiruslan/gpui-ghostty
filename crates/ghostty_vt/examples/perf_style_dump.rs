@@ -51,9 +51,6 @@ fn main() {
     let style_runs_elapsed = start.elapsed();
 
     println!("iters={iters} rows={rows} cols={cols}");
-    println!(
-        "cell_styles: {cell_styles_elapsed:?} (records={total_cell_styles})"
-    );
+    println!("cell_styles: {cell_styles_elapsed:?} (records={total_cell_styles})");
     println!("style_runs:  {style_runs_elapsed:?} (records={total_style_runs})");
 }
-

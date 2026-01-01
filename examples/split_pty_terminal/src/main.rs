@@ -192,8 +192,10 @@ fn main() {
                         pixel_height: 0,
                     });
 
-                    left_view_for_resize.update(cx, |this, cx| this.resize_terminal(cols, rows, cx));
-                    right_view_for_resize.update(cx, |this, cx| this.resize_terminal(cols, rows, cx));
+                    left_view_for_resize
+                        .update(cx, |this, cx| this.resize_terminal(cols, rows, cx));
+                    right_view_for_resize
+                        .update(cx, |this, cx| this.resize_terminal(cols, rows, cx));
                 })
             });
             subscription.detach();

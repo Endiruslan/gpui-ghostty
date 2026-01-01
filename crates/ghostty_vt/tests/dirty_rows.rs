@@ -17,4 +17,3 @@ fn dirty_rows_are_cleared_after_take() {
     let dirty = terminal.take_dirty_viewport_rows(24).unwrap();
     assert!(dirty.contains(&0));
 }
-
