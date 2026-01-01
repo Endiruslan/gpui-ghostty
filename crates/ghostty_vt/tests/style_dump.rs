@@ -52,3 +52,23 @@ fn viewport_row_cell_styles_reflect_inverse() {
     );
 }
 
+#[test]
+fn viewport_row_cell_styles_reflect_faint_underline_and_strikethrough_flags() {
+    let mut t = Terminal::new(4, 1).unwrap();
+    t.feed(b"\x1b[2mX\x1b[0m").unwrap();
+    let styles = t.dump_viewport_row_cell_styles(0).unwrap();
+    assert_eq!(styles.len(), 4);
+    assert_ne!(styles[0].flags & 0x10, 0);
+
+    let mut t = Terminal::new(4, 1).unwrap();
+    t.feed(b"\x1b[4mX\x1b[0m").unwrap();
+    let styles = t.dump_viewport_row_cell_styles(0).unwrap();
+    assert_eq!(styles.len(), 4);
+    assert_ne!(styles[0].flags & 0x08, 0);
+
+    let mut t = Terminal::new(4, 1).unwrap();
+    t.feed(b"\x1b[9mX\x1b[0m").unwrap();
+    let styles = t.dump_viewport_row_cell_styles(0).unwrap();
+    assert_eq!(styles.len(), 4);
+    assert_ne!(styles[0].flags & 0x40, 0);
+}

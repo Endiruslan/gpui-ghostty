@@ -292,6 +292,7 @@ export fn ghostty_vt_terminal_dump_viewport_row_cell_styles(
         if (s.flags.underline != .none) flags |= 0x08;
         if (s.flags.faint) flags |= 0x10;
         if (s.flags.invisible) flags |= 0x20;
+        if (s.flags.strikethrough) flags |= 0x40;
 
         if (s.flags.inverse) {
             const tmp = fg;

@@ -54,6 +54,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M5.5: Default Monospace Font Family
 - [x] M5.6: Interactive TUI Polish (clear artifacts, reduce startup cost)
 - [x] M5.7: IME Preedit Overlay (avoid text overlap)
+- [x] M5.8: Text Attributes (bold, faint, underline)
 
 ## User Work
 

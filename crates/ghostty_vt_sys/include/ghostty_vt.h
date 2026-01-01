@@ -27,6 +27,15 @@ typedef struct ghostty_vt_cell_style_s {
   uint8_t reserved;
 } ghostty_vt_cell_style_t;
 
+// flags bitset:
+// - 0x01: inverse
+// - 0x02: bold
+// - 0x04: italic
+// - 0x08: underline
+// - 0x10: faint
+// - 0x20: invisible
+// - 0x40: strikethrough
+
 ghostty_vt_terminal_t ghostty_vt_terminal_new(uint16_t cols, uint16_t rows);
 void ghostty_vt_terminal_free(ghostty_vt_terminal_t terminal);
 

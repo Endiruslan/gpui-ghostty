@@ -1497,6 +1497,74 @@ pub mod view {
         bg: Rgb,
     }
 
+    const CELL_STYLE_FLAG_BOLD: u8 = 0x02;
+    const CELL_STYLE_FLAG_ITALIC: u8 = 0x04;
+    const CELL_STYLE_FLAG_UNDERLINE: u8 = 0x08;
+    const CELL_STYLE_FLAG_FAINT: u8 = 0x10;
+    const CELL_STYLE_FLAG_STRIKETHROUGH: u8 = 0x40;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TextRunKey {
+        fg: Rgb,
+        flags: u8,
+    }
+
+    fn hsla_from_rgb(rgb: Rgb) -> gpui::Hsla {
+        let rgba = gpui::Rgba {
+            r: rgb.r as f32 / 255.0,
+            g: rgb.g as f32 / 255.0,
+            b: rgb.b as f32 / 255.0,
+            a: 1.0,
+        };
+        rgba.into()
+    }
+
+    fn font_for_flags(base: &gpui::Font, flags: u8) -> gpui::Font {
+        let mut font = base.clone();
+        if flags & CELL_STYLE_FLAG_BOLD != 0 {
+            font = font.bold();
+        }
+        if flags & CELL_STYLE_FLAG_ITALIC != 0 {
+            font = font.italic();
+        }
+        font
+    }
+
+    fn color_for_key(key: TextRunKey) -> gpui::Hsla {
+        let mut color = hsla_from_rgb(key.fg);
+        if key.flags & CELL_STYLE_FLAG_FAINT != 0 {
+            color = color.alpha(0.65);
+        }
+        color
+    }
+
+    fn text_run_for_key(base_font: &gpui::Font, key: TextRunKey, len: usize) -> TextRun {
+        let font = font_for_flags(base_font, key.flags);
+        let color = color_for_key(key);
+
+        let underline =
+            (key.flags & CELL_STYLE_FLAG_UNDERLINE != 0).then_some(UnderlineStyle {
+                color: Some(color),
+                thickness: px(1.0),
+                wavy: false,
+            });
+
+        let strikethrough =
+            (key.flags & CELL_STYLE_FLAG_STRIKETHROUGH != 0).then_some(gpui::StrikethroughStyle {
+                color: Some(color),
+                thickness: px(1.0),
+            });
+
+        TextRun {
+            len,
+            font,
+            color,
+            background_color: None,
+            underline,
+            strikethrough,
+        }
+    }
+
     pub(crate) fn byte_index_for_column_in_line(line: &str, col: u16) -> usize {
         use unicode_width::UnicodeWidthChar as _;
 
@@ -1621,9 +1689,17 @@ pub mod view {
                     {
                         let mut byte_pos = 0usize;
                         let mut seg_start_col: u16 = 1;
-                        let mut seg_fg = cell_styles[0].fg;
+                        let mut seg_key = TextRunKey {
+                            fg: cell_styles[0].fg,
+                            flags: cell_styles[0].flags
+                                & (CELL_STYLE_FLAG_BOLD
+                                    | CELL_STYLE_FLAG_ITALIC
+                                    | CELL_STYLE_FLAG_UNDERLINE
+                                    | CELL_STYLE_FLAG_FAINT
+                                    | CELL_STYLE_FLAG_STRIKETHROUGH),
+                        };
 
-                        let mut emit_segment = |start_col: u16, end_col: u16, fg: Rgb| {
+                        let mut emit_segment = |start_col: u16, end_col: u16, key: TextRunKey| {
                             let start =
                                 byte_index_for_column_in_line(text.as_str(), start_col).min(text.len());
                             let end = byte_index_for_column_in_line(
@@ -1645,35 +1721,40 @@ pub mod view {
                             }
 
                             if end > start {
-                                let color = rgba(
-                                    (u32::from(fg.r) << 24)
-                                        | (u32::from(fg.g) << 16)
-                                        | (u32::from(fg.b) << 8)
-                                        | 0xFF,
-                                );
-                                runs.push(TextRun {
-                                    len: end.saturating_sub(start),
-                                    font: run_font.clone(),
-                                    color: color.into(),
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                });
+                                runs.push(text_run_for_key(
+                                    &run_font,
+                                    key,
+                                    end.saturating_sub(start),
+                                ));
                                 byte_pos = end;
                             }
                         };
 
                         for (i, style) in cell_styles.iter().enumerate().skip(1) {
-                            if style.fg == seg_fg {
+                            let key = TextRunKey {
+                                fg: style.fg,
+                                flags: style.flags
+                                    & (CELL_STYLE_FLAG_BOLD
+                                        | CELL_STYLE_FLAG_ITALIC
+                                        | CELL_STYLE_FLAG_UNDERLINE
+                                        | CELL_STYLE_FLAG_FAINT
+                                        | CELL_STYLE_FLAG_STRIKETHROUGH),
+                            };
+
+                            if key == seg_key {
                                 continue;
                             }
 
-                            emit_segment(seg_start_col, i as u16, seg_fg);
+                            emit_segment(seg_start_col, i as u16, seg_key);
                             seg_start_col = i as u16 + 1;
-                            seg_fg = style.fg;
+                            seg_key = key;
                         }
 
-                        emit_segment(seg_start_col, cell_styles.len().min(u16::MAX as usize) as u16, seg_fg);
+                        emit_segment(
+                            seg_start_col,
+                            cell_styles.len().min(u16::MAX as usize) as u16,
+                            seg_key,
+                        );
 
                         if byte_pos < text.len() {
                             runs.push(TextRun {
