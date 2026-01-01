@@ -61,7 +61,6 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 ## Future Work
 
 - M1 (remaining): Incremental damage updates.
-- M2 (remaining): OSC links, fuller keyboard encoding via Ghostty key encoder.
-- M3 (remaining): Unicode/fallback font strategy, deep behavior regressions.
+- M3 (remaining): Deep behavior regressions.
 - M4 (remaining): Better grid sizing and layout, richer end-to-end examples.
 - M5: IME support (CJK input).
