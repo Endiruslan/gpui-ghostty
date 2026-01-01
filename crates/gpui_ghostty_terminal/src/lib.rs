@@ -387,7 +387,7 @@ pub mod view {
         EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyDownEvent, LayoutId,
         MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Render,
         ScrollDelta, ScrollWheelEvent, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-        Window, actions, div, fill, hsla, point, prelude::*, px, relative, size,
+        Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size,
     };
     use std::ops::Range;
 
@@ -525,6 +525,30 @@ pub mod view {
             }
 
             Some(start_utf8?..end_utf8?)
+        }
+
+        fn cell_offset_for_utf16(text: &str, utf16_offset: usize) -> usize {
+            use unicode_width::UnicodeWidthChar as _;
+
+            let mut cells = 0usize;
+            let mut utf16_count = 0usize;
+            for ch in text.chars() {
+                if utf16_count >= utf16_offset {
+                    break;
+                }
+
+                let len_utf16 = ch.len_utf16();
+                if utf16_count.saturating_add(len_utf16) > utf16_offset {
+                    break;
+                }
+                utf16_count = utf16_count.saturating_add(len_utf16);
+
+                let width = ch.width().unwrap_or(0);
+                if width > 0 {
+                    cells = cells.saturating_add(width);
+                }
+            }
+            cells
         }
 
         fn clear_marked_text(&mut self, cx: &mut Context<Self>) {
@@ -1279,7 +1303,12 @@ pub mod view {
             let base_y =
                 element_bounds.top() + px(cell_height * (row.saturating_sub(1)) as f32);
 
-            let x = base_x + px(cell_width * range_utf16.start as f32);
+            let offset_cells = self
+                .marked_text
+                .as_ref()
+                .map(|text| Self::cell_offset_for_utf16(text.as_str(), range_utf16.start))
+                .unwrap_or(range_utf16.start);
+            let x = base_x + px(cell_width * offset_cells as f32);
             Some(Bounds::new(
                 point(x, base_y),
                 size(px(cell_width), px(cell_height)),
@@ -1301,6 +1330,7 @@ pub mod view {
         shaped_lines: Vec<gpui::ShapedLine>,
         selection_quads: Vec<PaintQuad>,
         marked_text: Option<(gpui::ShapedLine, gpui::Point<Pixels>)>,
+        cursor: Option<PaintQuad>,
     }
 
     struct TerminalTextElement {
@@ -1491,11 +1521,33 @@ pub mod view {
                 })
                 .unwrap_or_default();
 
+            let cursor = {
+                let view = self.view.read(cx);
+                view.focus_handle
+                    .is_focused(window)
+                    .then(|| view.session.cursor_position())
+                    .flatten()
+            }
+            .and_then(|(col, row)| {
+                let font = { self.view.read(cx).font.clone() };
+                let (cell_width, _) = crate::cell_metrics(window, &font)?;
+
+                let x =
+                    bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
+                let y = bounds.top() + line_height * (row.saturating_sub(1)) as f32;
+
+                Some(fill(
+                    Bounds::new(point(x, y), size(px(cell_width), line_height)),
+                    rgba(0xffffff55),
+                ))
+            });
+
             TerminalPrepaintState {
                 line_height,
                 shaped_lines,
                 selection_quads,
                 marked_text,
+                cursor,
             }
         }
 
@@ -1528,6 +1580,10 @@ pub mod view {
 
             if let Some((line, origin)) = prepaint.marked_text.as_ref() {
                 let _ = line.paint(*origin, prepaint.line_height, window, cx);
+            }
+
+            if let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
             }
         }
     }
@@ -1661,6 +1717,8 @@ fn viewport_index_for_cell(viewport: &str, row: u16, col: u16) -> usize {
     let row = row.max(1) as usize;
     let col = col.max(1) as usize;
 
+    use unicode_width::UnicodeWidthChar as _;
+
     let mut current_row = 1usize;
     let mut offset = 0usize;
 
@@ -1673,11 +1731,22 @@ fn viewport_index_for_cell(viewport: &str, row: u16, col: u16) -> usize {
             }
 
             let mut current_col = 1usize;
-            for (byte_index, _) in line.char_indices() {
+            for (byte_index, ch) in line.char_indices() {
+                let width = ch.width().unwrap_or(0);
+                if width == 0 {
+                    continue;
+                }
+
                 if current_col == col {
                     return offset + byte_index;
                 }
-                current_col += 1;
+
+                let next_col = current_col.saturating_add(width);
+                if col < next_col {
+                    return offset + byte_index;
+                }
+
+                current_col = next_col;
             }
 
             return offset + line.len();
@@ -1742,6 +1811,17 @@ mod tests {
             super::viewport_index_for_cell(viewport, 3, 1),
             viewport.len()
         );
+    }
+
+    #[test]
+    fn viewport_index_accounts_for_wide_characters() {
+        let viewport = "你a\n";
+        let wide_len = "你".len();
+
+        assert_eq!(super::viewport_index_for_cell(viewport, 1, 1), 0);
+        assert_eq!(super::viewport_index_for_cell(viewport, 1, 2), 0);
+        assert_eq!(super::viewport_index_for_cell(viewport, 1, 3), wide_len);
+        assert_eq!(super::viewport_index_for_cell(viewport, 1, 4), wide_len + 1);
     }
 
     #[test]

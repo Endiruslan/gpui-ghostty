@@ -2194,6 +2194,7 @@ dependencies = [
  "base64",
  "ghostty_vt",
  "gpui",
+ "unicode-width",
 ]
 
 [[package]]

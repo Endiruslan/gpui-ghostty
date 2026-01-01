@@ -66,10 +66,10 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Fix duplicate character input (e.g. typing "j" shows twice)
 - [x] Update README
 - [x] Fix DSR cursor position report (for codex/claude: "The cursor position could not be read within a normal duration")
-- [ ] 复制内容时指针移动速度和内容选中速度不一致
-- [ ] 看不到游标的位置
-- [ ] 中文候选框窗口与实际位置不一致，有错位
-- [ ] 运行 htop 等应用显示不正常
+- [x] Fix selection tracking vs mouse movement (copy/drag mismatch)
+- [x] Render the cursor
+- [x] Fix IME candidate window position (CJK preedit misalignment)
+- [x] Improve TUI rendering for apps like `htop`
 
 ## Future Work
 
