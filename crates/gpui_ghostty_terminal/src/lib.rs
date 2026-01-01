@@ -1,10 +1,10 @@
 use ghostty_vt::{Error, Terminal};
 
-fn update_viewport_string(current: &mut String, updated: String) -> bool {
-    if *current == updated {
+fn update_viewport_string(current: &mut gpui::SharedString, updated: String) -> bool {
+    if current.as_str() == updated.as_str() {
         false
     } else {
-        *current = updated;
+        *current = gpui::SharedString::from(updated);
         true
     }
 }
@@ -316,9 +316,10 @@ pub mod view {
     use super::TerminalSession;
     use ghostty_vt::{KeyModifiers, encode_key_named};
     use gpui::{
-        ClipboardItem, Context, FocusHandle, HighlightStyle, IntoElement, KeyDownEvent,
-        MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollDelta,
-        ScrollWheelEvent, StyledText, Window, actions, div, prelude::*,
+        App, Bounds, ClipboardItem, Context, Element, ElementId, FocusHandle, GlobalElementId,
+        IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+        MouseUpEvent, PaintQuad, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString,
+        Style, TextRun, Window, actions, div, fill, hsla, point, prelude::*, relative,
     };
     use std::ops::Range;
 
@@ -342,8 +343,11 @@ pub mod view {
 
     pub struct TerminalView {
         session: TerminalSession,
-        viewport: String,
+        viewport: SharedString,
         viewport_lines: Vec<String>,
+        viewport_line_offsets: Vec<usize>,
+        line_layouts: Vec<Option<gpui::ShapedLine>>,
+        line_layout_key: Option<(Pixels, Pixels)>,
         focus_handle: FocusHandle,
         last_window_title: Option<String>,
         input: Option<TerminalInput>,
@@ -373,8 +377,11 @@ pub mod view {
         pub fn new(session: TerminalSession, focus_handle: FocusHandle) -> Self {
             Self {
                 session,
-                viewport: String::new(),
+                viewport: SharedString::default(),
                 viewport_lines: Vec::new(),
+                viewport_line_offsets: Vec::new(),
+                line_layouts: Vec::new(),
+                line_layout_key: None,
                 focus_handle,
                 last_window_title: None,
                 input: None,
@@ -393,8 +400,11 @@ pub mod view {
         ) -> Self {
             Self {
                 session,
-                viewport: String::new(),
+                viewport: SharedString::default(),
                 viewport_lines: Vec::new(),
+                viewport_line_offsets: Vec::new(),
+                line_layouts: Vec::new(),
+                line_layout_key: None,
                 focus_handle,
                 last_window_title: None,
                 input: Some(input),
@@ -414,22 +424,37 @@ pub mod view {
         fn refresh_viewport(&mut self) {
             let viewport = self.session.dump_viewport().unwrap_or_default();
             if crate::update_viewport_string(&mut self.viewport, viewport) {
-                self.viewport_lines = crate::split_viewport_lines(&self.viewport);
+                self.viewport_lines = crate::split_viewport_lines(self.viewport.as_str());
+                self.viewport_line_offsets = Self::compute_viewport_line_offsets(&self.viewport_lines);
+                self.line_layouts.clear();
+                self.line_layout_key = None;
                 self.selection = None;
             }
         }
 
+        fn compute_viewport_line_offsets(lines: &[String]) -> Vec<usize> {
+            let mut offsets = Vec::with_capacity(lines.len());
+            let mut offset = 0usize;
+            for line in lines {
+                offsets.push(offset);
+                offset = offset.saturating_add(line.len() + 1);
+            }
+            offsets
+        }
+
         fn rebuild_viewport_from_lines(&mut self) {
-            self.viewport.clear();
+            let mut viewport = String::new();
             for (idx, line) in self.viewport_lines.iter().enumerate() {
                 if idx > 0 {
-                    self.viewport.push('\n');
+                    viewport.push('\n');
                 }
-                self.viewport.push_str(line);
+                viewport.push_str(line);
             }
             if !self.viewport_lines.is_empty() {
-                self.viewport.push('\n');
+                viewport.push('\n');
             }
+            self.viewport = SharedString::from(viewport);
+            self.viewport_line_offsets = Self::compute_viewport_line_offsets(&self.viewport_lines);
         }
 
         fn apply_dirty_viewport_rows(&mut self, dirty_rows: &[u16]) -> bool {
@@ -460,6 +485,9 @@ pub mod view {
                 let line = line.strip_suffix('\n').unwrap_or(line.as_str());
                 self.viewport_lines[row].clear();
                 self.viewport_lines[row].push_str(line);
+                if row < self.line_layouts.len() {
+                    self.line_layouts[row] = None;
+                }
             }
 
             self.rebuild_viewport_from_lines();
@@ -562,7 +590,7 @@ pub mod view {
                 .selection
                 .map(|s| s.range())
                 .filter(|range| !range.is_empty())
-                .and_then(|range| self.viewport.get(range))
+                .and_then(|range| self.viewport.as_str().get(range))
                 .unwrap_or(self.viewport.as_str());
 
             let item = ClipboardItem::new_string(selection.to_string());
@@ -574,7 +602,7 @@ pub mod view {
         fn on_select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
             self.selection = Some(ByteSelection {
                 anchor: 0,
-                active: self.viewport.len(),
+                active: self.viewport.as_str().len(),
             });
             self.on_copy(&Copy, window, cx);
         }
@@ -998,6 +1026,189 @@ pub mod view {
         }
     }
 
+    struct TerminalPrepaintState {
+        line_height: Pixels,
+        shaped_lines: Vec<gpui::ShapedLine>,
+        selection_quads: Vec<PaintQuad>,
+    }
+
+    struct TerminalTextElement {
+        view: gpui::Entity<TerminalView>,
+    }
+
+    impl IntoElement for TerminalTextElement {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for TerminalTextElement {
+        type RequestLayoutState = ();
+        type PrepaintState = TerminalPrepaintState;
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&gpui::InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            let mut style = Style::default();
+            style.size.width = relative(1.).into();
+            style.size.height = relative(1.).into();
+            (window.request_layout(style, [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&gpui::InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Self::PrepaintState {
+            let style = window.text_style();
+            let rem_size = window.rem_size();
+            let font_size = style.font_size.to_pixels(rem_size);
+            let line_height = style.line_height.to_pixels(style.font_size, rem_size);
+
+            let run_font = style.font();
+            let run_color = style.color;
+
+            self.view.update(cx, |view, _cx| {
+                if view.viewport_lines.is_empty() {
+                    view.line_layouts.clear();
+                    view.line_layout_key = None;
+                    return;
+                }
+
+                if view.line_layout_key != Some((font_size, line_height))
+                    || view.line_layouts.len() != view.viewport_lines.len()
+                {
+                    view.line_layout_key = Some((font_size, line_height));
+                    view.line_layouts = vec![None; view.viewport_lines.len()];
+                }
+
+                for (idx, line) in view.viewport_lines.iter().enumerate() {
+                    let Some(slot) = view.line_layouts.get_mut(idx) else {
+                        continue;
+                    };
+
+                    if let Some(existing) = slot.as_ref()
+                        && existing.text.as_str() == line.as_str()
+                    {
+                        continue;
+                    }
+
+                    let text = SharedString::from(line.clone());
+                    let run = TextRun {
+                        len: text.len(),
+                        font: run_font.clone(),
+                        color: run_color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = window.text_system().shape_line(text, font_size, &[run], None);
+                    *slot = Some(shaped);
+                }
+            });
+
+            let (shaped_lines, selection, line_offsets) = {
+                let view = self.view.read(cx);
+                (
+                    view.line_layouts
+                        .iter()
+                        .map(|line| line.clone().unwrap_or_default())
+                        .collect::<Vec<_>>(),
+                    view.selection,
+                    view.viewport_line_offsets.clone(),
+                )
+            };
+
+            let selection_quads = selection
+                .map(|sel| sel.range())
+                .filter(|range| !range.is_empty())
+                .map(|range| {
+                    let highlight = hsla(0.58, 0.9, 0.55, 0.35);
+                    let mut quads = Vec::new();
+
+                    for (row, line) in shaped_lines.iter().enumerate() {
+                        let Some(&line_offset) = line_offsets.get(row) else {
+                            continue;
+                        };
+
+                        let line_start = line_offset;
+                        let line_end = line_offset.saturating_add(line.text.len());
+
+                        let seg_start = range.start.max(line_start).min(line_end);
+                        let seg_end = range.end.max(line_start).min(line_end);
+                        if seg_start >= seg_end {
+                            continue;
+                        }
+
+                        let local_start = seg_start.saturating_sub(line_start);
+                        let local_end = seg_end.saturating_sub(line_start);
+
+                        let x1 = line.x_for_index(local_start);
+                        let x2 = line.x_for_index(local_end);
+
+                        let y1 = bounds.top() + line_height * row as f32;
+                        let y2 = y1 + line_height;
+
+                        quads.push(fill(
+                            Bounds::from_corners(
+                                point(bounds.left() + x1, y1),
+                                point(bounds.left() + x2, y2),
+                            ),
+                            highlight,
+                        ));
+                    }
+
+                    quads
+                })
+                .unwrap_or_default();
+
+            TerminalPrepaintState {
+                line_height,
+                shaped_lines,
+                selection_quads,
+            }
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&gpui::InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            for quad in prepaint.selection_quads.drain(..) {
+                window.paint_quad(quad);
+            }
+
+            let origin = bounds.origin;
+            for (row, line) in prepaint.shaped_lines.iter().enumerate() {
+                let y = origin.y + prepaint.line_height * row as f32;
+                let _ = line.paint(point(origin.x, y), prepaint.line_height, window, cx);
+            }
+        }
+    }
+
     impl Render for TerminalView {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             if !self.pending_output.is_empty() {
@@ -1045,21 +1256,7 @@ pub mod view {
                 .text_color(gpui::white())
                 .font(self.font.clone())
                 .whitespace_nowrap()
-                .child({
-                    let highlight = HighlightStyle {
-                        background_color: Some(gpui::hsla(0.58, 0.9, 0.55, 0.35)),
-                        ..Default::default()
-                    };
-
-                    let mut text = StyledText::new(self.viewport.clone());
-                    if let Some(selection) = self.selection {
-                        let range = selection.range();
-                        if !range.is_empty() {
-                            text = text.with_highlights([(range, highlight)]);
-                        }
-                    }
-                    text
-                })
+                .child(TerminalTextElement { view: cx.entity() })
         }
     }
 }
@@ -1212,19 +1409,19 @@ mod tests {
 
     #[test]
     fn update_viewport_string_skips_noop_updates() {
-        let mut current = "abc".to_string();
+        let mut current = gpui::SharedString::from("abc".to_string());
 
         assert!(!super::update_viewport_string(
             &mut current,
             "abc".to_string()
         ));
-        assert_eq!(current, "abc");
+        assert_eq!(current.as_str(), "abc");
 
         assert!(super::update_viewport_string(
             &mut current,
             "def".to_string()
         ));
-        assert_eq!(current, "def");
+        assert_eq!(current.as_str(), "def");
     }
 
     #[test]

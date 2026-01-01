@@ -44,6 +44,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M1.11: Incremental Viewport Updates (dirty rows -> row dumps)
 - [x] M2.5: PTY Ctrl-Key Encoding (punctuation)
 - [x] M3.3: Regression Tests (scrollback + resize)
+- [x] M1.12: Incremental Damage Updates (reduce per-frame work)
 
 ## User Work
 
@@ -61,7 +62,6 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 
 ## Future Work
 
-- M1 (remaining): Incremental damage updates.
 - M3 (remaining): Deep behavior regressions.
 - M4 (remaining): Better grid sizing and layout, richer end-to-end examples.
 - M5: IME support (CJK input).
