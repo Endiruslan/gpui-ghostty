@@ -61,6 +61,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "android_system_properties"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -156,7 +165,7 @@ dependencies = [
  "url",
  "wayland-backend",
  "wayland-client",
- "wayland-protocols 0.32.10",
+ "wayland-protocols",
  "zbus",
 ]
 
@@ -826,6 +835,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono"
+version = "0.4.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "145052bdd345b87320e369255277e3fb5152762ad123a901ef5c262dd38fe8d2"
+dependencies = [
+ "iana-time-zone",
+ "js-sys",
+ "num-traits",
+ "serde",
+ "wasm-bindgen",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -927,7 +950,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "indexmap",
  "rustc-hash 2.1.1",
@@ -1282,7 +1305,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2067,7 +2090,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "anyhow",
  "as-raw-xcb-connection",
@@ -2109,6 +2132,7 @@ dependencies = [
  "libc",
  "log",
  "lyon",
+ "mach2",
  "media",
  "metal",
  "naga",
@@ -2148,7 +2172,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-cursor",
- "wayland-protocols 0.31.2",
+ "wayland-protocols",
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "windows 0.61.3",
@@ -2177,7 +2201,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -2315,7 +2339,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -2335,6 +2359,30 @@ dependencies = [
  "tempfile",
  "url",
  "util",
+]
+
+[[package]]
+name = "iana-time-zone"
+version = "0.1.64"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33e57f83510bb73707521ebaffa789ec8caf86f9657cad665b092b581d40e9fb"
+dependencies = [
+ "android_system_properties",
+ "core-foundation-sys",
+ "iana-time-zone-haiku",
+ "js-sys",
+ "log",
+ "wasm-bindgen",
+ "windows-core 0.61.2",
+]
+
+[[package]]
+name = "iana-time-zone-haiku"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -2859,7 +2907,7 @@ dependencies = [
 [[package]]
 name = "media"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -3463,7 +3511,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "collections",
  "serde",
@@ -3996,7 +4044,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "derive_refineable",
 ]
@@ -4694,7 +4742,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "arrayvec",
  "log",
@@ -5376,7 +5424,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "util"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -5412,7 +5460,7 @@ dependencies = [
 [[package]]
 name = "util_macros"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "perf",
  "quote",
@@ -5646,18 +5694,6 @@ dependencies = [
 
 [[package]]
 name = "wayland-protocols"
-version = "0.31.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f81f365b8b4a97f422ac0e8737c438024b5951734506b0e1d775c73030561f4"
-dependencies = [
- "bitflags 2.10.0",
- "wayland-backend",
- "wayland-client",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-protocols"
 version = "0.32.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baeda9ffbcfc8cd6ddaade385eaf2393bd2115a69523c735f12242353c3df4f3"
@@ -5670,14 +5706,14 @@ dependencies = [
 
 [[package]]
 name = "wayland-protocols-plasma"
-version = "0.2.0"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23803551115ff9ea9bce586860c5c5a971e360825a0309264102a9495a5ff479"
+checksum = "aa98634619300a535a9a97f338aed9a5ff1e01a461943e8346ff4ae26007306b"
 dependencies = [
  "bitflags 2.10.0",
  "wayland-backend",
  "wayland-client",
- "wayland-protocols 0.31.2",
+ "wayland-protocols",
  "wayland-scanner",
 ]
 
@@ -5690,7 +5726,7 @@ dependencies = [
  "bitflags 2.10.0",
  "wayland-backend",
  "wayland-client",
- "wayland-protocols 0.32.10",
+ "wayland-protocols",
  "wayland-scanner",
 ]
 
@@ -6620,6 +6656,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlog"
+version = "0.1.0"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "collections",
+ "log",
+]
+
+[[package]]
 name = "zmij"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6628,17 +6675,18 @@ checksum = "aac060176f7020d62c3bcc1cdbcec619d54f48b07ad1963a3f80ce7a0c17755f"
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
+ "zlog",
  "ztracing_macro",
 ]
 
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#80433cb239e868271457ac376673a5f75bc4adb1"
+source = "git+https://github.com/zed-industries/zed#cff3ac6f93f506330034652f0d2389591bfb45a0"
 
 [[package]]
 name = "zune-core"

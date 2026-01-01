@@ -77,7 +77,7 @@ fn main() {
 
             let view = cx.new(|cx| {
                 let focus_handle = cx.focus_handle();
-                focus_handle.focus(window);
+                focus_handle.focus(window, cx);
 
                 let session = TerminalSession::new(config).expect("vt init");
                 let input = TerminalInput::new(move |bytes| {

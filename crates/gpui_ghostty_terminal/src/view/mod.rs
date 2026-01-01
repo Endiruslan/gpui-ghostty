@@ -657,7 +657,7 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
 
         if event.first_mouse {
             return;
@@ -1861,7 +1861,14 @@ impl Element for TerminalTextElement {
             let origin = bounds.origin;
             for (row, line) in prepaint.shaped_lines.iter().enumerate() {
                 let y = origin.y + prepaint.line_height * row as f32;
-                let _ = line.paint(point(origin.x, y), prepaint.line_height, window, cx);
+                let _ = line.paint(
+                    point(origin.x, y),
+                    prepaint.line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
 
             for quad in prepaint.box_drawing_quads.drain(..) {
@@ -1873,7 +1880,14 @@ impl Element for TerminalTextElement {
             }
 
             if let Some((line, origin)) = prepaint.marked_text.as_ref() {
-                let _ = line.paint(*origin, prepaint.line_height, window, cx);
+                let _ = line.paint(
+                    *origin,
+                    prepaint.line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
 
             if let Some(cursor) = prepaint.cursor.take() {
