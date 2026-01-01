@@ -80,6 +80,7 @@ pub struct TerminalSession {
     clipboard_write: Option<String>,
     parse_tail: Vec<u8>,
     dsr_state: DsrScanState,
+    osc_query_state: OscQueryScanState,
 }
 
 impl TerminalSession {
@@ -96,6 +97,7 @@ impl TerminalSession {
             clipboard_write: None,
             parse_tail: Vec::new(),
             dsr_state: DsrScanState::default(),
+            osc_query_state: OscQueryScanState::default(),
         })
     }
 
@@ -302,20 +304,33 @@ impl TerminalSession {
 
         let mut seg_start = 0usize;
         for (i, &b) in bytes.iter().enumerate() {
-            let Some(query) = self.dsr_state.advance(b) else {
+            let dsr = self.dsr_state.advance(b);
+            let osc = self.osc_query_state.advance(b);
+            if dsr.is_none() && osc.is_none() {
                 continue;
-            };
+            }
 
             self.terminal.feed(&bytes[seg_start..=i])?;
             seg_start = i + 1;
 
-            match query {
-                TerminalQuery::DeviceStatus => send(b"\x1b[0n"),
-                TerminalQuery::CursorPosition => {
-                    let (col, row) = self.cursor_position().unwrap_or((1, 1));
-                    let resp = format!("\x1b[{};{}R", row, col);
-                    send(resp.as_bytes());
+            if let Some(query) = dsr {
+                match query {
+                    TerminalQuery::DeviceStatus => send(b"\x1b[0n"),
+                    TerminalQuery::CursorPosition => {
+                        let (col, row) = self.cursor_position().unwrap_or((1, 1));
+                        let resp = format!("\x1b[{};{}R", row, col);
+                        send(resp.as_bytes());
+                    }
                 }
+            }
+
+            if let Some(query) = osc {
+                let rgb = match query {
+                    OscQuery::ForegroundColor => (0xFFu8, 0xFFu8, 0xFFu8),
+                    OscQuery::BackgroundColor => (0x00u8, 0x00u8, 0x00u8),
+                };
+                let resp = osc_color_query_response(query, rgb);
+                send(resp.as_bytes());
             }
         }
 
@@ -375,6 +390,28 @@ enum TerminalQuery {
     CursorPosition,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscQuery {
+    ForegroundColor,
+    BackgroundColor,
+}
+
+fn osc_color_query_response(query: OscQuery, (r, g, b): (u8, u8, u8)) -> String {
+    let ps = match query {
+        OscQuery::ForegroundColor => 10,
+        OscQuery::BackgroundColor => 11,
+    };
+
+    let r16 = u16::from(r) * 0x0101;
+    let g16 = u16::from(g) * 0x0101;
+    let b16 = u16::from(b) * 0x0101;
+
+    format!(
+        "\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+        ps, r16, g16, b16
+    )
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 enum DsrScanState {
     #[default]
@@ -414,6 +451,69 @@ impl DsrScanState {
         };
 
         matched
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum OscQueryScanState {
+    #[default]
+    Idle,
+    Esc,
+    Osc,
+    Ps { value: u32 },
+    AfterSemicolon { ps: u32 },
+    Query { ps: u32 },
+    StEscape { ps: u32 },
+}
+
+impl OscQueryScanState {
+    fn advance(&mut self, b: u8) -> Option<OscQuery> {
+        use OscQueryScanState::*;
+
+        let matched = match (*self, b) {
+            (Query { ps }, 0x07) => match ps {
+                10 => Some(OscQuery::ForegroundColor),
+                11 => Some(OscQuery::BackgroundColor),
+                _ => None,
+            },
+            (StEscape { ps }, b'\\') => match ps {
+                10 => Some(OscQuery::ForegroundColor),
+                11 => Some(OscQuery::BackgroundColor),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        *self = match (*self, b) {
+            (Query { ps }, 0x1b) => StEscape { ps },
+            (_, 0x1b) => Esc,
+            (Esc, b']') => Osc,
+            (Esc, _) => Idle,
+            (Osc, d) if d.is_ascii_digit() => Ps {
+                value: (d - b'0') as u32,
+            },
+            (Ps { value }, d) if d.is_ascii_digit() => Ps {
+                value: value.saturating_mul(10).saturating_add((d - b'0') as u32),
+            },
+            (Ps { value }, b';') => value_to_after_semicolon_state(value),
+            (Osc, _) | (Ps { .. }, _) => Idle,
+            (AfterSemicolon { ps }, b'?') => Query { ps },
+            (AfterSemicolon { .. }, _) => Idle,
+            (Query { .. }, 0x07) => Idle,
+            (Query { .. }, _) => Idle,
+            (StEscape { .. }, b'\\') => Idle,
+            (StEscape { .. }, _) => Idle,
+            _ => Idle,
+        };
+
+        matched
+    }
+}
+
+fn value_to_after_semicolon_state(ps: u32) -> OscQueryScanState {
+    match ps {
+        10 | 11 => OscQueryScanState::AfterSemicolon { ps },
+        _ => OscQueryScanState::Idle,
     }
 }
 
@@ -2668,6 +2768,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(response, b"\x1b[0n");
+    }
+
+    #[test]
+    fn responds_to_osc_10_default_foreground_color_query() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut response = Vec::new();
+
+        session
+            .feed_with_pty_responses(b"\x1b]10;?\x1b\\", |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+
+        let expected =
+            super::osc_color_query_response(super::OscQuery::ForegroundColor, (0xFF, 0xFF, 0xFF));
+        assert_eq!(response, expected.as_bytes());
+    }
+
+    #[test]
+    fn responds_to_osc_11_default_background_color_query() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut response = Vec::new();
+
+        session
+            .feed_with_pty_responses(b"\x1b]11;?\x1b\\", |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+
+        let expected =
+            super::osc_color_query_response(super::OscQuery::BackgroundColor, (0x00, 0x00, 0x00));
+        assert_eq!(response, expected.as_bytes());
+    }
+
+    #[test]
+    fn responds_to_osc_11_across_chunk_boundaries() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut response = Vec::new();
+
+        session
+            .feed_with_pty_responses(b"\x1b]11;?\x1b", |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+        assert!(response.is_empty());
+
+        session
+            .feed_with_pty_responses(b"\\", |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+
+        let expected =
+            super::osc_color_query_response(super::OscQuery::BackgroundColor, (0x00, 0x00, 0x00));
+        assert_eq!(response, expected.as_bytes());
+    }
+
+    #[test]
+    fn responds_to_osc_11_query_terminated_by_bel() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut response = Vec::new();
+
+        session
+            .feed_with_pty_responses(b"\x1b]11;?\x07", |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+
+        let expected =
+            super::osc_color_query_response(super::OscQuery::BackgroundColor, (0x00, 0x00, 0x00));
+        assert_eq!(response, expected.as_bytes());
     }
 
     #[test]

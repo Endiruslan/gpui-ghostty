@@ -58,6 +58,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M5.9: Line Drawing Charset (DEC Special Graphics)
 - [x] M5.10: IME Enter Passthrough (do not skip Enter key)
 - [x] M5.11: Unicode Box Drawing (procedural glyph overlay)
+- [x] M5.12: OSC Default Colors (reply to OSC 10/11 queries)
 
 ## User Work
 
