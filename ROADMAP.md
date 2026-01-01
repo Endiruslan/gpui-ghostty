@@ -65,6 +65,9 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M6.1: Default Colors (configurable fg/bg for OSC 10/11 + renderer clear)
 - [x] M6.2: Background Clear (always paint base background to avoid artifacts)
 - [x] M6.3: Terminal Env Defaults (TERM/COLORTERM for examples)
+- [ ] M7.1: Refactor (split gpui_ghostty_terminal into modules)
+- [ ] M7.2: API Surface (stable re-exports + minimal public types)
+- [ ] M7.3: Tests (move + expand unit test coverage)
 
 ## User Work
 
