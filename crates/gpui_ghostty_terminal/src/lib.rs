@@ -17,6 +17,17 @@ fn split_viewport_lines(viewport: &str) -> Vec<String> {
     viewport.split('\n').map(|line| line.to_string()).collect()
 }
 
+fn should_skip_key_down_for_ime(has_input: bool, keystroke: &gpui::Keystroke) -> bool {
+    if !has_input || !keystroke.is_ime_in_progress() {
+        return false;
+    }
+
+    !matches!(
+        keystroke.key.as_str(),
+        "enter" | "return" | "kp_enter" | "numpad_enter"
+    )
+}
+
 fn sgr_mouse_button_value(
     base_button: u8,
     motion: bool,
@@ -1124,7 +1135,7 @@ pub mod view {
             cx: &mut Context<Self>,
         ) {
             let raw_keystroke = event.keystroke.clone();
-            if self.input.is_some() && raw_keystroke.is_ime_in_progress() {
+            if super::should_skip_key_down_for_ime(self.input.is_some(), &raw_keystroke) {
                 return;
             }
             let keystroke = raw_keystroke.with_simulated_ime();
@@ -2299,6 +2310,7 @@ fn viewport_index_for_cell(viewport: &str, row: u16, col: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{TerminalConfig, TerminalSession};
+    use gpui::Keystroke;
 
     #[test]
     fn tracks_bracketed_paste_mode_from_output() {
@@ -2352,8 +2364,8 @@ mod tests {
 
     #[test]
     fn viewport_index_accounts_for_wide_characters() {
-        let viewport = "你a\n";
-        let wide_len = "你".len();
+        let viewport = "Ｗa\n";
+        let wide_len = "Ｗ".len();
 
         assert_eq!(super::viewport_index_for_cell(viewport, 1, 1), 0);
         assert_eq!(super::viewport_index_for_cell(viewport, 1, 2), 0);
@@ -2500,10 +2512,25 @@ mod tests {
     }
 
     #[test]
+    fn does_not_skip_enter_key_when_ime_in_progress() {
+        let enter = Keystroke::parse("enter").unwrap();
+        assert!(enter.is_ime_in_progress());
+        assert!(!super::should_skip_key_down_for_ime(true, &enter));
+
+        let letter = Keystroke::parse("a").unwrap();
+        assert!(letter.is_ime_in_progress());
+        assert!(super::should_skip_key_down_for_ime(true, &letter));
+
+        let committed = Keystroke::parse("a->a").unwrap();
+        assert!(!committed.is_ime_in_progress());
+        assert!(!super::should_skip_key_down_for_ime(true, &committed));
+    }
+
+    #[test]
     fn byte_index_for_column_in_line_handles_wide_characters() {
-        assert_eq!(super::view::byte_index_for_column_in_line("你a", 1), 0);
-        assert_eq!(super::view::byte_index_for_column_in_line("你a", 2), 0);
-        assert_eq!(super::view::byte_index_for_column_in_line("你a", 3), "你".len());
-        assert_eq!(super::view::byte_index_for_column_in_line("你a", 4), "你".len() + 1);
+        assert_eq!(super::view::byte_index_for_column_in_line("Ｗa", 1), 0);
+        assert_eq!(super::view::byte_index_for_column_in_line("Ｗa", 2), 0);
+        assert_eq!(super::view::byte_index_for_column_in_line("Ｗa", 3), "Ｗ".len());
+        assert_eq!(super::view::byte_index_for_column_in_line("Ｗa", 4), "Ｗ".len() + 1);
     }
 }
