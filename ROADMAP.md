@@ -100,6 +100,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Add Apache-2.0 license (LICENSE + crate metadata + docs).
 - [x] Remove obsolete `.gitkeep` file.
 - [x] Initialize CI (GitHub Actions).
+- [x] Fix auto URL detection for `https://...` links (cmd-click).
 
 ## Future Work
 

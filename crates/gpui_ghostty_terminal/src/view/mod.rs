@@ -157,6 +157,15 @@ fn url_at_byte_index(text: &str, index: usize) -> Option<String> {
     }
 }
 
+fn url_at_column_in_line(line: &str, col: u16) -> Option<String> {
+    if line.is_empty() {
+        return None;
+    }
+
+    let local = byte_index_for_column_in_line(line, col).min(line.len().saturating_sub(1));
+    url_at_byte_index(line, local)
+}
+
 pub struct TerminalInput {
     send: Box<dyn Fn(&[u8]) + Send + Sync + 'static>,
 }
@@ -656,6 +665,16 @@ impl TerminalView {
             if let Some((col, row)) = self.mouse_position_to_cell(event.position, window) {
                 if let Some(link) = self.session.hyperlink_at(col, row) {
                     let item = ClipboardItem::new_string(link);
+                    cx.write_to_clipboard(item.clone());
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    cx.write_to_primary(item);
+                    return;
+                }
+
+                if let Some(line) = self.viewport_lines.get(row.saturating_sub(1) as usize)
+                    && let Some(url) = url_at_column_in_line(line, col)
+                {
+                    let item = ClipboardItem::new_string(url);
                     cx.write_to_clipboard(item.clone());
                     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                     cx.write_to_primary(item);
@@ -1860,6 +1879,34 @@ impl Element for TerminalTextElement {
                 window.paint_quad(cursor);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{url_at_byte_index, url_at_column_in_line};
+
+    #[test]
+    fn url_detection_finds_https_links() {
+        let text = "Visit https://google.com for search";
+        let idx = text.find("google").unwrap();
+        assert_eq!(
+            url_at_byte_index(text, idx).as_deref(),
+            Some("https://google.com")
+        );
+    }
+
+    #[test]
+    fn url_detection_finds_https_links_by_cell_column() {
+        let line = "https://google.com";
+        assert_eq!(
+            url_at_column_in_line(line, 1).as_deref(),
+            Some("https://google.com")
+        );
+        assert_eq!(
+            url_at_column_in_line(line, 10).as_deref(),
+            Some("https://google.com")
+        );
     }
 }
 
