@@ -515,6 +515,7 @@ pub mod view {
         viewport_lines: Vec<String>,
         viewport_line_offsets: Vec<usize>,
         viewport_cell_styles: Vec<Vec<CellStyle>>,
+        viewport_row_bg_runs: Vec<Option<Vec<ViewportBgRun>>>,
         line_layouts: Vec<Option<gpui::ShapedLine>>,
         line_layout_key: Option<(Pixels, Pixels)>,
         focus_handle: FocusHandle,
@@ -552,6 +553,7 @@ pub mod view {
                 viewport_lines: Vec::new(),
                 viewport_line_offsets: Vec::new(),
                 viewport_cell_styles: Vec::new(),
+                viewport_row_bg_runs: Vec::new(),
                 line_layouts: Vec::new(),
                 line_layout_key: None,
                 focus_handle,
@@ -578,6 +580,7 @@ pub mod view {
                 viewport_lines: Vec::new(),
                 viewport_line_offsets: Vec::new(),
                 viewport_cell_styles: Vec::new(),
+                viewport_row_bg_runs: Vec::new(),
                 line_layouts: Vec::new(),
                 line_layout_key: None,
                 focus_handle,
@@ -708,6 +711,7 @@ pub mod view {
                 self.viewport_cell_styles = (0..self.session.rows())
                     .map(|row| self.session.dump_viewport_row_cell_styles(row).unwrap_or_default())
                     .collect();
+                self.viewport_row_bg_runs = vec![None; self.viewport_cell_styles.len()];
                 self.line_layouts.clear();
                 self.line_layout_key = None;
                 self.selection = None;
@@ -753,6 +757,10 @@ pub mod view {
                 self.refresh_viewport();
                 return true;
             }
+            if self.viewport_row_bg_runs.len() != expected_rows {
+                self.refresh_viewport();
+                return true;
+            }
 
             for &row in dirty_rows {
                 let row = row as usize;
@@ -775,6 +783,9 @@ pub mod view {
                     .session
                     .dump_viewport_row_cell_styles(row as u16)
                     .unwrap_or_default();
+                if row < self.viewport_row_bg_runs.len() {
+                    self.viewport_row_bg_runs[row] = None;
+                }
                 if row < self.line_layouts.len() {
                     self.line_layouts[row] = None;
                 }
@@ -1478,6 +1489,13 @@ pub mod view {
         cursor: Option<PaintQuad>,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ViewportBgRun {
+        start_col: usize,
+        end_col: usize,
+        bg: Rgb,
+    }
+
     pub(crate) fn byte_index_for_column_in_line(line: &str, col: u16) -> usize {
         use unicode_width::UnicodeWidthChar as _;
 
@@ -1701,47 +1719,73 @@ pub mod view {
                     let origin = bounds.origin;
                     let mut quads: Vec<PaintQuad> = Vec::new();
 
+                    self.view.update(cx, |view, _cx| {
+                        if view.viewport_row_bg_runs.len() != view.viewport_cell_styles.len() {
+                            view.viewport_row_bg_runs = vec![None; view.viewport_cell_styles.len()];
+                        }
+
+                        for (row, styles) in view.viewport_cell_styles.iter().enumerate() {
+                            if row >= view.viewport_row_bg_runs.len() {
+                                break;
+                            }
+                            if view.viewport_row_bg_runs[row].is_some() {
+                                continue;
+                            }
+                            if styles.is_empty() {
+                                view.viewport_row_bg_runs[row] = Some(Vec::new());
+                                continue;
+                            }
+
+                            let mut runs: Vec<ViewportBgRun> = Vec::new();
+                            let mut run_start: usize = 0;
+                            let mut run_bg = styles[0].bg;
+
+                            for (col, style) in styles.iter().enumerate().skip(1) {
+                                if style.bg == run_bg {
+                                    continue;
+                                }
+
+                                if run_bg != default_bg && col > run_start {
+                                    runs.push(ViewportBgRun {
+                                        start_col: run_start,
+                                        end_col: col,
+                                        bg: run_bg,
+                                    });
+                                }
+
+                                run_start = col;
+                                run_bg = style.bg;
+                            }
+
+                            if run_bg != default_bg && styles.len() > run_start {
+                                runs.push(ViewportBgRun {
+                                    start_col: run_start,
+                                    end_col: styles.len(),
+                                    bg: run_bg,
+                                });
+                            }
+
+                            view.viewport_row_bg_runs[row] = Some(runs);
+                        }
+                    });
+
                     let view = self.view.read(cx);
-                    for (row, styles) in view.viewport_cell_styles.iter().enumerate() {
-                        if styles.is_empty() {
+                    for (row, runs) in view.viewport_row_bg_runs.iter().enumerate() {
+                        let Some(runs) = runs.as_ref() else {
+                            continue;
+                        };
+                        if runs.is_empty() {
                             continue;
                         }
 
                         let y = origin.y + line_height * row as f32;
-                        let mut run_start: usize = 0;
-                        let mut run_bg = styles[0].bg;
-
-                        for (col, style) in styles.iter().enumerate().skip(1) {
-                            if style.bg == run_bg {
-                                continue;
-                            }
-
-                            if run_bg != default_bg && col > run_start {
-                                let x = origin.x + px(cell_width * run_start as f32);
-                                let w = px(cell_width * (col - run_start) as f32);
-                                let color = rgba(
-                                    (u32::from(run_bg.r) << 24)
-                                        | (u32::from(run_bg.g) << 16)
-                                        | (u32::from(run_bg.b) << 8)
-                                        | 0xFF,
-                                );
-                                quads.push(fill(
-                                    Bounds::new(point(x, y), size(w, line_height)),
-                                    color,
-                                ));
-                            }
-
-                            run_start = col;
-                            run_bg = style.bg;
-                        }
-
-                        if run_bg != default_bg && styles.len() > run_start {
-                            let x = origin.x + px(cell_width * run_start as f32);
-                            let w = px(cell_width * (styles.len() - run_start) as f32);
+                        for run in runs {
+                            let x = origin.x + px(cell_width * run.start_col as f32);
+                            let w = px(cell_width * (run.end_col - run.start_col) as f32);
                             let color = rgba(
-                                (u32::from(run_bg.r) << 24)
-                                    | (u32::from(run_bg.g) << 16)
-                                    | (u32::from(run_bg.b) << 8)
+                                (u32::from(run.bg.r) << 24)
+                                    | (u32::from(run.bg.g) << 16)
+                                    | (u32::from(run.bg.b) << 8)
                                     | 0xFF,
                             );
                             quads.push(fill(
@@ -1893,6 +1937,8 @@ pub mod view {
             );
 
             window.paint_layer(bounds, |window| {
+                window.paint_quad(fill(bounds, gpui::black()));
+
                 for quad in prepaint.background_quads.drain(..) {
                     window.paint_quad(quad);
                 }

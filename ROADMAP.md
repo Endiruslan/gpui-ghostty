@@ -52,6 +52,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M5.3: Layout Clipping and Viewport Sizing
 - [x] M5.4: Monospace Alignment (disable ligatures, stable glyph positions)
 - [x] M5.5: Default Monospace Font Family
+- [x] M5.6: Interactive TUI Polish (clear artifacts, reduce startup cost)
 
 ## User Work
 
