@@ -35,6 +35,7 @@ const TerminalHandle = struct {
         };
         handle.handler.terminal = &handle.terminal;
         handle.stream = terminal.Stream(*Handler).init(&handle.handler);
+        handle.stream.parser.osc_parser.alloc = alloc;
         return handle;
     }
 
@@ -85,6 +86,48 @@ const Handler = struct {
 
     pub fn configureCharset(self: *Handler, slot: terminal.CharsetSlot, set: terminal.Charset) !void {
         self.terminal.configureCharset(slot, set);
+    }
+
+    pub fn handleColorOperation(
+        self: *Handler,
+        op: terminal.osc.color.Operation,
+        requests: *const terminal.osc.color.List,
+        terminator: terminal.osc.Terminator,
+    ) !void {
+        _ = op;
+        _ = terminator;
+
+        if (requests.count() == 0) return;
+
+        var it = requests.constIterator(0);
+        while (it.next()) |req| {
+            switch (req.*) {
+                .set => |set| switch (set.target) {
+                    .palette => |i| {
+                        self.terminal.color_palette.colors[i] = set.color;
+                        self.terminal.color_palette.mask.set(i);
+                    },
+                    else => {},
+                },
+                .reset => |target| switch (target) {
+                    .palette => |i| {
+                        self.terminal.color_palette.colors[i] = self.terminal.default_palette[i];
+                        self.terminal.color_palette.mask.unset(i);
+                    },
+                    else => {},
+                },
+                .reset_palette => {
+                    const mask = &self.terminal.color_palette.mask;
+                    var mask_iterator = mask.iterator(.{});
+                    while (mask_iterator.next()) |idx| {
+                        const i: usize = idx;
+                        self.terminal.color_palette.colors[i] = self.terminal.default_palette[i];
+                    }
+                    self.terminal.color_palette.mask = .initEmpty();
+                },
+                else => {},
+            }
+        }
     }
 
     pub fn setCursorLeft(self: *Handler, amount: u16) !void {
