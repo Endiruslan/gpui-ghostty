@@ -46,6 +46,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] M3.3: Regression Tests (scrollback + resize)
 - [x] M1.12: Incremental Damage Updates (reduce per-frame work)
 - [x] M3.5: Deep Behavior Regression Coverage
+- [x] M4.4: Layout + End-to-End Examples
 
 ## User Work
 
@@ -63,5 +64,4 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 
 ## Future Work
 
-- M4 (remaining): Better grid sizing and layout, richer end-to-end examples.
 - M5: IME support (CJK input).

@@ -25,3 +25,5 @@ Pipe any byte stream into the VT core and print the rendered viewport text:
 ### GPUI demo
 
 - Run: `cargo run -p basic_terminal`
+- Run with a login shell PTY: `cargo run -p pty_terminal`
+- Run with two split panes (two login shells): `cargo run -p split_pty_terminal`
