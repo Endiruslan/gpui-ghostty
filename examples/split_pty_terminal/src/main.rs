@@ -93,7 +93,7 @@ fn compute_cell_metrics(window: &mut Window) -> Option<(f32, f32)> {
     let mut style = window.text_style();
     let font = default_terminal_font();
     style.font_family = font.family.clone();
-    style.font_features = font.features;
+    style.font_features = gpui_ghostty_terminal::default_terminal_font_features();
     style.font_fallbacks = font.fallbacks.clone();
 
     let rem_size = window.rem_size();

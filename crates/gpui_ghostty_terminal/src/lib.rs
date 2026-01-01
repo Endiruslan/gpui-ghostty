@@ -1557,7 +1557,7 @@ pub mod view {
             let mut style = window.text_style();
             let font = { self.view.read(cx).font.clone() };
             style.font_family = font.family.clone();
-            style.font_features = font.features.clone();
+            style.font_features = crate::default_terminal_font_features();
             style.font_fallbacks = font.fallbacks.clone();
             style.color = gpui::white();
             let rem_size = window.rem_size();
@@ -1566,6 +1566,8 @@ pub mod view {
 
             let run_font = style.font();
             let run_color = style.color;
+
+            let cell_width = crate::cell_metrics(window, &font).map(|(w, _)| px(w));
 
             self.view.update(cx, |view, _cx| {
                 if view.viewport_lines.is_empty() {
@@ -1677,7 +1679,18 @@ pub mod view {
                         });
                     }
 
-                    let shaped = window.text_system().shape_line(text, font_size, &runs, None);
+                    let force_width = cell_width.and_then(|cell_width| {
+                        use unicode_width::UnicodeWidthChar as _;
+                        let has_wide = text
+                            .as_str()
+                            .chars()
+                            .any(|ch| ch.width().unwrap_or(0) > 1);
+                        (!has_wide).then_some(cell_width)
+                    });
+                    let shaped =
+                        window
+                            .text_system()
+                            .shape_line(text, font_size, &runs, force_width);
                     *slot = Some(shaped);
                 }
             });
@@ -1966,7 +1979,7 @@ pub mod view {
 fn cell_metrics(window: &mut gpui::Window, font: &gpui::Font) -> Option<(f32, f32)> {
     let mut style = window.text_style();
     style.font_family = font.family.clone();
-    style.font_features = font.features.clone();
+    style.font_features = crate::default_terminal_font_features();
     style.font_fallbacks = font.fallbacks.clone();
 
     let rem_size = window.rem_size();
@@ -2009,6 +2022,15 @@ pub fn default_terminal_font() -> gpui::Font {
     let mut font = gpui::font("monospace");
     font.fallbacks = Some(fallbacks);
     font
+}
+
+pub fn default_terminal_font_features() -> gpui::FontFeatures {
+    use std::sync::Arc;
+    gpui::FontFeatures(Arc::new(vec![
+        ("calt".to_string(), 0),
+        ("liga".to_string(), 0),
+        ("kern".to_string(), 0),
+    ]))
 }
 
 fn decode_osc_52(payload: &[u8]) -> Option<String> {
