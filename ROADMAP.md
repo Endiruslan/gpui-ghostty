@@ -64,7 +64,12 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Keep `Agent Work` and `Future Work` aligned with the implemented code (documented in `AGENTS.md`).
 - [x] Fix CJK output alignment
 - [x] Fix duplicate character input (e.g. typing "j" shows twice)
-- [ ] 更新 readme
+- [x] Update README
+- [x] Fix DSR cursor position report (for codex/claude: "The cursor position could not be read within a normal duration")
+- [ ] 复制内容时指针移动速度和内容选中速度不一致
+- [ ] 看不到游标的位置
+- [ ] 中文候选框窗口与实际位置不一致，有错位
+- [ ] 运行 htop 等应用显示不正常
 
 ## Future Work
 

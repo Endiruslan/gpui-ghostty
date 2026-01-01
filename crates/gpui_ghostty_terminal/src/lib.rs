@@ -68,6 +68,7 @@ pub struct TerminalSession {
     title: Option<String>,
     clipboard_write: Option<String>,
     parse_tail: Vec<u8>,
+    dsr_state: DsrScanState,
 }
 
 impl TerminalSession {
@@ -83,6 +84,7 @@ impl TerminalSession {
             title: None,
             clipboard_write: None,
             parse_tail: Vec::new(),
+            dsr_state: DsrScanState::default(),
         })
     }
 
@@ -280,6 +282,35 @@ impl TerminalSession {
         self.terminal.feed(bytes)
     }
 
+    pub fn feed_with_pty_responses(
+        &mut self,
+        bytes: &[u8],
+        mut send: impl FnMut(&[u8]),
+    ) -> Result<(), Error> {
+        self.update_state_from_output(bytes);
+
+        let mut seg_start = 0usize;
+        for (i, &b) in bytes.iter().enumerate() {
+            let dsr = self.dsr_state.advance(b);
+            if !dsr {
+                continue;
+            }
+
+            self.terminal.feed(&bytes[seg_start..=i])?;
+            seg_start = i + 1;
+
+            let (col, row) = self.cursor_position().unwrap_or((1, 1));
+            let resp = format!("\x1b[{};{}R", row, col);
+            send(resp.as_bytes());
+        }
+
+        if seg_start < bytes.len() {
+            self.terminal.feed(&bytes[seg_start..])?;
+        }
+
+        Ok(())
+    }
+
     pub fn dump_viewport(&self) -> Result<String, Error> {
         self.terminal.dump_viewport()
     }
@@ -313,6 +344,38 @@ impl TerminalSession {
         self.terminal
             .take_dirty_viewport_rows(self.config.rows)
             .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum DsrScanState {
+    #[default]
+    Idle,
+    Esc,
+    Csi,
+    CsiQ,
+    Csi6,
+    CsiQ6,
+}
+
+impl DsrScanState {
+    fn advance(&mut self, b: u8) -> bool {
+        use DsrScanState::*;
+
+        let matched = matches!((*self, b), (Csi6, b'n') | (CsiQ6, b'n'));
+
+        *self = match (*self, b) {
+            (_, 0x1b) => Esc,
+            (Esc, b'[') => Csi,
+            (Csi, b'?') => CsiQ,
+            (Csi, b'6') => Csi6,
+            (CsiQ, b'6') => CsiQ6,
+            (Csi6, b'n') => Idle,
+            (CsiQ6, b'n') => Idle,
+            _ => Idle,
+        };
+
+        matched
     }
 }
 
@@ -596,7 +659,13 @@ pub mod view {
         }
 
         pub fn feed_output_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-            let _ = self.session.feed(bytes);
+            if let Some(input) = self.input.as_ref() {
+                let _ = self
+                    .session
+                    .feed_with_pty_responses(bytes, |resp| input.send(resp));
+            } else {
+                let _ = self.session.feed(bytes);
+            }
             self.refresh_viewport();
             self.apply_side_effects(cx);
             cx.notify();
@@ -613,7 +682,13 @@ pub mod view {
 
             if !self.pending_output.is_empty() {
                 let pending = std::mem::take(&mut self.pending_output);
-                let _ = self.session.feed(&pending);
+                if let Some(input) = self.input.as_ref() {
+                    let _ = self
+                        .session
+                        .feed_with_pty_responses(&pending, |resp| input.send(resp));
+                } else {
+                    let _ = self.session.feed(&pending);
+                }
                 self.apply_side_effects(cx);
                 let dirty = self.session.take_dirty_viewport_rows();
                 if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
@@ -625,7 +700,14 @@ pub mod view {
                 let mut offset = 0usize;
                 while offset < bytes.len() {
                     let end = (offset + MAX_PENDING_OUTPUT_BYTES).min(bytes.len());
-                    let _ = self.session.feed(&bytes[offset..end]);
+                    if let Some(input) = self.input.as_ref() {
+                        let _ = self.session.feed_with_pty_responses(
+                            &bytes[offset..end],
+                            |resp| input.send(resp),
+                        );
+                    } else {
+                        let _ = self.session.feed(&bytes[offset..end]);
+                    }
                     offset = end;
                 }
                 self.apply_side_effects(cx);
@@ -1454,7 +1536,13 @@ pub mod view {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             if !self.pending_output.is_empty() {
                 let bytes = std::mem::take(&mut self.pending_output);
-                let _ = self.session.feed(&bytes);
+                if let Some(input) = self.input.as_ref() {
+                    let _ = self
+                        .session
+                        .feed_with_pty_responses(&bytes, |resp| input.send(resp));
+                } else {
+                    let _ = self.session.feed(&bytes);
+                }
                 self.apply_side_effects(cx);
                 let dirty = self.session.take_dirty_viewport_rows();
                 if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
@@ -1722,5 +1810,40 @@ mod tests {
         assert_eq!(session.take_clipboard_write(), None);
         session.feed(b"sbG8=\x07").unwrap();
         assert_eq!(session.take_clipboard_write(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn responds_to_csi_6n_cursor_position_request() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut response = Vec::new();
+
+        session
+            .feed_with_pty_responses(b"hi\x1b[6n", |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+
+        assert_eq!(response, b"\x1b[1;3R");
+    }
+
+    #[test]
+    fn responds_to_csi_6n_across_chunk_boundaries() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut response = Vec::new();
+
+        session
+            .feed_with_pty_responses(b"hi\x1b[", |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+        assert!(response.is_empty());
+
+        session
+            .feed_with_pty_responses(b"6n", |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+
+        assert_eq!(response, b"\x1b[1;3R");
     }
 }
