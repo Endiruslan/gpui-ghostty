@@ -31,6 +31,9 @@ int ghostty_vt_terminal_scroll_viewport_bottom(ghostty_vt_terminal_t terminal);
 ghostty_vt_bytes_t ghostty_vt_terminal_dump_viewport(ghostty_vt_terminal_t terminal);
 ghostty_vt_bytes_t ghostty_vt_terminal_take_dirty_viewport_rows(ghostty_vt_terminal_t terminal,
                                                                 uint16_t rows);
+ghostty_vt_bytes_t ghostty_vt_terminal_hyperlink_at(ghostty_vt_terminal_t terminal,
+                                                    uint16_t col,
+                                                    uint16_t row);
 void ghostty_vt_bytes_free(ghostty_vt_bytes_t bytes);
 
 #ifdef __cplusplus

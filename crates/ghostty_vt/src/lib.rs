@@ -88,6 +88,20 @@ impl Terminal {
         Ok(out)
     }
 
+    pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<String> {
+        let bytes = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_hyperlink_at(self.ptr.as_ptr(), col, row)
+        };
+        if bytes.ptr.is_null() || bytes.len == 0 {
+            return None;
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let s = String::from_utf8_lossy(slice).into_owned();
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Some(s)
+    }
+
     pub fn scroll_viewport(&mut self, delta_lines: i32) -> Result<(), Error> {
         let rc = unsafe {
             ghostty_vt_sys::ghostty_vt_terminal_scroll_viewport(self.ptr.as_ptr(), delta_lines)

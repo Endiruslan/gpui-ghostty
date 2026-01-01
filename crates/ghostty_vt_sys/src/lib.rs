@@ -45,5 +45,11 @@ unsafe extern "C" {
         rows: u16,
     ) -> ghostty_vt_bytes_t;
 
+    pub fn ghostty_vt_terminal_hyperlink_at(
+        terminal: *mut core::ffi::c_void,
+        col: u16,
+        row: u16,
+    ) -> ghostty_vt_bytes_t;
+
     pub fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t);
 }

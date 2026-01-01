@@ -111,6 +111,14 @@ const Handler = struct {
     pub fn eraseLine(self: *Handler, mode: terminal.EraseLine, protected: bool) !void {
         self.terminal.eraseLine(mode, protected);
     }
+
+    pub fn startHyperlink(self: *Handler, uri: []const u8, id: ?[]const u8) !void {
+        try self.terminal.screen.startHyperlink(uri, id);
+    }
+
+    pub fn endHyperlink(self: *Handler) !void {
+        self.terminal.screen.endHyperlink();
+    }
 };
 
 export fn ghostty_vt_terminal_new(cols: u16, rows: u16) callconv(.C) ?*anyopaque {
@@ -224,6 +232,30 @@ export fn ghostty_vt_terminal_take_dirty_viewport_rows(
 
     const slice = out.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
     return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
+export fn ghostty_vt_terminal_hyperlink_at(
+    terminal_ptr: ?*anyopaque,
+    col: u16,
+    row: u16,
+) callconv(.C) ghostty_vt_bytes_t {
+    if (terminal_ptr == null or col == 0 or row == 0) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    const x: terminal.size.CellCountInt = @intCast(col - 1);
+    const y: u32 = @intCast(row - 1);
+    const pt: terminal.point.Point = .{ .viewport = .{ .x = x, .y = y } };
+    const pin = handle.terminal.screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+    const rac = pin.rowAndCell();
+    if (!rac.cell.hyperlink) return .{ .ptr = null, .len = 0 };
+
+    const id = pin.node.data.lookupHyperlink(rac.cell) orelse return .{ .ptr = null, .len = 0 };
+    const entry = pin.node.data.hyperlink_set.get(pin.node.data.memory, id).*;
+    const uri = entry.uri.offset.ptr(pin.node.data.memory)[0..entry.uri.len];
+
+    const alloc = std.heap.c_allocator;
+    const duped = alloc.dupe(u8, uri) catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = duped.ptr, .len = duped.len };
 }
 
 const ghostty_vt_bytes_t = extern struct {

@@ -110,6 +110,10 @@ impl TerminalSession {
         self.title.as_deref()
     }
 
+    pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<String> {
+        self.terminal.hyperlink_at(col, row)
+    }
+
     pub fn take_clipboard_write(&mut self) -> Option<String> {
         self.clipboard_write.take()
     }
@@ -515,6 +519,18 @@ pub mod view {
 
             if event.first_mouse {
                 return;
+            }
+
+            if event.button == MouseButton::Left && event.modifiers.platform {
+                if let Some((col, row)) = self.mouse_position_to_cell(event.position, window) {
+                    if let Some(link) = self.session.hyperlink_at(col, row) {
+                        let item = ClipboardItem::new_string(link);
+                        cx.write_to_clipboard(item.clone());
+                        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                        cx.write_to_primary(item);
+                        return;
+                    }
+                }
             }
 
             if event.modifiers.shift
