@@ -1,13 +1,13 @@
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use gpui::{App, AppContext, Application, KeyBinding, WindowOptions};
+use gpui::{App, AppContext, Application, KeyBinding, SharedString, WindowOptions};
 use gpui_ghostty_terminal::view::{Copy, Paste, SelectAll, TerminalInput, TerminalView};
 use gpui_ghostty_terminal::{TerminalConfig, TerminalSession};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::sync::Arc;
 
 fn main() {
     Application::new().run(|cx: &mut App| {
@@ -87,15 +87,36 @@ fn main() {
             let master_for_resize = master.clone();
             let subscription = view.update(cx, |_, cx| {
                 cx.observe_window_bounds(window, move |this, window, cx| {
-                    const CELL_WIDTH_PX: f32 = 8.0;
-                    const CELL_HEIGHT_PX: f32 = 16.0;
-
                     let size = window.bounds().size;
                     let width = f32::from(size.width);
                     let height = f32::from(size.height);
 
-                    let cols = (width / CELL_WIDTH_PX).floor().max(1.0) as u16;
-                    let rows = (height / CELL_HEIGHT_PX).floor().max(1.0) as u16;
+                    let mut style = window.text_style();
+                    style.font_family = "monospace".into();
+
+                    let rem_size = window.rem_size();
+                    let font_size = style.font_size.to_pixels(rem_size);
+                    let line_height = style.line_height.to_pixels(style.font_size, rem_size);
+
+                    let run = style.to_run(1);
+                    let Ok(lines) = window.text_system().shape_text(
+                        SharedString::from("M"),
+                        font_size,
+                        &[run],
+                        None,
+                        Some(1),
+                    ) else {
+                        return;
+                    };
+                    let Some(line) = lines.first() else {
+                        return;
+                    };
+
+                    let cell_width = f32::from(line.width()).max(1.0);
+                    let cell_height = f32::from(line_height).max(1.0);
+
+                    let cols = (width / cell_width).floor().max(1.0) as u16;
+                    let rows = (height / cell_height).floor().max(1.0) as u16;
 
                     let _ = master_for_resize.resize(PtySize {
                         rows,
