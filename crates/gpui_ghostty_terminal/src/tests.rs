@@ -1,6 +1,9 @@
-use gpui::Keystroke;
+use gpui::{KeyBinding, KeyContext, Keymap, Keystroke, actions};
+use std::any::TypeId;
 
 use crate::{TerminalConfig, TerminalSession};
+
+actions!(tab_shadow_test, [RootTab, TerminalTab]);
 
 fn osc_color_response(ps: u8, (r, g, b): (u8, u8, u8)) -> String {
     let r16 = u16::from(r) * 0x0101;
@@ -54,6 +57,29 @@ fn viewport_index_for_cell(viewport: &str, row: u16, col: u16) -> usize {
     }
 
     viewport.len()
+}
+
+#[test]
+fn terminal_tab_binding_shadows_root_tab_binding() {
+    let mut keymap = Keymap::default();
+    keymap.add_bindings([
+        KeyBinding::new("tab", RootTab, Some("Root")),
+        KeyBinding::new("tab", TerminalTab, Some("Terminal")),
+    ]);
+
+    let mut root = KeyContext::default();
+    root.add("Root");
+    let mut terminal = KeyContext::default();
+    terminal.add("Terminal");
+
+    let (bindings, pending) =
+        keymap.bindings_for_input(&[Keystroke::parse("tab").unwrap()], &[root, terminal]);
+
+    assert!(!pending);
+    assert_eq!(
+        bindings[0].action().as_any().type_id(),
+        TypeId::of::<TerminalTab>()
+    );
 }
 
 #[test]

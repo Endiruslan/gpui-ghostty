@@ -107,6 +107,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Verify Zed pin `80433cb239e868271457ac376673a5f75bc4adb1` builds (fails by default: gpui uses `SmallVec::from_const` but `smallvec` feature `const_new` is not enabled; adding `smallvec = { version = \"1.15\", features = [\"const_new\"] }` makes it build).
 - [x] Switch gpui (Zed) to workspace dependency and pin `rev = "v0.217.3"`.
 - [x] Use unpinned Zed git dependency (no rev) and lock to `cff3ac6f93f506330034652f0d2389591bfb45a0`.
+- [x] Fix Tab focus escape: TerminalView should consume Tab/Shift-Tab when focused.
 
 ## Future Work
 

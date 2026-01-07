@@ -2,14 +2,27 @@ use super::TerminalSession;
 use ghostty_vt::{KeyModifiers, Rgb, StyleRun, encode_key_named};
 use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
-    EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Render,
+    EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyBinding, KeyDownEvent,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Render,
     ScrollDelta, ScrollWheelEvent, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
     Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size,
 };
 use std::ops::Range;
+use std::sync::Once;
 
-actions!(terminal_view, [Copy, Paste, SelectAll]);
+actions!(terminal_view, [Copy, Paste, SelectAll, Tab, TabPrev]);
+
+const KEY_CONTEXT: &str = "Terminal";
+static KEY_BINDINGS: Once = Once::new();
+
+fn ensure_key_bindings(cx: &mut App) {
+    KEY_BINDINGS.call_once(|| {
+        cx.bind_keys([
+            KeyBinding::new("tab", Tab, Some(KEY_CONTEXT)),
+            KeyBinding::new("shift-tab", TabPrev, Some(KEY_CONTEXT)),
+        ]);
+    });
+}
 
 fn split_viewport_lines(viewport: &str) -> Vec<String> {
     let viewport = viewport.strip_suffix('\n').unwrap_or(viewport);
@@ -252,6 +265,30 @@ impl TerminalView {
             font: crate::default_terminal_font(),
         }
         .with_refreshed_viewport()
+    }
+
+    fn on_tab(&mut self, _: &Tab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.send_tab(false, cx);
+    }
+
+    fn on_tab_prev(&mut self, _: &TabPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        self.send_tab(true, cx);
+    }
+
+    fn send_tab(&mut self, reverse: bool, cx: &mut Context<Self>) {
+        let bytes: &[u8] = if reverse {
+            b"\x1b[Z".as_slice()
+        } else {
+            b"\t".as_slice()
+        };
+        if let Some(input) = self.input.as_ref() {
+            input.send(bytes);
+            return;
+        }
+
+        let _ = self.session.feed(bytes);
+        self.apply_side_effects(cx);
+        self.schedule_viewport_refresh(cx);
     }
 
     pub fn new_with_input(
@@ -1937,6 +1974,8 @@ impl Element for TerminalTextElement {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ensure_key_bindings(cx);
+
         if !self.pending_output.is_empty() {
             let bytes = std::mem::take(&mut self.pending_output);
             if let Some(input) = self.input.as_ref() {
@@ -1974,9 +2013,12 @@ impl Render for TerminalView {
             .size_full()
             .flex()
             .track_focus(&self.focus_handle)
+            .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_select_all))
             .on_action(cx.listener(Self::on_paste))
+            .on_action(cx.listener(Self::on_tab))
+            .on_action(cx.listener(Self::on_tab_prev))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
