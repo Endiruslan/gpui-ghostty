@@ -11,6 +11,8 @@ const TerminalHandle = struct {
     handler: Handler,
     default_fg: terminal.color.RGB,
     default_bg: terminal.color.RGB,
+    viewport_top_y_screen: u32,
+    has_viewport_top_y_screen: bool,
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
         const handle = try alloc.create(TerminalHandle);
@@ -32,6 +34,8 @@ const TerminalHandle = struct {
             .stream = undefined,
             .default_fg = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
             .default_bg = .{ .r = 0x00, .g = 0x00, .b = 0x00 },
+            .viewport_top_y_screen = 0,
+            .has_viewport_top_y_screen = true,
         };
         handle.handler.terminal = &handle.terminal;
         handle.stream = terminal.Stream(*Handler).init(&handle.handler);
@@ -627,6 +631,40 @@ export fn ghostty_vt_terminal_take_dirty_viewport_rows(
 
     const slice = out.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
     return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
+fn pinScreenRow(pin: terminal.Pin) u32 {
+    var y: u32 = @intCast(pin.y);
+    var node_ = pin.node;
+    while (node_.prev) |node| {
+        y += @intCast(node.data.size.rows);
+        node_ = node;
+    }
+    return y;
+}
+
+export fn ghostty_vt_terminal_take_viewport_scroll_delta(
+    terminal_ptr: ?*anyopaque,
+) callconv(.C) i32 {
+    if (terminal_ptr == null) return 0;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    const tl = handle.terminal.screen.pages.getTopLeft(.viewport);
+    const current: u32 = pinScreenRow(tl);
+
+    if (!handle.has_viewport_top_y_screen) {
+        handle.viewport_top_y_screen = current;
+        handle.has_viewport_top_y_screen = true;
+        return 0;
+    }
+
+    const prev: u32 = handle.viewport_top_y_screen;
+    handle.viewport_top_y_screen = current;
+
+    const delta64: i64 = @as(i64, @intCast(current)) - @as(i64, @intCast(prev));
+    if (delta64 > std.math.maxInt(i32)) return std.math.maxInt(i32);
+    if (delta64 < std.math.minInt(i32)) return std.math.minInt(i32);
+    return @intCast(delta64);
 }
 
 export fn ghostty_vt_terminal_hyperlink_at(

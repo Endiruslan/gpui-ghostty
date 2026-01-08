@@ -74,6 +74,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Add regression tests for full-redraw triggers (alt-screen, reverse colors, palette).
 - [x] Refactor: unify TerminalView input send paths.
 - [x] Refactor: deduplicate output feed+dirty handling.
+- [x] Fix viewport scroll rendering: expose viewport scroll delta and apply incremental line shifting.
 
 ## User Work
 

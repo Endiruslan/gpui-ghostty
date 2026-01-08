@@ -265,6 +265,10 @@ impl Terminal {
         Ok(out)
     }
 
+    pub fn take_viewport_scroll_delta(&mut self) -> i32 {
+        unsafe { ghostty_vt_sys::ghostty_vt_terminal_take_viewport_scroll_delta(self.ptr.as_ptr()) }
+    }
+
     pub fn cursor_position(&self) -> Option<(u16, u16)> {
         let mut col: u16 = 0;
         let mut row: u16 = 0;

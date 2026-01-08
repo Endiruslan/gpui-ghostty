@@ -70,6 +70,7 @@ ghostty_vt_bytes_t ghostty_vt_terminal_dump_viewport_row_style_runs(ghostty_vt_t
                                                                     uint16_t row);
 ghostty_vt_bytes_t ghostty_vt_terminal_take_dirty_viewport_rows(ghostty_vt_terminal_t terminal,
                                                                 uint16_t rows);
+int32_t ghostty_vt_terminal_take_viewport_scroll_delta(ghostty_vt_terminal_t terminal);
 ghostty_vt_bytes_t ghostty_vt_terminal_hyperlink_at(ghostty_vt_terminal_t terminal,
                                                     uint16_t col,
                                                     uint16_t row);

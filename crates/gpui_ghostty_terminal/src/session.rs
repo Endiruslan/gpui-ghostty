@@ -344,6 +344,10 @@ impl TerminalSession {
             .take_dirty_viewport_rows(self.config.rows)
             .unwrap_or_default()
     }
+
+    pub(crate) fn take_viewport_scroll_delta(&mut self) -> i32 {
+        self.terminal.take_viewport_scroll_delta()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

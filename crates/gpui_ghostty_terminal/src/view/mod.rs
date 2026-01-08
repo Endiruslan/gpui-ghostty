@@ -434,7 +434,78 @@ impl TerminalView {
         }
     }
 
+    fn sync_viewport_scroll_tracking(&mut self) {
+        let _ = self.session.take_viewport_scroll_delta();
+    }
+
+    fn apply_viewport_scroll_delta(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+
+        let rows = self.session.rows() as usize;
+        if rows == 0 {
+            return;
+        }
+
+        if self.viewport_lines.len() != rows || self.viewport_style_runs.len() != rows {
+            self.refresh_viewport();
+            return;
+        }
+
+        let delta_abs: usize = delta.unsigned_abs() as usize;
+        if delta_abs == 0 {
+            return;
+        }
+        if delta_abs >= rows {
+            self.refresh_viewport();
+            return;
+        }
+
+        let has_layouts = self.line_layouts.len() == rows;
+
+        if delta > 0 {
+            self.viewport_lines.rotate_left(delta_abs);
+            self.viewport_style_runs.rotate_left(delta_abs);
+            if has_layouts {
+                self.line_layouts.rotate_left(delta_abs);
+            }
+
+            for idx in rows - delta_abs..rows {
+                self.viewport_lines[idx].clear();
+                self.viewport_style_runs[idx].clear();
+                if has_layouts {
+                    self.line_layouts[idx] = None;
+                }
+            }
+
+            let dirty_rows: Vec<u16> = (rows - delta_abs..rows).map(|row| row as u16).collect();
+            let _ = self.apply_dirty_viewport_rows(&dirty_rows);
+            return;
+        }
+
+        self.viewport_lines.rotate_right(delta_abs);
+        self.viewport_style_runs.rotate_right(delta_abs);
+        if has_layouts {
+            self.line_layouts.rotate_right(delta_abs);
+        }
+
+        for idx in 0..delta_abs {
+            self.viewport_lines[idx].clear();
+            self.viewport_style_runs[idx].clear();
+            if has_layouts {
+                self.line_layouts[idx] = None;
+            }
+        }
+
+        let dirty_rows: Vec<u16> = (0..delta_abs).map(|row| row as u16).collect();
+        let _ = self.apply_dirty_viewport_rows(&dirty_rows);
+    }
+
     fn reconcile_dirty_viewport_after_output(&mut self) {
+        let delta = self.session.take_viewport_scroll_delta();
+        self.apply_viewport_scroll_delta(delta);
+
         let dirty = self.session.take_dirty_viewport_rows();
         if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
             self.pending_refresh = true;
@@ -643,6 +714,7 @@ impl TerminalView {
 
     pub fn resize_terminal(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
         let _ = self.session.resize(cols, rows);
+        self.sync_viewport_scroll_tracking();
         self.pending_refresh = true;
         cx.notify();
     }
@@ -892,24 +964,28 @@ impl TerminalView {
                 match keystroke.key.as_str() {
                     "home" => {
                         let _ = self.session.scroll_viewport_top();
+                        self.sync_viewport_scroll_tracking();
                         self.apply_side_effects(cx);
                         self.schedule_viewport_refresh(cx);
                         return;
                     }
                     "end" => {
                         let _ = self.session.scroll_viewport_bottom();
+                        self.sync_viewport_scroll_tracking();
                         self.apply_side_effects(cx);
                         self.schedule_viewport_refresh(cx);
                         return;
                     }
                     "pageup" | "page_up" | "page-up" => {
                         let _ = self.session.scroll_viewport(-scroll_step);
+                        self.sync_viewport_scroll_tracking();
                         self.apply_side_effects(cx);
                         self.schedule_viewport_refresh(cx);
                         return;
                     }
                     "pagedown" | "page_down" | "page-down" => {
                         let _ = self.session.scroll_viewport(scroll_step);
+                        self.sync_viewport_scroll_tracking();
                         self.apply_side_effects(cx);
                         self.schedule_viewport_refresh(cx);
                         return;
@@ -949,24 +1025,28 @@ impl TerminalView {
         match keystroke.key.as_str() {
             "home" => {
                 let _ = self.session.scroll_viewport_top();
+                self.sync_viewport_scroll_tracking();
                 self.apply_side_effects(cx);
                 self.schedule_viewport_refresh(cx);
                 return;
             }
             "end" => {
                 let _ = self.session.scroll_viewport_bottom();
+                self.sync_viewport_scroll_tracking();
                 self.apply_side_effects(cx);
                 self.schedule_viewport_refresh(cx);
                 return;
             }
             "pageup" | "page_up" | "page-up" => {
                 let _ = self.session.scroll_viewport(-scroll_step);
+                self.sync_viewport_scroll_tracking();
                 self.apply_side_effects(cx);
                 self.schedule_viewport_refresh(cx);
                 return;
             }
             "pagedown" | "page_down" | "page-down" => {
                 let _ = self.session.scroll_viewport(scroll_step);
+                self.sync_viewport_scroll_tracking();
                 self.apply_side_effects(cx);
                 self.schedule_viewport_refresh(cx);
                 return;
@@ -1040,6 +1120,7 @@ impl TerminalView {
         }
 
         let _ = self.session.scroll_viewport(delta_lines);
+        self.sync_viewport_scroll_tracking();
         self.apply_side_effects(cx);
         self.schedule_viewport_refresh(cx);
     }
