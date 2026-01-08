@@ -276,19 +276,11 @@ impl TerminalView {
     }
 
     fn send_tab(&mut self, reverse: bool, cx: &mut Context<Self>) {
-        let bytes: &[u8] = if reverse {
-            b"\x1b[Z".as_slice()
+        if reverse {
+            self.send_input_parts(&[b"\x1b[Z"], cx);
         } else {
-            b"\t".as_slice()
-        };
-        if let Some(input) = self.input.as_ref() {
-            input.send(bytes);
-            return;
+            self.send_input_parts(&[b"\t"], cx);
         }
-
-        let _ = self.session.feed(bytes);
-        self.apply_side_effects(cx);
-        self.schedule_viewport_refresh(cx);
     }
 
     pub fn new_with_input(
@@ -410,14 +402,43 @@ impl TerminalView {
             return;
         }
 
-        if let Some(input) = self.input.as_ref() {
-            input.send(text.as_bytes());
+        self.send_input_parts(&[text.as_bytes()], cx);
+    }
+
+    fn send_input_parts(&mut self, parts: &[&[u8]], cx: &mut Context<Self>) {
+        if parts.is_empty() {
             return;
         }
 
-        let _ = self.session.feed(text.as_bytes());
+        if let Some(input) = self.input.as_ref() {
+            for bytes in parts {
+                input.send(bytes);
+            }
+            return;
+        }
+
+        for bytes in parts {
+            let _ = self.session.feed(bytes);
+        }
         self.apply_side_effects(cx);
         self.schedule_viewport_refresh(cx);
+    }
+
+    fn feed_output_bytes_to_session(&mut self, bytes: &[u8]) {
+        if let Some(input) = self.input.as_ref() {
+            let _ = self
+                .session
+                .feed_with_pty_responses(bytes, |resp| input.send(resp));
+        } else {
+            let _ = self.session.feed(bytes);
+        }
+    }
+
+    fn reconcile_dirty_viewport_after_output(&mut self) {
+        let dirty = self.session.take_dirty_viewport_rows();
+        if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
+            self.pending_refresh = true;
+        }
     }
 
     fn with_refreshed_viewport(mut self) -> Self {
@@ -581,13 +602,7 @@ impl TerminalView {
     }
 
     pub fn feed_output_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        if let Some(input) = self.input.as_ref() {
-            let _ = self
-                .session
-                .feed_with_pty_responses(bytes, |resp| input.send(resp));
-        } else {
-            let _ = self.session.feed(bytes);
-        }
+        self.feed_output_bytes_to_session(bytes);
         self.refresh_viewport();
         self.apply_side_effects(cx);
         cx.notify();
@@ -604,38 +619,20 @@ impl TerminalView {
 
         if !self.pending_output.is_empty() {
             let pending = std::mem::take(&mut self.pending_output);
-            if let Some(input) = self.input.as_ref() {
-                let _ = self
-                    .session
-                    .feed_with_pty_responses(&pending, |resp| input.send(resp));
-            } else {
-                let _ = self.session.feed(&pending);
-            }
+            self.feed_output_bytes_to_session(&pending);
             self.apply_side_effects(cx);
-            let dirty = self.session.take_dirty_viewport_rows();
-            if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
-                self.pending_refresh = true;
-            }
+            self.reconcile_dirty_viewport_after_output();
         }
 
         if bytes.len() > MAX_PENDING_OUTPUT_BYTES {
             let mut offset = 0usize;
             while offset < bytes.len() {
                 let end = (offset + MAX_PENDING_OUTPUT_BYTES).min(bytes.len());
-                if let Some(input) = self.input.as_ref() {
-                    let _ = self
-                        .session
-                        .feed_with_pty_responses(&bytes[offset..end], |resp| input.send(resp));
-                } else {
-                    let _ = self.session.feed(&bytes[offset..end]);
-                }
+                self.feed_output_bytes_to_session(&bytes[offset..end]);
                 offset = end;
             }
             self.apply_side_effects(cx);
-            let dirty = self.session.take_dirty_viewport_rows();
-            if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
-                self.pending_refresh = true;
-            }
+            self.reconcile_dirty_viewport_after_output();
             cx.notify();
             return;
         }
@@ -655,26 +652,11 @@ impl TerminalView {
             return;
         };
 
-        if let Some(input) = self.input.as_ref() {
-            if self.session.bracketed_paste_enabled() {
-                input.send(b"\x1b[200~");
-                input.send(text.as_bytes());
-                input.send(b"\x1b[201~");
-            } else {
-                input.send(text.as_bytes());
-            }
-            return;
-        }
-
         if self.session.bracketed_paste_enabled() {
-            let _ = self.session.feed(b"\x1b[200~");
-            let _ = self.session.feed(text.as_bytes());
-            let _ = self.session.feed(b"\x1b[201~");
+            self.send_input_parts(&[b"\x1b[200~", text.as_bytes(), b"\x1b[201~"], cx);
         } else {
-            let _ = self.session.feed(text.as_bytes());
+            self.send_input_parts(&[text.as_bytes()], cx);
         }
-        self.apply_side_effects(cx);
-        self.schedule_viewport_refresh(cx);
     }
 
     fn on_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1978,18 +1960,9 @@ impl Render for TerminalView {
 
         if !self.pending_output.is_empty() {
             let bytes = std::mem::take(&mut self.pending_output);
-            if let Some(input) = self.input.as_ref() {
-                let _ = self
-                    .session
-                    .feed_with_pty_responses(&bytes, |resp| input.send(resp));
-            } else {
-                let _ = self.session.feed(&bytes);
-            }
+            self.feed_output_bytes_to_session(&bytes);
             self.apply_side_effects(cx);
-            let dirty = self.session.take_dirty_viewport_rows();
-            if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
-                self.pending_refresh = true;
-            }
+            self.reconcile_dirty_viewport_after_output();
         }
 
         if self.pending_refresh {
