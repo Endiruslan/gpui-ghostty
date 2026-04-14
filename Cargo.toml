@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "examples/*"]
+members = ["crates/*"]
+exclude = ["examples/*"]
 
 [workspace.dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "5d15e010aee869a9e1f3e168d089b5650aa13ba1", package = "gpui" }
