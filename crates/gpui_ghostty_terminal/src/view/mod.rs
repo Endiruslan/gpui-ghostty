@@ -1155,7 +1155,12 @@ impl TerminalView {
         }
 
         let local_position = self.mouse_position_to_local(position);
-        let (cell_width, cell_height) = cell_metrics(window, &self.font)?;
+        let (cell_width, cell_height) = cell_metrics_with_overrides(
+            window,
+            &self.font,
+            self.session.font_size(),
+            self.session.line_height_ratio(),
+        )?;
         let x = f32::from(local_position.x);
         let y = f32::from(local_position.y);
         let mut row_index = (y / cell_height).floor() as i32;
@@ -1197,7 +1202,12 @@ impl TerminalView {
         let rows = self.session.rows();
 
         let position = self.mouse_position_to_local(position);
-        let (cell_width, cell_height) = cell_metrics(window, &self.font)?;
+        let (cell_width, cell_height) = cell_metrics_with_overrides(
+            window,
+            &self.font,
+            self.session.font_size(),
+            self.session.line_height_ratio(),
+        )?;
         let x = f32::from(position.x);
         let y = f32::from(position.y);
 
@@ -1303,7 +1313,12 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let (col, row) = self.session.cursor_position()?;
-        let (cell_width, cell_height) = cell_metrics(window, &self.font)?;
+        let (cell_width, cell_height) = cell_metrics_with_overrides(
+            window,
+            &self.font,
+            self.session.font_size(),
+            self.session.line_height_ratio(),
+        )?;
 
         let base_x = element_bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
         let base_y = element_bounds.top() + px(cell_height * (row.saturating_sub(1)) as f32);
@@ -1699,12 +1714,25 @@ impl Element for TerminalTextElement {
             view.last_bounds = Some(bounds);
         });
 
+        let (font, font_size_override, line_height_ratio_override, default_fg) = {
+            let view = self.view.read(cx);
+            (
+                view.font.clone(),
+                view.session.font_size(),
+                view.session.line_height_ratio(),
+                view.session.default_foreground(),
+            )
+        };
         let mut style = window.text_style();
-        let font = { self.view.read(cx).font.clone() };
         style.font_family = font.family.clone();
         style.font_features = crate::default_terminal_font_features();
         style.font_fallbacks = font.fallbacks.clone();
-        let default_fg = { self.view.read(cx).session.default_foreground() };
+        if let Some(fs) = font_size_override {
+            style.font_size = px(fs).into();
+        }
+        if let Some(ratio) = line_height_ratio_override {
+            style.line_height = relative(ratio);
+        }
         style.color = hsla_from_rgb(default_fg);
         let rem_size = window.rem_size();
         let font_size = style.font_size.to_pixels(rem_size);
@@ -1713,7 +1741,13 @@ impl Element for TerminalTextElement {
         let run_font = style.font();
         let run_color = style.color;
 
-        let cell_width = cell_metrics(window, &font).map(|(w, _)| px(w));
+        let cell_width = cell_metrics_with_overrides(
+            window,
+            &font,
+            font_size_override,
+            line_height_ratio_override,
+        )
+        .map(|(w, _)| px(w));
 
         self.view.update(cx, |view, _cx| {
             if view.viewport_lines.is_empty() {
@@ -1820,7 +1854,7 @@ impl Element for TerminalTextElement {
         });
 
         let default_bg = { self.view.read(cx).session.default_background() };
-        let background_quads = cell_metrics(window, &font)
+        let background_quads = cell_metrics_with_overrides(window, &font, font_size_override, line_height_ratio_override)
             .map(|(cell_width, _)| {
                 let origin = bounds.origin;
                 let mut quads: Vec<PaintQuad> = Vec::new();
@@ -1882,7 +1916,7 @@ impl Element for TerminalTextElement {
                     return None;
                 }
                 let (col, row) = cursor_position?;
-                let (cell_width, _) = cell_metrics(window, &font)?;
+                let (cell_width, _) = cell_metrics_with_overrides(window, &font, font_size_override, line_height_ratio_override)?;
 
                 let origin_x = bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
                 let origin_y = bounds.top() + line_height * (row.saturating_sub(1)) as f32;
@@ -1993,7 +2027,7 @@ impl Element for TerminalTextElement {
             })
             .unwrap_or_default();
 
-        let box_drawing_quads = cell_metrics(window, &font)
+        let box_drawing_quads = cell_metrics_with_overrides(window, &font, font_size_override, line_height_ratio_override)
             .map(|(cell_width, _)| {
                 use unicode_width::UnicodeWidthChar as _;
                 let default_fg = run_color;
@@ -2253,10 +2287,28 @@ impl Render for TerminalView {
 }
 
 pub(crate) fn cell_metrics(window: &mut gpui::Window, font: &gpui::Font) -> Option<(f32, f32)> {
+    cell_metrics_with_overrides(window, font, None, None)
+}
+
+/// Compute cell (width, height) in px. Overrides let callers force a
+/// specific font size / line-height ratio instead of inheriting from
+/// `window.text_style()`.
+pub(crate) fn cell_metrics_with_overrides(
+    window: &mut gpui::Window,
+    font: &gpui::Font,
+    font_size_override: Option<f32>,
+    line_height_ratio_override: Option<f32>,
+) -> Option<(f32, f32)> {
     let mut style = window.text_style();
     style.font_family = font.family.clone();
     style.font_features = crate::default_terminal_font_features();
     style.font_fallbacks = font.fallbacks.clone();
+    if let Some(fs) = font_size_override {
+        style.font_size = px(fs).into();
+    }
+    if let Some(ratio) = line_height_ratio_override {
+        style.line_height = gpui::relative(ratio);
+    }
 
     let rem_size = window.rem_size();
     let font_size = style.font_size.to_pixels(rem_size);

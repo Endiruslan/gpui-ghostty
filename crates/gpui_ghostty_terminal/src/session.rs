@@ -57,6 +57,16 @@ impl TerminalSession {
         self.config.default_bg
     }
 
+    /// Override font size in pixels. `None` = inherit from `window.text_style()`.
+    pub fn font_size(&self) -> Option<f32> {
+        self.config.font_size
+    }
+
+    /// Override line height as multiplier of font size. `None` = inherit.
+    pub fn line_height_ratio(&self) -> Option<f32> {
+        self.config.line_height_ratio
+    }
+
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste_enabled
     }

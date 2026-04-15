@@ -7,6 +7,12 @@ pub struct TerminalConfig {
     pub default_fg: Rgb,
     pub default_bg: Rgb,
     pub update_window_title: bool,
+    /// Font size in pixels. `None` = inherit from `window.text_style()`.
+    pub font_size: Option<f32>,
+    /// Line height as a multiplier of font size. `None` = inherit from
+    /// `window.text_style()` (GPUI default is phi ≈ 1.618, which is usually
+    /// too tall for terminals — typical terminal ratio is ~1.2).
+    pub line_height_ratio: Option<f32>,
 }
 
 impl Default for TerminalConfig {
@@ -25,6 +31,8 @@ impl Default for TerminalConfig {
                 b: 0x00,
             },
             update_window_title: true,
+            font_size: None,
+            line_height_ratio: None,
         }
     }
 }
