@@ -1492,6 +1492,103 @@ fn box_drawing_quads_for_char(
     quads
 }
 
+/// Returns `true` for Unicode block / shade / eighth-block characters.
+///
+/// These characters are conventionally rendered by terminal emulators as
+/// filled quads of specific fractions of the cell. Menlo (and many fonts)
+/// size their block glyphs to the em-box, which is smaller than the
+/// line height — this leaves horizontal gaps between rows where the glyph
+/// doesn't reach. Rendering them as quads that fill exactly the computed
+/// cell bounds eliminates those stripes.
+pub(crate) fn is_block_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '█' | '▀' | '▄' | '▌' | '▐'
+            | '▁' | '▂' | '▃' | '▅' | '▆' | '▇'
+            | '▏' | '▎' | '▍' | '▋' | '▊' | '▉'
+            | '▔' | '▕'
+            | '▖' | '▗' | '▘' | '▝' | '▙' | '▟' | '▛' | '▜' | '▚' | '▞'
+    )
+}
+
+/// Render block / shade / eighth-block characters as filled quads.
+///
+/// Returns `None` for chars that aren't block drawing → caller falls back
+/// to normal glyph rendering.
+fn block_char_quads_for_char(
+    cell: Bounds<Pixels>,
+    line_height: Pixels,
+    cell_width: f32,
+    color: gpui::Hsla,
+    ch: char,
+) -> Option<Vec<PaintQuad>> {
+    let x0 = cell.left();
+    let y0 = cell.top();
+    let w = px(cell_width);
+    let h = line_height;
+
+    // Helper: fill a fractional sub-rectangle of the cell.
+    // frac_x, frac_y, frac_w, frac_h are all in [0, 1] of the cell.
+    let rect = |fx: f32, fy: f32, fw: f32, fh: f32| -> PaintQuad {
+        let ox = x0 + w * fx;
+        let oy = y0 + h * fy;
+        fill(
+            Bounds::new(point(ox, oy), size(w * fw, h * fh)),
+            color,
+        )
+    };
+
+    let quads: Vec<PaintQuad> = match ch {
+        // Full block
+        '█' => vec![rect(0., 0., 1., 1.)],
+
+        // Half blocks
+        '▀' => vec![rect(0., 0., 1., 0.5)],            // upper half
+        '▄' => vec![rect(0., 0.5, 1., 0.5)],           // lower half
+        '▌' => vec![rect(0., 0., 0.5, 1.)],            // left half
+        '▐' => vec![rect(0.5, 0., 0.5, 1.)],           // right half
+
+        // Lower eighths (▁ = 1/8, ▂ = 2/8, ..., ▇ = 7/8, ▄ already above = 4/8)
+        '▁' => vec![rect(0., 7. / 8., 1., 1. / 8.)],
+        '▂' => vec![rect(0., 6. / 8., 1., 2. / 8.)],
+        '▃' => vec![rect(0., 5. / 8., 1., 3. / 8.)],
+        '▅' => vec![rect(0., 3. / 8., 1., 5. / 8.)],
+        '▆' => vec![rect(0., 2. / 8., 1., 6. / 8.)],
+        '▇' => vec![rect(0., 1. / 8., 1., 7. / 8.)],
+
+        // Left eighths (▏ = 1/8, ▎ = 2/8, ..., ▉ = 7/8, ▌ already = 4/8)
+        '▏' => vec![rect(0., 0., 1. / 8., 1.)],
+        '▎' => vec![rect(0., 0., 2. / 8., 1.)],
+        '▍' => vec![rect(0., 0., 3. / 8., 1.)],
+        '▋' => vec![rect(0., 0., 5. / 8., 1.)],
+        '▊' => vec![rect(0., 0., 6. / 8., 1.)],
+        '▉' => vec![rect(0., 0., 7. / 8., 1.)],
+
+        // Upper block variants
+        '▔' => vec![rect(0., 0., 1., 1. / 8.)],         // upper one eighth block
+        '▕' => vec![rect(7. / 8., 0., 1. / 8., 1.)],    // right one eighth block
+
+        // Shaded blocks (░▒▓) — skipped: translucent quads would blend
+        // with the underlying glyph. Font renderer handles them.
+
+        // Quadrants
+        '▖' => vec![rect(0., 0.5, 0.5, 0.5)],          // lower-left
+        '▗' => vec![rect(0.5, 0.5, 0.5, 0.5)],         // lower-right
+        '▘' => vec![rect(0., 0., 0.5, 0.5)],           // upper-left
+        '▝' => vec![rect(0.5, 0., 0.5, 0.5)],          // upper-right
+        '▙' => vec![rect(0., 0., 0.5, 1.), rect(0.5, 0.5, 0.5, 0.5)],
+        '▟' => vec![rect(0.5, 0., 0.5, 1.), rect(0., 0.5, 0.5, 0.5)],
+        '▛' => vec![rect(0., 0., 1., 0.5), rect(0., 0.5, 0.5, 0.5)],
+        '▜' => vec![rect(0., 0., 1., 0.5), rect(0.5, 0.5, 0.5, 0.5)],
+        '▚' => vec![rect(0., 0., 0.5, 0.5), rect(0.5, 0.5, 0.5, 0.5)],
+        '▞' => vec![rect(0.5, 0., 0.5, 0.5), rect(0., 0.5, 0.5, 0.5)],
+
+        _ => return None,
+    };
+
+    Some(quads)
+}
+
 fn text_run_for_key(base_font: &gpui::Font, key: TextRunKey, len: usize) -> TextRun {
     let font = font_for_flags(base_font, key.flags);
     let color = color_for_key(key);
@@ -1915,7 +2012,10 @@ impl Element for TerminalTextElement {
                             continue;
                         }
 
-                        if let Some((_, _)) = box_drawing_mask(ch) {
+                        let is_box = box_drawing_mask(ch).is_some();
+                        let is_block = is_block_char(ch);
+
+                        if is_box || is_block {
                             let fg = runs
                                 .and_then(|runs| {
                                     while let Some(run) = runs.get(run_idx) {
@@ -1946,13 +2046,24 @@ impl Element for TerminalTextElement {
                             let x = bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
                             let cell_bounds =
                                 Bounds::new(point(x, y), size(px(cell_width), line_height));
-                            quads.extend(box_drawing_quads_for_char(
+
+                            if is_box {
+                                quads.extend(box_drawing_quads_for_char(
+                                    cell_bounds,
+                                    line_height,
+                                    cell_width,
+                                    fg,
+                                    ch,
+                                ));
+                            } else if let Some(block_quads) = block_char_quads_for_char(
                                 cell_bounds,
                                 line_height,
                                 cell_width,
                                 fg,
                                 ch,
-                            ));
+                            ) {
+                                quads.extend(block_quads);
+                            }
                         }
 
                         col = col.saturating_add(width);
