@@ -241,6 +241,13 @@ pub struct TerminalView {
     /// a background timer toggles this ~every `cursor_blink_ms`. When blink
     /// is disabled, this stays `true` forever (solid cursor).
     cursor_blink_on: bool,
+    /// True while the hosting window is active (frontmost, not occluded).
+    /// Tracked via `observe_window_activation`. When false, the blink timer
+    /// stops calling `cx.notify()` — no redraws happen while the window is
+    /// in the background, saving several % idle CPU.
+    window_active: bool,
+    /// Held so the window activation subscription lives as long as the view.
+    _window_activation_sub: Option<gpui::Subscription>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -291,6 +298,8 @@ impl TerminalView {
             marked_selected_range_utf16: 0..0,
             font,
             cursor_blink_on: true,
+            window_active: true,
+            _window_activation_sub: None,
         }
         .with_refreshed_viewport()
     }
@@ -336,18 +345,41 @@ impl TerminalView {
             marked_selected_range_utf16: 0..0,
             font,
             cursor_blink_on: true,
+            window_active: true,
+            _window_activation_sub: None,
         }
         .with_refreshed_viewport()
     }
 
-    /// Start the cursor-blink timer if `TerminalConfig.cursor_blink_ms` is set.
-    /// Idempotent-ish: calling twice spawns two timers — call once after
-    /// constructing the view in `cx.new`.
+    /// Start the cursor-blink timer if `TerminalConfig.cursor_blink_ms` is set,
+    /// and subscribe to window activation so the timer can pause when the
+    /// window is backgrounded.
     ///
-    /// Implementation: single background task, one `cx.notify()` per toggle.
-    /// At the default 530 ms interval that's ~2 notifies/sec — negligible CPU,
-    /// no per-frame polling.
-    pub fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
+    /// Idempotent-ish: calling twice spawns two timers — call once after
+    /// constructing the view in `cx.new`. Must pass `&mut Window` so the
+    /// activation subscription can register.
+    ///
+    /// Implementation: single background task. Each tick toggles the blink
+    /// bool; `cx.notify()` is only issued while `window_active` is true.
+    /// While the window is inactive, the timer still runs (cheap) but
+    /// produces no repaints.
+    pub fn start_cursor_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Track window active/inactive — render loop skips notify when
+        // inactive to avoid wasted paints on a backgrounded window.
+        self.window_active = window.is_window_active();
+        let sub = cx.observe_window_activation(window, |view, window, cx| {
+            let now_active = window.is_window_active();
+            if view.window_active != now_active {
+                view.window_active = now_active;
+                if now_active {
+                    // Snap cursor on when we regain focus for instant feedback.
+                    view.cursor_blink_on = true;
+                    cx.notify();
+                }
+            }
+        });
+        self._window_activation_sub = Some(sub);
+
         let Some(blink_ms) = self.session.cursor_blink_ms() else {
             return;
         };
@@ -357,7 +389,9 @@ impl TerminalView {
             if this
                 .update(cx, |view, cx| {
                     view.cursor_blink_on = !view.cursor_blink_on;
-                    cx.notify();
+                    if view.window_active {
+                        cx.notify();
+                    }
                 })
                 .is_err()
             {
