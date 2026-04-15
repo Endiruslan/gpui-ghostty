@@ -207,6 +207,18 @@ impl TerminalInput {
     }
 }
 
+/// Build the `gpui::Font` to use for a terminal, applying any override
+/// from its `TerminalConfig.font_family` while keeping the rich fallback
+/// chain from `default_terminal_font()` (SF Mono, Cascadia, JetBrains,
+/// Noto CJK mono, emoji …).
+fn font_for_session(session: &TerminalSession) -> gpui::Font {
+    let mut font = crate::default_terminal_font();
+    if let Some(family) = session.font_family() {
+        font.family = family.to_string().into();
+    }
+    font
+}
+
 pub struct TerminalView {
     session: TerminalSession,
     viewport_lines: Vec<String>,
@@ -255,6 +267,7 @@ impl TerminalView {
     }
 
     pub fn new(session: TerminalSession, focus_handle: FocusHandle) -> Self {
+        let font = font_for_session(&session);
         Self {
             session,
             viewport_lines: Vec::new(),
@@ -272,7 +285,7 @@ impl TerminalView {
             selection: None,
             marked_text: None,
             marked_selected_range_utf16: 0..0,
-            font: crate::default_terminal_font(),
+            font,
         }
         .with_refreshed_viewport()
     }
@@ -298,6 +311,7 @@ impl TerminalView {
         focus_handle: FocusHandle,
         input: TerminalInput,
     ) -> Self {
+        let font = font_for_session(&session);
         Self {
             session,
             viewport_lines: Vec::new(),
@@ -315,7 +329,7 @@ impl TerminalView {
             selection: None,
             marked_text: None,
             marked_selected_range_utf16: 0..0,
-            font: crate::default_terminal_font(),
+            font,
         }
         .with_refreshed_viewport()
     }

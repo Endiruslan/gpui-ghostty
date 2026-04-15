@@ -67,6 +67,11 @@ impl TerminalSession {
         self.config.line_height_ratio
     }
 
+    /// Primary font family override. `None` = `default_terminal_font()`.
+    pub fn font_family(&self) -> Option<&str> {
+        self.config.font_family.as_deref()
+    }
+
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste_enabled
     }

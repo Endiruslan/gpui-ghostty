@@ -1,6 +1,6 @@
 use ghostty_vt::Rgb;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TerminalConfig {
     pub cols: u16,
     pub rows: u16,
@@ -13,6 +13,10 @@ pub struct TerminalConfig {
     /// `window.text_style()` (GPUI default is phi ≈ 1.618, which is usually
     /// too tall for terminals — typical terminal ratio is ~1.2).
     pub line_height_ratio: Option<f32>,
+    /// Primary font family. `None` = `default_terminal_font()` (Menlo on macOS).
+    /// Fallbacks (SF Mono, Cascadia Mono, JetBrains Mono, Noto mono CJK, emoji…)
+    /// are always appended regardless of this choice.
+    pub font_family: Option<String>,
 }
 
 impl Default for TerminalConfig {
@@ -33,6 +37,7 @@ impl Default for TerminalConfig {
             update_window_title: true,
             font_size: None,
             line_height_ratio: None,
+            font_family: None,
         }
     }
 }
