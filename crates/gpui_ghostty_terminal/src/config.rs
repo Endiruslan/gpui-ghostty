@@ -17,6 +17,11 @@ pub struct TerminalConfig {
     /// Fallbacks (SF Mono, Cascadia Mono, JetBrains Mono, Noto mono CJK, emoji…)
     /// are always appended regardless of this choice.
     pub font_family: Option<String>,
+    /// Cursor blink interval in milliseconds. `None` = no blink (solid cursor).
+    /// Typical terminal blink rate is 530 ms. The blink is implemented with a
+    /// single background timer that toggles a boolean and schedules a repaint —
+    /// ~2 Hz notify rate, negligible CPU cost.
+    pub cursor_blink_ms: Option<u64>,
 }
 
 impl Default for TerminalConfig {
@@ -38,6 +43,7 @@ impl Default for TerminalConfig {
             font_size: None,
             line_height_ratio: None,
             font_family: None,
+            cursor_blink_ms: None,
         }
     }
 }

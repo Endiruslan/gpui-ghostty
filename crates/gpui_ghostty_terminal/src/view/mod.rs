@@ -237,6 +237,10 @@ pub struct TerminalView {
     marked_text: Option<SharedString>,
     marked_selected_range_utf16: Range<usize>,
     font: gpui::Font,
+    /// Whether the cursor should currently be drawn. When blink is enabled,
+    /// a background timer toggles this ~every `cursor_blink_ms`. When blink
+    /// is disabled, this stays `true` forever (solid cursor).
+    cursor_blink_on: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -286,6 +290,7 @@ impl TerminalView {
             marked_text: None,
             marked_selected_range_utf16: 0..0,
             font,
+            cursor_blink_on: true,
         }
         .with_refreshed_viewport()
     }
@@ -330,8 +335,36 @@ impl TerminalView {
             marked_text: None,
             marked_selected_range_utf16: 0..0,
             font,
+            cursor_blink_on: true,
         }
         .with_refreshed_viewport()
+    }
+
+    /// Start the cursor-blink timer if `TerminalConfig.cursor_blink_ms` is set.
+    /// Idempotent-ish: calling twice spawns two timers — call once after
+    /// constructing the view in `cx.new`.
+    ///
+    /// Implementation: single background task, one `cx.notify()` per toggle.
+    /// At the default 530 ms interval that's ~2 notifies/sec — negligible CPU,
+    /// no per-frame polling.
+    pub fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        let Some(blink_ms) = self.session.cursor_blink_ms() else {
+            return;
+        };
+        let dur = std::time::Duration::from_millis(blink_ms);
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(dur).await;
+            if this
+                .update(cx, |view, cx| {
+                    view.cursor_blink_on = !view.cursor_blink_on;
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
     }
 
     fn utf16_len(s: &str) -> usize {
@@ -709,6 +742,10 @@ impl TerminalView {
 
     pub fn queue_output_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         const MAX_PENDING_OUTPUT_BYTES: usize = 256 * 1024;
+
+        // Reset blink so that cursor is visible on fresh output (e.g. while
+        // user types and the shell echoes). Blink timer will resume toggling.
+        self.cursor_blink_on = true;
 
         if self.pending_output.len().saturating_add(bytes.len()) <= MAX_PENDING_OUTPUT_BYTES {
             self.pending_output.extend_from_slice(bytes);
@@ -2124,7 +2161,10 @@ impl Element for TerminalTextElement {
 
         let cursor = {
             let view = self.view.read(cx);
-            if view.focus_handle.is_focused(window) && view.session.cursor_visible() {
+            if view.focus_handle.is_focused(window)
+                && view.session.cursor_visible()
+                && view.cursor_blink_on
+            {
                 view.session.cursor_position()
             } else {
                 None

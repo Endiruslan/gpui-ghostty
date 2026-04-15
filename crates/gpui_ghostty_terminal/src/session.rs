@@ -72,6 +72,11 @@ impl TerminalSession {
         self.config.font_family.as_deref()
     }
 
+    /// Cursor blink interval in ms. `None` = no blink.
+    pub fn cursor_blink_ms(&self) -> Option<u64> {
+        self.config.cursor_blink_ms
+    }
+
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste_enabled
     }
