@@ -22,6 +22,22 @@ pub struct TerminalConfig {
     /// single background timer that toggles a boolean and schedules a repaint —
     /// ~2 Hz notify rate, negligible CPU cost.
     pub cursor_blink_ms: Option<u64>,
+    /// Optional override for the cursor color.  `None` = auto-contrast
+    /// against the current background.  Use to theme the cursor with the
+    /// host application's accent color.
+    pub cursor_color: Option<Rgb>,
+    /// Cursor rendering shape.  Defaults to [`CursorStyle::Block`].
+    pub cursor_style: CursorStyle,
+}
+
+/// Cursor shape for [`TerminalConfig::cursor_style`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CursorStyle {
+    /// Full cell-width fill — classic block cursor.
+    #[default]
+    Block,
+    /// Thin 2 px vertical bar at the left edge of the cursor cell.
+    Bar,
 }
 
 impl Default for TerminalConfig {
@@ -44,6 +60,8 @@ impl Default for TerminalConfig {
             line_height_ratio: None,
             font_family: None,
             cursor_blink_ms: None,
+            cursor_color: None,
+            cursor_style: CursorStyle::Block,
         }
     }
 }

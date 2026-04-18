@@ -835,6 +835,18 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Override the cursor color (`Some`) or restore auto-contrast (`None`).
+    pub fn set_cursor_color(&mut self, color: Option<Rgb>, cx: &mut Context<Self>) {
+        self.session.set_cursor_color(color);
+        cx.notify();
+    }
+
+    /// Change the cursor shape (Block vs Bar).
+    pub fn set_cursor_style(&mut self, style: crate::CursorStyle, cx: &mut Context<Self>) {
+        self.session.set_cursor_style(style);
+        cx.notify();
+    }
+
     fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
@@ -2217,16 +2229,28 @@ impl Element for TerminalTextElement {
             }
         }
         .and_then(|(col, row)| {
-            let background = { self.view.read(cx).session.default_background() };
-            let cursor_color = cursor_color_for_background(background);
+            let (cursor_color, cursor_style) = {
+                let view = self.view.read(cx);
+                let bg = view.session.default_background();
+                let color = view
+                    .session
+                    .cursor_color()
+                    .map(hsla_from_rgb)
+                    .unwrap_or_else(|| cursor_color_for_background(bg));
+                (color, view.session.cursor_style())
+            };
             let y = bounds.top() + line_height * (row.saturating_sub(1)) as f32;
             let row_index = row.saturating_sub(1) as usize;
             let line = shaped_lines.get(row_index)?;
             let byte_index = byte_index_for_column_in_line(line.text.as_str(), col);
             let x = bounds.left() + line.x_for_index(byte_index.min(line.text.len()));
 
+            let width = match cursor_style {
+                crate::CursorStyle::Block => cell_width.unwrap_or(px(8.0)),
+                crate::CursorStyle::Bar => px(2.0),
+            };
             Some(fill(
-                Bounds::new(point(x, y), size(px(2.0), line_height)),
+                Bounds::new(point(x, y), size(width, line_height)),
                 cursor_color,
             ))
         });

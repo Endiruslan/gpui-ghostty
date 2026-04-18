@@ -93,6 +93,26 @@ impl TerminalSession {
         self.config.cursor_blink_ms
     }
 
+    /// Override color for the block/bar cursor.  `None` = auto-contrast.
+    pub fn cursor_color(&self) -> Option<Rgb> {
+        self.config.cursor_color
+    }
+
+    /// Cursor shape (Block vs Bar).
+    pub fn cursor_style(&self) -> crate::CursorStyle {
+        self.config.cursor_style
+    }
+
+    /// Update the cursor color at runtime (Theme switches, accent changes).
+    pub fn set_cursor_color(&mut self, color: Option<Rgb>) {
+        self.config.cursor_color = color;
+    }
+
+    /// Update the cursor shape at runtime.
+    pub fn set_cursor_style(&mut self, style: crate::CursorStyle) {
+        self.config.cursor_style = style;
+    }
+
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste_enabled
     }
