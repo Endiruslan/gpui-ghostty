@@ -57,6 +57,22 @@ impl TerminalSession {
         self.config.default_bg
     }
 
+    /// Swap the terminal's default foreground and background colors at runtime.
+    ///
+    /// Affects every subsequently-rendered cell that uses the "default"
+    /// palette entry — i.e. any cell not carrying an explicit SGR color.
+    /// The config copy is also updated so callers can read the new values via
+    /// [`Self::default_foreground`] / [`Self::default_background`].
+    ///
+    /// Use this to react to host-application theme changes without
+    /// reconstructing the `TerminalSession` (which would lose scrollback and
+    /// reset the cursor).
+    pub fn set_default_colors(&mut self, fg: Rgb, bg: Rgb) {
+        self.config.default_fg = fg;
+        self.config.default_bg = bg;
+        self.terminal.set_default_colors(fg, bg);
+    }
+
     /// Override font size in pixels. `None` = inherit from `window.text_style()`.
     pub fn font_size(&self) -> Option<f32> {
         self.config.font_size

@@ -823,6 +823,18 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Swap the terminal's default foreground and background colors at
+    /// runtime.  Use to follow host-application theme changes without
+    /// reconstructing the view (scrollback and cursor are preserved).
+    ///
+    /// Forces a full repaint so already-drawn cells that still use the
+    /// default palette entry pick up the new colors immediately.
+    pub fn set_default_colors(&mut self, fg: Rgb, bg: Rgb, cx: &mut Context<Self>) {
+        self.session.set_default_colors(fg, bg);
+        self.pending_refresh = true;
+        cx.notify();
+    }
+
     fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
