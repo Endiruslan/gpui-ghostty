@@ -241,6 +241,10 @@ pub struct TerminalView {
     /// a background timer toggles this ~every `cursor_blink_ms`. When blink
     /// is disabled, this stays `true` forever (solid cursor).
     cursor_blink_on: bool,
+    /// Runtime switch for the blink timer. Lets the host pause blinking on
+    /// focus-out (unfocused pane shows a static cursor) and resume on
+    /// focus-in without tearing down the timer task.
+    cursor_blink_enabled: bool,
     /// True while the hosting window is active (frontmost, not occluded).
     /// Tracked via `observe_window_activation`. When false, the blink timer
     /// stops calling `cx.notify()` — no redraws happen while the window is
@@ -298,6 +302,7 @@ impl TerminalView {
             marked_selected_range_utf16: 0..0,
             font,
             cursor_blink_on: true,
+            cursor_blink_enabled: true,
             window_active: true,
             _window_activation_sub: None,
         }
@@ -345,6 +350,7 @@ impl TerminalView {
             marked_selected_range_utf16: 0..0,
             font,
             cursor_blink_on: true,
+            cursor_blink_enabled: true,
             window_active: true,
             _window_activation_sub: None,
         }
@@ -388,6 +394,11 @@ impl TerminalView {
             cx.background_executor().timer(dur).await;
             if this
                 .update(cx, |view, cx| {
+                    if !view.cursor_blink_enabled {
+                        // Blink paused by host (unfocused pane); keep cursor
+                        // solid-on and issue no repaints.
+                        return;
+                    }
                     view.cursor_blink_on = !view.cursor_blink_on;
                     if view.window_active {
                         cx.notify();
@@ -399,6 +410,22 @@ impl TerminalView {
             }
         })
         .detach();
+    }
+
+    /// Runtime toggle for cursor blinking. Host panes flip this on
+    /// focus-in / focus-out so the unfocused terminal shows a static cursor
+    /// (Terminal.app / iTerm convention). Safe to call repeatedly.
+    pub fn set_cursor_blink_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.cursor_blink_enabled == enabled {
+            return;
+        }
+        self.cursor_blink_enabled = enabled;
+        // Disabling → snap cursor to solid-on immediately. Enabling keeps
+        // whatever phase the timer was in; next tick will toggle normally.
+        if !enabled {
+            self.cursor_blink_on = true;
+        }
+        cx.notify();
     }
 
     fn utf16_len(s: &str) -> usize {
