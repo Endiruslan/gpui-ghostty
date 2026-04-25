@@ -265,24 +265,29 @@ const Handler = struct {
     }
 
     pub fn promptStart(self: *Handler, aid: ?[]const u8, redraw: bool) !void {
+        _ = self;
         _ = aid;
         _ = redraw;
-        try self.handle.events.append(0x02);
+        // OSC 133;A — shell is about to draw a fresh prompt. Not a
+        // command boundary, so we drop it; command duration is measured
+        // between OSC 133;C (end-of-input, command begins) and OSC 133;D
+        // (end-of-command).
     }
 
     pub fn promptContinuation(self: *Handler, aid: ?[]const u8) !void {
+        _ = self;
         _ = aid;
-        try self.handle.events.append(0x02);
     }
 
     pub fn promptEnd(self: *Handler) !void {
         _ = self;
-        // No-op; we only care about start/end-of-command boundaries.
     }
 
     pub fn endOfInput(self: *Handler) !void {
-        // No-op; command-start tag (0x02) suffices.
-        _ = self;
+        // OSC 133;C — user hit enter, command is about to execute. This
+        // is the canonical "command start" signal in semantic-prompt
+        // shell integrations (zsh's preexec, fish's fish_preexec, …).
+        try self.handle.events.append(0x02);
     }
 
     pub fn endOfCommand(self: *Handler, exit_code: ?u8) !void {
