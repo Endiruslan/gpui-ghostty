@@ -50,6 +50,20 @@ pub struct StyleRun {
     pub flags: u8,
 }
 
+/// Snapshot of the viewport's position inside the full screen.
+/// See [`Terminal::scroll_position`] for details.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollPosition {
+    /// 0-based row index of the topmost visible row, counting from the
+    /// oldest scrollback row. Equals `total_rows - viewport_rows` when the
+    /// viewport is scrolled all the way to the live screen bottom.
+    pub viewport_top: u32,
+    /// Total row count in the screen (scrollback + on-screen).
+    pub total_rows: u32,
+    /// Height of the viewport in rows.
+    pub viewport_rows: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyModifiers {
     pub shift: bool,
@@ -339,6 +353,41 @@ impl Terminal {
         }
         unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
         Ok(out)
+    }
+
+    /// Snapshot of where the viewport sits inside the full screen
+    /// (scrollback + active rows). Used to drive a scrollbar UI.
+    ///
+    /// * `viewport_top` — 0-based row index of the topmost visible row,
+    ///   counting from the oldest scrollback row.
+    /// * `total_rows` — current total row count in the screen (scrollback +
+    ///   on-screen). Grows as new lines scroll into history; capped at the
+    ///   terminal's scrollback size.
+    /// * `viewport_rows` — height of the viewport in rows, configured at
+    ///   construction time.
+    ///
+    /// Returns `None` only if the FFI handle is null. O(pages) walk —
+    /// cheap, but not free; cache between scroll events.
+    pub fn scroll_position(&self) -> Option<ScrollPosition> {
+        let mut viewport_top: u32 = 0;
+        let mut total_rows: u32 = 0;
+        let mut viewport_rows: u32 = 0;
+        let ok = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_scroll_position(
+                self.ptr.as_ptr(),
+                &mut viewport_top,
+                &mut total_rows,
+                &mut viewport_rows,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        Some(ScrollPosition {
+            viewport_top,
+            total_rows,
+            viewport_rows,
+        })
     }
 
     pub fn take_viewport_scroll_delta(&mut self) -> i32 {

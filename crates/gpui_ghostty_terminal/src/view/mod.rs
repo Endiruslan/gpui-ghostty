@@ -391,6 +391,13 @@ pub struct TerminalView {
     /// changed, or font metrics changed. Re-fetched lazily in prepaint, but
     /// only when `pixel_offset > 0` (otherwise peek isn't rendered).
     peek_dirty: bool,
+    /// Cached viewport position inside the full screen, used to size and
+    /// place the scrollbar. Refreshed in prepaint when [`scroll_pos_dirty`]
+    /// is set — i.e. after VT scroll, refresh, or new PTY content. The FFI
+    /// behind this walks the page list (O(pages)) so we don't want to call
+    /// it every frame; on idle frames the cached value is accurate.
+    scroll_pos: Option<ghostty_vt::ScrollPosition>,
+    scroll_pos_dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -449,6 +456,8 @@ impl TerminalView {
             peek_runs: Vec::new(),
             peek_layout: None,
             peek_dirty: false,
+            scroll_pos: None,
+            scroll_pos_dirty: true,
         }
         .with_refreshed_viewport()
     }
@@ -502,6 +511,8 @@ impl TerminalView {
             peek_runs: Vec::new(),
             peek_layout: None,
             peek_dirty: false,
+            scroll_pos: None,
+            scroll_pos_dirty: true,
         }
         .with_refreshed_viewport()
     }
@@ -703,6 +714,9 @@ impl TerminalView {
 
     fn sync_viewport_scroll_tracking(&mut self) {
         let _ = self.session.take_viewport_scroll_delta();
+        // Any path that calls sync (wheel snap, page/home/end, resize) has
+        // moved the viewport — invalidate the cached scrollbar position.
+        self.scroll_pos_dirty = true;
         // Anything that calls this helper has just moved the VT to a fresh
         // line-aligned position (mouse wheel snap, page/home/end keys,
         // resize). The previous sub-line `pixel_offset` is no longer
@@ -720,6 +734,9 @@ impl TerminalView {
         if delta == 0 {
             return;
         }
+        // Either the wheel handler or new PTY output moved the viewport —
+        // the cached scrollbar position is now stale.
+        self.scroll_pos_dirty = true;
 
         let rows = self.session.rows() as usize;
         if rows == 0 {
@@ -814,6 +831,7 @@ impl TerminalView {
         // It'll be re-fetched lazily in prepaint when needed.
         self.peek_dirty = true;
         self.peek_layout = None;
+        self.scroll_pos_dirty = true;
     }
 
     fn compute_viewport_line_offsets(lines: &[String]) -> Vec<usize> {
@@ -1834,6 +1852,17 @@ struct TerminalPrepaintState {
     peek_line: Option<gpui::ShapedLine>,
     peek_background_quads: Vec<PaintQuad>,
     peek_box_drawing_quads: Vec<PaintQuad>,
+    /// Scrollbar track + thumb quads, drawn on the right edge when there is
+    /// scrollback above the visible area. `None` when the screen fits
+    /// entirely in the viewport (no scrolling possible). Painted *after*
+    /// content + cursor, on top, without `pixel_offset` translation since
+    /// the scrollbar lives in viewport-relative space.
+    scrollbar: Option<ScrollbarQuads>,
+}
+
+struct ScrollbarQuads {
+    track: PaintQuad,
+    thumb: PaintQuad,
 }
 
 const CELL_STYLE_FLAG_BOLD: u8 = 0x02;
@@ -2315,6 +2344,63 @@ fn build_box_quads_for_row(
 
         col = col.saturating_add(width);
     }
+}
+
+/// Build a track + proportional thumb for the right-side scrollbar.
+///
+/// Layout: a 6 px track flush to the right edge with a 1 px gap, semi-
+/// transparent so it doesn't compete with terminal content. The thumb's
+/// height is proportional to `viewport_rows / total_rows` (with a 24 px
+/// minimum so it stays grabbable on tall scrollbacks) and its top is
+/// proportional to `viewport_top / scrollable_range`.
+fn build_scrollbar_quads(
+    bounds: Bounds<Pixels>,
+    pos: ghostty_vt::ScrollPosition,
+) -> ScrollbarQuads {
+    const TRACK_WIDTH: f32 = 6.0;
+    const TRACK_RIGHT_GAP: f32 = 1.0;
+    const MIN_THUMB_HEIGHT: f32 = 24.0;
+
+    let track_x = bounds.right() - px(TRACK_WIDTH + TRACK_RIGHT_GAP);
+    let track_w = px(TRACK_WIDTH);
+    let track_y = bounds.top();
+    let track_h = bounds.size.height;
+
+    let total = pos.total_rows.max(1) as f32;
+    let viewport = pos.viewport_rows.max(1) as f32;
+    let scrollable = (total - viewport).max(1.0);
+
+    let h_px = f32::from(track_h);
+    let raw_thumb_h = (viewport / total) * h_px;
+    let thumb_h = raw_thumb_h.max(MIN_THUMB_HEIGHT).min(h_px);
+
+    let progress = (pos.viewport_top as f32 / scrollable).clamp(0.0, 1.0);
+    let thumb_y_offset = progress * (h_px - thumb_h);
+
+    // Subtle achromatic bar that adapts to the terminal's default
+    // background — blended over whatever's underneath, so it works on
+    // dark and light themes without theming. The thumb is the same hue
+    // family but considerably more opaque so the contrast against the
+    // track is what reads, not the absolute brightness.
+    let track_color = hsla(0.0, 0.0, 0.5, 0.18);
+    let thumb_color = hsla(0.0, 0.0, 0.5, 0.55);
+
+    let track = fill(
+        Bounds::new(point(track_x, track_y), size(track_w, track_h)),
+        track_color,
+    )
+    .corner_radii(px(TRACK_WIDTH * 0.5));
+
+    let thumb = fill(
+        Bounds::new(
+            point(track_x, track_y + px(thumb_y_offset)),
+            size(track_w, px(thumb_h)),
+        ),
+        thumb_color,
+    )
+    .corner_radii(px(TRACK_WIDTH * 0.5));
+
+    ScrollbarQuads { track, thumb }
 }
 
 struct TerminalTextElement {
@@ -2800,6 +2886,22 @@ impl Element for TerminalTextElement {
             (px(view.pixel_offset), view.peek_layout.clone())
         };
 
+        // Refresh the cached scroll position if it's stale, then build
+        // scrollbar quads. Skip when total rows fit entirely in the viewport
+        // (nothing to scroll).
+        let scrollbar = self.view.update(cx, |view, _cx| {
+            if view.scroll_pos_dirty {
+                view.scroll_pos = view.session.scroll_position();
+                view.scroll_pos_dirty = false;
+            }
+            view.scroll_pos.and_then(|pos| {
+                if pos.total_rows <= pos.viewport_rows || pos.viewport_rows == 0 {
+                    return None;
+                }
+                Some(build_scrollbar_quads(bounds, pos))
+            })
+        });
+
         let prepaint_us = _prepaint_start.elapsed().as_micros() as u64;
         SCROLL_STATS.prepaint_calls.fetch_add(1, Ordering::Relaxed);
         SCROLL_STATS.prepaint_us.fetch_add(prepaint_us, Ordering::Relaxed);
@@ -2817,6 +2919,7 @@ impl Element for TerminalTextElement {
             peek_line,
             peek_background_quads,
             peek_box_drawing_quads,
+            scrollbar,
         }
     }
 
@@ -2929,6 +3032,15 @@ impl Element for TerminalTextElement {
             if let Some(mut cursor) = prepaint.cursor.take() {
                 translate(&mut cursor);
                 window.paint_quad(cursor);
+            }
+
+            // Scrollbar paints on top of everything else, *not* shifted by
+            // pixel_offset — the bar lives in viewport-relative coords so a
+            // sub-line scroll can advance the thumb without the track sliding
+            // along. Track first, thumb on top.
+            if let Some(scrollbar) = prepaint.scrollbar.take() {
+                window.paint_quad(scrollbar.track);
+                window.paint_quad(scrollbar.thumb);
             }
         });
 

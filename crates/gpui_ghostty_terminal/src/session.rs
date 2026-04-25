@@ -401,6 +401,12 @@ impl TerminalSession {
         self.terminal.dump_screen_row_style_runs(rows_above)
     }
 
+    /// Where the viewport currently sits in the full screen — used to
+    /// drive a scrollbar UI. See [`ghostty_vt::ScrollPosition`].
+    pub fn scroll_position(&self) -> Option<ghostty_vt::ScrollPosition> {
+        self.terminal.scroll_position()
+    }
+
     pub fn cursor_position(&self) -> Option<(u16, u16)> {
         self.terminal.cursor_position()
     }

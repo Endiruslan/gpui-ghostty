@@ -732,6 +732,44 @@ fn pinScreenRow(pin: terminal.Pin) u32 {
     return y;
 }
 
+/// Read the current viewport scroll position, expressed in absolute
+/// scrollback coordinates. This is what a scrollbar UI needs:
+///
+/// * `out_viewport_top` — index (0-based) of the row currently shown at the
+///   *top* of the visible viewport, counting from the oldest scrollback row.
+/// * `out_total_rows` — total number of rows currently materialised in the
+///   screen (scrollback history + on-screen rows). Note this is the
+///   *current* size, not a maximum capacity.
+/// * `out_viewport_rows` — number of rows in the viewport itself, equal to
+///   the screen rows configured at construction time.
+///
+/// Returns `false` only if `terminal_ptr` is null. The traversal walks the
+/// page list — O(pages), not O(rows) — so it's fine to call once per
+/// scroll event but not per frame at 60+Hz on a large scrollback.
+export fn ghostty_vt_terminal_scroll_position(
+    terminal_ptr: ?*anyopaque,
+    out_viewport_top: *u32,
+    out_total_rows: *u32,
+    out_viewport_rows: *u32,
+) callconv(.C) bool {
+    if (terminal_ptr == null) return false;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    const top = handle.terminal.screen.pages.getTopLeft(.viewport);
+    out_viewport_top.* = pinScreenRow(top);
+
+    var total: u32 = 0;
+    var node_ = handle.terminal.screen.pages.pages.first;
+    while (node_) |node| {
+        total += @intCast(node.data.size.rows);
+        node_ = node.next;
+    }
+    out_total_rows.* = total;
+    out_viewport_rows.* = @intCast(handle.terminal.rows);
+
+    return true;
+}
+
 export fn ghostty_vt_terminal_take_viewport_scroll_delta(
     terminal_ptr: ?*anyopaque,
 ) callconv(.C) i32 {
