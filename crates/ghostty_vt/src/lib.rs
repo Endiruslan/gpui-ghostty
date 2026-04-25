@@ -244,6 +244,82 @@ impl Terminal {
         Ok(out)
     }
 
+    /// Read a single row from scrollback **above** the visible viewport.
+    /// Used by pixel-smooth scroll to fetch the bleed row that visually
+    /// peeks in at the top while the viewport slides between line
+    /// boundaries.
+    ///
+    /// `rows_above_viewport_top = 0` returns the row immediately above the
+    /// viewport's top row. `1` returns the row above that, etc.
+    ///
+    /// Returns `Ok(None)` if there is no row that far back (start of
+    /// scrollback hit). Returns `Ok(Some(""))` if the row exists but is
+    /// blank.
+    pub fn dump_screen_row(&self, rows_above_viewport_top: u32) -> Result<Option<String>, Error> {
+        let bytes = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_dump_screen_row(
+                self.ptr.as_ptr(),
+                rows_above_viewport_top,
+            )
+        };
+        if bytes.ptr.is_null() {
+            return Ok(None);
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let s = String::from_utf8_lossy(slice).into_owned();
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Ok(Some(s))
+    }
+
+    /// Same as [`dump_screen_row`] but returns the per-cell style runs.
+    /// Returns `Ok(None)` if no row at that offset.
+    pub fn dump_screen_row_style_runs(
+        &self,
+        rows_above_viewport_top: u32,
+    ) -> Result<Option<Vec<StyleRun>>, Error> {
+        let bytes = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_dump_screen_row_style_runs(
+                self.ptr.as_ptr(),
+                rows_above_viewport_top,
+            )
+        };
+        if bytes.ptr.is_null() {
+            return Ok(None);
+        }
+        if bytes.len == 0 {
+            unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+            return Ok(Some(Vec::new()));
+        }
+        if bytes.len % 12 != 0 {
+            unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+            return Err(Error::DumpFailed);
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let mut out = Vec::with_capacity(bytes.len / 12);
+        for chunk in slice.chunks_exact(12) {
+            out.push(StyleRun {
+                start_col: u16::from_ne_bytes([chunk[0], chunk[1]]),
+                end_col: u16::from_ne_bytes([chunk[2], chunk[3]]),
+                fg: Rgb {
+                    r: chunk[4],
+                    g: chunk[5],
+                    b: chunk[6],
+                },
+                bg: Rgb {
+                    r: chunk[7],
+                    g: chunk[8],
+                    b: chunk[9],
+                },
+                flags: chunk[10],
+            });
+        }
+
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Ok(Some(out))
+    }
+
     pub fn take_dirty_viewport_rows(&mut self, rows: u16) -> Result<Vec<u16>, Error> {
         let bytes = unsafe {
             ghostty_vt_sys::ghostty_vt_terminal_take_dirty_viewport_rows(self.ptr.as_ptr(), rows)

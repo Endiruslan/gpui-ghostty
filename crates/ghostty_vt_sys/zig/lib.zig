@@ -480,15 +480,10 @@ fn resolvedStyle(
     return .{ .fg = fg, .bg = default_bg, .flags = flags };
 }
 
-export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
-    terminal_ptr: ?*anyopaque,
-    row: u16,
-) callconv(.C) ghostty_vt_bytes_t {
-    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
-    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
-
-    const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
-    const pin = handle.terminal.screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+fn dumpStyleRunsForPin(
+    handle: *TerminalHandle,
+    pin: terminal.Pin,
+) ghostty_vt_bytes_t {
     const cells = pin.cells(.all);
 
     const default_fg: terminal.color.RGB = handle.default_fg;
@@ -624,6 +619,68 @@ export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
 
     const slice = out.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
     return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
+export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
+    terminal_ptr: ?*anyopaque,
+    row: u16,
+) callconv(.C) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
+    const pin = handle.terminal.screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+    return dumpStyleRunsForPin(handle, pin);
+}
+
+/// Resolve a pin pointing at a row above the current viewport top.
+/// `rows_above_viewport_top = 0` means the row immediately above the viewport.
+fn pinAboveViewport(handle: *TerminalHandle, rows_above_viewport_top: u32) ?terminal.Pin {
+    const top: terminal.Pin = handle.terminal.screen.pages.getTopLeft(.viewport);
+    const moved = top.upOverflow(rows_above_viewport_top + 1);
+    return switch (moved) {
+        .offset => |p| p,
+        .overflow => null,
+    };
+}
+
+/// Read a single row from scrollback above the viewport. Used by
+/// pixel-smooth scroll to fetch the bleed row that appears when the
+/// viewport visually slides between line boundaries.
+export fn ghostty_vt_terminal_dump_screen_row(
+    terminal_ptr: ?*anyopaque,
+    rows_above_viewport_top: u32,
+) callconv(.C) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    const pin = pinAboveViewport(handle, rows_above_viewport_top) orelse
+        return .{ .ptr = null, .len = 0 };
+
+    const alloc = std.heap.c_allocator;
+    var builder = std.ArrayList(u8).init(alloc);
+    errdefer builder.deinit();
+
+    handle.terminal.screen.pages.encodeUtf8(builder.writer(), .{
+        .tl = pin,
+        .br = pin,
+        .unwrap = false,
+    }) catch return .{ .ptr = null, .len = 0 };
+
+    const slice = builder.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
+export fn ghostty_vt_terminal_dump_screen_row_style_runs(
+    terminal_ptr: ?*anyopaque,
+    rows_above_viewport_top: u32,
+) callconv(.C) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    const pin = pinAboveViewport(handle, rows_above_viewport_top) orelse
+        return .{ .ptr = null, .len = 0 };
+    return dumpStyleRunsForPin(handle, pin);
 }
 
 export fn ghostty_vt_terminal_take_dirty_viewport_rows(

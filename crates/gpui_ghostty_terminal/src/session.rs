@@ -387,6 +387,20 @@ impl TerminalSession {
         self.terminal.dump_viewport_row_style_runs(row)
     }
 
+    /// Read a row from scrollback above the viewport. `rows_above = 0`
+    /// returns the row directly above viewport top. Returns `Ok(None)` if
+    /// scrollback start is reached.
+    pub fn dump_screen_row(&self, rows_above: u32) -> Result<Option<String>, Error> {
+        self.terminal.dump_screen_row(rows_above)
+    }
+
+    pub fn dump_screen_row_style_runs(
+        &self,
+        rows_above: u32,
+    ) -> Result<Option<Vec<ghostty_vt::StyleRun>>, Error> {
+        self.terminal.dump_screen_row_style_runs(rows_above)
+    }
+
     pub fn cursor_position(&self) -> Option<(u16, u16)> {
         self.terminal.cursor_position()
     }

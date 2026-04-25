@@ -4,11 +4,130 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyBinding, KeyDownEvent,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size,
+    ScrollDelta, ScrollWheelEvent, SharedString, Style, TextRun, TouchPhase, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size,
 };
 use std::ops::Range;
 use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// Lightweight cumulative counters dumped to stderr roughly every 500 ms
+/// while the user is actively scrolling. Lets us compare CPU vs. event
+/// volume vs. line-snaps vs. peek refetches at a glance — was added when
+/// the pixel-smooth scroll landed and CPU jumped from ~10–20% to ~40%
+/// during trackpad scrolls.
+struct ScrollStats {
+    events: AtomicU64,
+    subline_paints: AtomicU64,
+    line_snaps: AtomicU64,
+    peek_fetches: AtomicU64,
+    peek_reshapes: AtomicU64,
+    boundary_clamps: AtomicU64,
+    /// Number of times `TerminalTextElement::paint` was actually invoked.
+    /// Compared with `events` to see if GPUI is re-painting more often than
+    /// the trackpad event rate (display-link driven, PTY-driven, etc).
+    paint_calls: AtomicU64,
+    /// Microseconds spent inside `TerminalTextElement::paint` excluding
+    /// `nextDrawable` (paint itself only — `prepaint` runs separately). Lets
+    /// us see if per-paint CPU work is the bottleneck or if it's display
+    /// sync waits.
+    paint_us: AtomicU64,
+    /// Number of times `TerminalTextElement::prepaint` was invoked, plus
+    /// total microseconds spent there.
+    prepaint_calls: AtomicU64,
+    prepaint_us: AtomicU64,
+    /// Mouse-wheel events forwarded to the running TUI as SGR mouse
+    /// sequences (mouse-reporting mode). Each forwarded event causes the
+    /// TUI to re-render and emit PTY output back, which in turn triggers
+    /// our `feed_output_bytes` notify path.
+    sgr_wheel_events: AtomicU64,
+    /// Number of times `feed_output_bytes` (PTY → terminal) caused a notify.
+    /// If this is high during scroll, the running TUI is re-rendering in
+    /// response to our forwarded mouse events — that's external CPU we
+    /// can't optimise on the terminal side.
+    pty_input_notifies: AtomicU64,
+    /// Bytes received from PTY while scrolling.
+    pty_input_bytes: AtomicU64,
+    last_emit_ms: AtomicU64,
+    started_ms: AtomicU64,
+}
+
+impl ScrollStats {
+    const fn new() -> Self {
+        Self {
+            events: AtomicU64::new(0),
+            subline_paints: AtomicU64::new(0),
+            line_snaps: AtomicU64::new(0),
+            peek_fetches: AtomicU64::new(0),
+            peek_reshapes: AtomicU64::new(0),
+            boundary_clamps: AtomicU64::new(0),
+            paint_calls: AtomicU64::new(0),
+            paint_us: AtomicU64::new(0),
+            prepaint_calls: AtomicU64::new(0),
+            prepaint_us: AtomicU64::new(0),
+            sgr_wheel_events: AtomicU64::new(0),
+            pty_input_notifies: AtomicU64::new(0),
+            pty_input_bytes: AtomicU64::new(0),
+            last_emit_ms: AtomicU64::new(0),
+            started_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn now_ms() -> u64 {
+        // Monotonic millis since process start. We don't need wall time.
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let epoch = EPOCH.get_or_init(Instant::now);
+        epoch.elapsed().as_millis() as u64
+    }
+
+    fn maybe_emit(&self) {
+        let now = Self::now_ms();
+        let last = self.last_emit_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            self.started_ms.store(now, Ordering::Relaxed);
+            self.last_emit_ms.store(now, Ordering::Relaxed);
+            return;
+        }
+        if now.saturating_sub(last) < 500 {
+            return;
+        }
+        // Reset the window — we want per-window deltas, not cumulative.
+        let events = self.events.swap(0, Ordering::Relaxed);
+        let subline = self.subline_paints.swap(0, Ordering::Relaxed);
+        let snaps = self.line_snaps.swap(0, Ordering::Relaxed);
+        let fetches = self.peek_fetches.swap(0, Ordering::Relaxed);
+        let reshapes = self.peek_reshapes.swap(0, Ordering::Relaxed);
+        let clamps = self.boundary_clamps.swap(0, Ordering::Relaxed);
+        let paint_calls = self.paint_calls.swap(0, Ordering::Relaxed);
+        let paint_us = self.paint_us.swap(0, Ordering::Relaxed);
+        let prepaint_calls = self.prepaint_calls.swap(0, Ordering::Relaxed);
+        let prepaint_us = self.prepaint_us.swap(0, Ordering::Relaxed);
+        let sgr_evts = self.sgr_wheel_events.swap(0, Ordering::Relaxed);
+        let pty_notifies = self.pty_input_notifies.swap(0, Ordering::Relaxed);
+        let pty_bytes = self.pty_input_bytes.swap(0, Ordering::Relaxed);
+        self.last_emit_ms.store(now, Ordering::Relaxed);
+        if events == 0 && subline == 0 && snaps == 0 && fetches == 0 && paint_calls == 0 {
+            return;
+        }
+        let dur_ms = (now - last).max(1);
+        let per_sec = |x: u64| (x as f64 * 1000.0) / dur_ms as f64;
+        let avg_us = |total: u64, n: u64| if n == 0 { 0.0 } else { total as f64 / n as f64 };
+        eprintln!(
+            "[scroll] {dur_ms}ms ev={events}({:.0}/s) sub={subline}({:.0}/s) snaps={snaps}({:.0}/s) clamps={clamps} sgr={sgr_evts} pty_notif={pty_notifies}({:.0}/s, {pty_bytes}B) | paint={paint_calls}({:.0}/s, {:.0}us) prep={prepaint_calls}({:.0}/s, {:.0}us)",
+            per_sec(events),
+            per_sec(subline),
+            per_sec(snaps),
+            per_sec(pty_notifies),
+            per_sec(paint_calls),
+            avg_us(paint_us, paint_calls),
+            per_sec(prepaint_calls),
+            avg_us(prepaint_us, prepaint_calls),
+        );
+    }
+}
+
+static SCROLL_STATS: ScrollStats = ScrollStats::new();
 
 actions!(terminal_view, [Copy, Paste, SelectAll, Tab, TabPrev]);
 
@@ -252,6 +371,26 @@ pub struct TerminalView {
     window_active: bool,
     /// Held so the window activation subscription lives as long as the view.
     _window_activation_sub: Option<gpui::Subscription>,
+    /// Sub-line vertical scroll position in **pixels**, in `[0, cell_h)`.
+    /// Represents how much of the bleed-row above the viewport ("peek row")
+    /// is currently revealed at the top edge. `0.0` means the viewport sits
+    /// exactly on a line boundary, just like a classic line-aligned terminal.
+    /// Values in between produce smooth pixel-by-pixel motion: when this
+    /// crosses a line boundary, [`apply_scroll_pixels`] snaps it back into
+    /// range and advances the VT viewport by the corresponding line count.
+    pixel_offset: f32,
+    /// Cached text of the row immediately above the viewport. `None` means
+    /// scrollback is exhausted (no row above) — `pixel_offset` will be
+    /// clamped to `0.0` in that case so we never reveal an empty strip.
+    peek_text: Option<String>,
+    /// Style runs for [`peek_text`] (same shape as `viewport_style_runs[i]`).
+    peek_runs: Vec<StyleRun>,
+    /// Cached shaping for [`peek_text`]. Invalidated on font/size/text change.
+    peek_layout: Option<gpui::ShapedLine>,
+    /// Set when the peek-row data may be stale: VT scrolled, viewport text
+    /// changed, or font metrics changed. Re-fetched lazily in prepaint, but
+    /// only when `pixel_offset > 0` (otherwise peek isn't rendered).
+    peek_dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -305,6 +444,11 @@ impl TerminalView {
             cursor_blink_enabled: true,
             window_active: true,
             _window_activation_sub: None,
+            pixel_offset: 0.0,
+            peek_text: None,
+            peek_runs: Vec::new(),
+            peek_layout: None,
+            peek_dirty: false,
         }
         .with_refreshed_viewport()
     }
@@ -353,6 +497,11 @@ impl TerminalView {
             cursor_blink_enabled: true,
             window_active: true,
             _window_activation_sub: None,
+            pixel_offset: 0.0,
+            peek_text: None,
+            peek_runs: Vec::new(),
+            peek_layout: None,
+            peek_dirty: false,
         }
         .with_refreshed_viewport()
     }
@@ -554,6 +703,17 @@ impl TerminalView {
 
     fn sync_viewport_scroll_tracking(&mut self) {
         let _ = self.session.take_viewport_scroll_delta();
+        // Anything that calls this helper has just moved the VT to a fresh
+        // line-aligned position (mouse wheel snap, page/home/end keys,
+        // resize). The previous sub-line `pixel_offset` is no longer
+        // meaningful — drop it so the next paint shows the new viewport
+        // exactly on a line boundary. The mouse-wheel path explicitly
+        // re-assigns the new offset after this call.
+        if self.pixel_offset != 0.0 {
+            self.pixel_offset = 0.0;
+            self.peek_layout = None;
+            self.peek_dirty = true;
+        }
     }
 
     fn apply_viewport_scroll_delta(&mut self, delta: i32) {
@@ -650,6 +810,10 @@ impl TerminalView {
         self.line_layouts.clear();
         self.line_layout_key = None;
         self.selection = None;
+        // Viewport text changed — peek row above may also have shifted.
+        // It'll be re-fetched lazily in prepaint when needed.
+        self.peek_dirty = true;
+        self.peek_layout = None;
     }
 
     fn compute_viewport_line_offsets(lines: &[String]) -> Vec<usize> {
@@ -808,8 +972,10 @@ impl TerminalView {
         // user types and the shell echoes). Blink timer will resume toggling.
         self.cursor_blink_on = true;
 
+        SCROLL_STATS.pty_input_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         if self.pending_output.len().saturating_add(bytes.len()) <= MAX_PENDING_OUTPUT_BYTES {
             self.pending_output.extend_from_slice(bytes);
+            SCROLL_STATS.pty_input_notifies.fetch_add(1, Ordering::Relaxed);
             cx.notify();
             return;
         }
@@ -1239,25 +1405,42 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dy_lines: f32 = match event.delta {
-            ScrollDelta::Lines(p) => p.y,
-            ScrollDelta::Pixels(p) => f32::from(p.y) / 16.0,
+        let cell_h = cell_metrics_with_overrides(
+            window,
+            &self.font,
+            self.session.font_size(),
+            self.session.line_height_ratio(),
+        )
+        .map(|(_, h)| h)
+        .unwrap_or(16.0);
+
+        // Convert delta to pixels. ScrollDelta::Lines means an upstream OS
+        // already mapped it to whole lines (rare on macOS trackpads); we
+        // convert to the equivalent pixel count using the real cell height.
+        let dy_px_in: f32 = match event.delta {
+            ScrollDelta::Lines(p) => p.y * cell_h,
+            ScrollDelta::Pixels(p) => f32::from(p.y),
         };
 
-        let delta_lines = (-dy_lines).round() as i32;
-        if delta_lines == 0 {
-            return;
-        }
+        // Sign convention used internally: positive = scroll INTO history
+        // (peek revealed at top). Trackpad delta.y is positive when fingers
+        // move up = page should reveal content above = into history.
+        let dy_history = dy_px_in;
 
+        // Mouse-reporting branch — remote app handles the scroll itself; we
+        // pass discrete integer steps. No local pixel accumulation.
         if let Some(input) = self.input.as_ref()
             && !event.modifiers.shift
             && self.session.mouse_reporting_enabled()
             && self.session.mouse_sgr_enabled()
         {
+            let delta_lines = (-dy_history / cell_h).round() as i32;
+            if delta_lines == 0 {
+                return;
+            }
             let Some((col, row)) = self.mouse_position_to_cell(event.position, window) else {
                 return;
             };
-
             let button = if delta_lines < 0 { 64 } else { 65 };
             let button_value = sgr_mouse_button_value(
                 button,
@@ -1271,13 +1454,159 @@ impl TerminalView {
                 let seq = sgr_mouse_sequence(button_value, col, row, true);
                 input.send(seq.as_bytes());
             }
+            SCROLL_STATS.sgr_wheel_events.fetch_add(steps as u64, Ordering::Relaxed);
+            SCROLL_STATS.events.fetch_add(1, Ordering::Relaxed);
+            SCROLL_STATS.maybe_emit();
             return;
         }
 
-        let _ = self.session.scroll_viewport(delta_lines);
-        self.sync_viewport_scroll_tracking();
-        self.apply_side_effects(cx);
-        self.schedule_viewport_refresh(cx);
+        // Phase reset: a brand-new gesture starts at whatever sub-line offset
+        // is currently visible — we don't snap to a line boundary, that's
+        // exactly the "stickiness" we're trying to eliminate. We only drop
+        // micro-noise (touch_phase::Started often arrives with delta = 0).
+        if matches!(event.touch_phase, TouchPhase::Started) && dy_history.abs() < 0.5 {
+            return;
+        }
+
+        self.apply_scroll_pixels(dy_history, cell_h, cx);
+    }
+
+    /// Update sub-line `pixel_offset` and snap the VT viewport to lines as
+    /// needed. The bulk of trackpad events fall *within* a single line and
+    /// only do `pixel_offset += dy + cx.notify()` — no VT calls, no text
+    /// refetch. Only when crossing a line boundary do we touch the VT.
+    fn apply_scroll_pixels(&mut self, dy_history_px: f32, cell_h: f32, cx: &mut Context<Self>) {
+        if cell_h <= 0.0 {
+            return;
+        }
+
+        // Velocity gate: at high scroll speeds (>1.5 lines per event), the
+        // visual is dominated by line snaps — sub-pixel motion isn't
+        // perceptible. Skip the peek-row render path entirely in that case
+        // and snap straight to a line boundary. This keeps the cost of
+        // pixel-smooth scroll bounded to slow/precise gestures (where the
+        // user actually sees the smoothness) and matches OS-level fast-swipe
+        // behaviour. Cuts ~10–13% CPU during fast trackpad swipes by
+        // dropping the extra glyph row + quad submissions per frame.
+        let fast = dy_history_px.abs() > cell_h * 1.5;
+        if fast {
+            // Drop any leftover sub-line offset and snap.
+            let combined_px = self.pixel_offset + dy_history_px;
+            let lines = (combined_px / cell_h).round() as i32;
+
+            if lines != 0 {
+                let _ = self.session.take_viewport_scroll_delta();
+                let _ = self.session.scroll_viewport(-lines);
+                let actual_delta = self.session.take_viewport_scroll_delta();
+                self.apply_viewport_scroll_delta(actual_delta);
+                let dirty_rows = self.session.take_dirty_viewport_rows();
+                if !dirty_rows.is_empty() && !self.apply_dirty_viewport_rows(&dirty_rows) {
+                    self.pending_refresh = true;
+                }
+                self.apply_side_effects(cx);
+                cx.notify();
+                if -actual_delta != lines {
+                    SCROLL_STATS.boundary_clamps.fetch_add(1, Ordering::Relaxed);
+                }
+                SCROLL_STATS
+                    .line_snaps
+                    .fetch_add(lines.unsigned_abs() as u64, Ordering::Relaxed);
+            }
+
+            // Always reset offset (no peek to render, no sub-line state to keep).
+            if self.pixel_offset != 0.0 {
+                self.pixel_offset = 0.0;
+                self.peek_layout = None;
+                self.peek_dirty = true;
+            }
+            SCROLL_STATS.events.fetch_add(1, Ordering::Relaxed);
+            SCROLL_STATS.maybe_emit();
+            return;
+        }
+
+        let raw = self.pixel_offset + dy_history_px;
+        let whole = (raw / cell_h).floor() as i32;
+        let mut new_offset = raw - (whole as f32) * cell_h;
+
+        let was_zero = self.pixel_offset == 0.0;
+        let mut text_refresh_scheduled = false;
+        let mut clamped_at_boundary = false;
+
+        if whole != 0 {
+            // `whole > 0` means `raw` advanced into history → scroll VT one
+            // line *back* in scrollback per unit, i.e. scroll_viewport(-whole).
+            // Wrap with delta clear/take so we can detect when the VT clamped
+            // at a boundary (top of scrollback, or live screen with nothing
+            // below). This replaces an earlier per-event `dump_screen_row(0)`
+            // probe that allocated and freed a UTF-8 string on every event.
+            let _ = self.session.take_viewport_scroll_delta();
+            let _ = self.session.scroll_viewport(-whole);
+            let actual_delta = self.session.take_viewport_scroll_delta();
+            let actual_history_whole = -actual_delta;
+
+            // Smart refresh: rotate the cached `viewport_lines` /
+            // `line_layouts` by the actual delta and only re-fetch + re-shape
+            // the rows that scrolled in (|delta| rows at top or bottom).
+            // The previous path (`schedule_viewport_refresh`) cleared the
+            // entire layout cache and forced a re-shape of every viewport
+            // row on every line-snap — at fast trackpad speeds with
+            // |whole|=7 and N=40 that's 33 wasted shapes per event. The
+            // PTY-output path already uses this delta-rotate; we just
+            // mirror it here.
+            self.apply_viewport_scroll_delta(actual_delta);
+            let dirty_rows = self.session.take_dirty_viewport_rows();
+            if !dirty_rows.is_empty() && !self.apply_dirty_viewport_rows(&dirty_rows) {
+                // Only fall back to full refresh if delta-aware patching
+                // couldn't keep up (e.g. wide-char re-flow). Rare.
+                self.pending_refresh = true;
+                cx.notify();
+            } else {
+                cx.notify();
+            }
+            self.apply_side_effects(cx);
+            self.peek_dirty = true;
+            text_refresh_scheduled = true;
+
+            if actual_history_whole != whole {
+                clamped_at_boundary = true;
+                SCROLL_STATS.boundary_clamps.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if clamped_at_boundary {
+            // Hit a boundary (top of scrollback OR live mode bottom). The
+            // visual position can't advance further in the requested
+            // direction — snap to the nearest line boundary so we don't
+            // rubber-band into peek territory (would show a "bounce" at the
+            // bottom or empty strip at the top).
+            new_offset = 0.0;
+        }
+
+        let offset_changed = (self.pixel_offset - new_offset).abs() > 0.001;
+        if offset_changed {
+            self.pixel_offset = new_offset;
+            // Peek text only changes when the VT viewport moves *or* when we
+            // newly enter peek territory (offset transitioned 0 → >0). Pure
+            // sub-line offset changes within `(0, cell_h)` re-use the same
+            // peek text, so don't dirty it then — that was a major source of
+            // CPU during continuous trackpad scroll (every event re-fetched
+            // and re-shaped the peek line).
+            if was_zero && new_offset > 0.0 {
+                self.peek_dirty = true;
+            }
+        }
+
+        SCROLL_STATS.events.fetch_add(1, Ordering::Relaxed);
+        if whole != 0 {
+            SCROLL_STATS.line_snaps.fetch_add(whole.unsigned_abs() as u64, Ordering::Relaxed);
+        } else if offset_changed {
+            SCROLL_STATS.subline_paints.fetch_add(1, Ordering::Relaxed);
+        }
+        SCROLL_STATS.maybe_emit();
+
+        if !text_refresh_scheduled && offset_changed {
+            cx.notify();
+        }
     }
 
     fn mouse_position_to_viewport_index(
@@ -1298,7 +1627,10 @@ impl TerminalView {
             self.session.line_height_ratio(),
         )?;
         let x = f32::from(local_position.x);
-        let y = f32::from(local_position.y);
+        // Subtract pixel_offset so the row math operates in *content* space,
+        // not *viewport* space. With the peek row visible at top, viewport
+        // y=0 maps to content y=-pixel_offset (somewhere inside the peek).
+        let y = f32::from(local_position.y) - self.pixel_offset;
         let mut row_index = (y / cell_height).floor() as i32;
         if row_index < 0 {
             row_index = 0;
@@ -1345,7 +1677,7 @@ impl TerminalView {
             self.session.line_height_ratio(),
         )?;
         let x = f32::from(position.x);
-        let y = f32::from(position.y);
+        let y = f32::from(position.y) - self.pixel_offset;
 
         let mut col = (x / cell_width).floor() as i32 + 1;
         let mut row = (y / cell_height).floor() as i32 + 1;
@@ -1457,7 +1789,9 @@ impl EntityInputHandler for TerminalView {
         )?;
 
         let base_x = element_bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
-        let base_y = element_bounds.top() + px(cell_height * (row.saturating_sub(1)) as f32);
+        let base_y = element_bounds.top()
+            + px(cell_height * (row.saturating_sub(1)) as f32)
+            + px(self.pixel_offset);
 
         let offset_cells = self
             .marked_text
@@ -1483,6 +1817,10 @@ impl EntityInputHandler for TerminalView {
 
 struct TerminalPrepaintState {
     line_height: Pixels,
+    /// Y-shift applied to *all* viewport rows + cursor + selection during
+    /// paint. Encodes the sub-line scroll offset so the screen slides
+    /// pixel-by-pixel between line boundaries. Always in `[0, line_height)`.
+    pixel_offset: Pixels,
     shaped_lines: Vec<gpui::ShapedLine>,
     background_quads: Vec<PaintQuad>,
     selection_quads: Vec<PaintQuad>,
@@ -1490,6 +1828,12 @@ struct TerminalPrepaintState {
     marked_text: Option<(gpui::ShapedLine, gpui::Point<Pixels>)>,
     marked_text_background: Option<PaintQuad>,
     cursor: Option<PaintQuad>,
+    /// Optional bleed-row shown above viewport row 0 when `pixel_offset > 0`.
+    /// All three vectors are in *content* coords (no pixel_offset applied);
+    /// paint translates them by `(0, pixel_offset - line_height)`.
+    peek_line: Option<gpui::ShapedLine>,
+    peek_background_quads: Vec<PaintQuad>,
+    peek_box_drawing_quads: Vec<PaintQuad>,
 }
 
 const CELL_STYLE_FLAG_BOLD: u8 = 0x02;
@@ -1796,6 +2140,183 @@ pub(crate) fn byte_index_for_column_in_line(line: &str, col: u16) -> usize {
     line.len()
 }
 
+/// Build the GPUI [`TextRun`] sequence for a single terminal row from its
+/// raw text and per-cell style runs. Extracted so it can be shared by the
+/// main viewport shaping loop and the peek-row shaper.
+fn build_runs_for_line(
+    text: &str,
+    style_runs: &[StyleRun],
+    run_font: &gpui::Font,
+    run_color: gpui::Hsla,
+) -> Vec<TextRun> {
+    let mut runs: Vec<TextRun> = Vec::new();
+    if !style_runs.is_empty() {
+        let mut byte_pos = 0usize;
+        for style in style_runs.iter() {
+            let key = TextRunKey {
+                fg: style.fg,
+                flags: style.flags
+                    & (CELL_STYLE_FLAG_BOLD
+                        | CELL_STYLE_FLAG_ITALIC
+                        | CELL_STYLE_FLAG_UNDERLINE
+                        | CELL_STYLE_FLAG_FAINT
+                        | CELL_STYLE_FLAG_STRIKETHROUGH),
+            };
+
+            let start = byte_index_for_column_in_line(text, style.start_col).min(text.len());
+            let end = byte_index_for_column_in_line(text, style.end_col.saturating_add(1))
+                .min(text.len());
+
+            if start > byte_pos {
+                runs.push(TextRun {
+                    len: start.saturating_sub(byte_pos),
+                    font: run_font.clone(),
+                    color: run_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+                byte_pos = start;
+            }
+
+            if end > start {
+                runs.push(text_run_for_key(run_font, key, end.saturating_sub(start)));
+                byte_pos = end;
+            }
+        }
+
+        if byte_pos < text.len() {
+            runs.push(TextRun {
+                len: text.len().saturating_sub(byte_pos),
+                font: run_font.clone(),
+                color: run_color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+    }
+
+    if runs.is_empty() {
+        runs.push(TextRun {
+            len: text.len(),
+            font: run_font.clone(),
+            color: run_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+
+    runs
+}
+
+/// Background-color quads for a single row at vertical offset `y`.
+/// Skips runs whose bg matches `default_bg` (those are painted by the
+/// element's outer fill).
+fn build_bg_quads_for_row(
+    style_runs: &[StyleRun],
+    default_bg: Rgb,
+    origin_x: Pixels,
+    y: Pixels,
+    cell_width: f32,
+    line_height: Pixels,
+    out: &mut Vec<PaintQuad>,
+) {
+    if style_runs.is_empty() {
+        return;
+    }
+    for run in style_runs.iter() {
+        if run.bg == default_bg {
+            continue;
+        }
+        let x = origin_x + px(cell_width * (run.start_col.saturating_sub(1)) as f32);
+        let w = px(cell_width
+            * (run.end_col.saturating_sub(run.start_col).saturating_add(1)) as f32);
+        let color = rgba(
+            (u32::from(run.bg.r) << 24)
+                | (u32::from(run.bg.g) << 16)
+                | (u32::from(run.bg.b) << 8)
+                | 0xFF,
+        );
+        out.push(fill(Bounds::new(point(x, y), size(w, line_height)), color));
+    }
+}
+
+/// Box-drawing / block-character quads for a single row at vertical offset
+/// `y`. These are foreground glyphs that we draw as quads instead of
+/// shaping through text (sub-pixel alignment hassle, charset coverage gaps).
+fn build_box_quads_for_row(
+    line: &str,
+    style_runs: Option<&[StyleRun]>,
+    default_fg: gpui::Hsla,
+    origin_x: Pixels,
+    y: Pixels,
+    cell_width: f32,
+    line_height: Pixels,
+    out: &mut Vec<PaintQuad>,
+) {
+    use unicode_width::UnicodeWidthChar as _;
+    let mut run_idx: usize = 0;
+    let mut col = 1usize;
+    for ch in line.chars() {
+        let width = ch.width().unwrap_or(0);
+        if width == 0 {
+            continue;
+        }
+
+        let is_box = box_drawing_mask(ch).is_some();
+        let is_block = is_block_char(ch);
+
+        if is_box || is_block {
+            let fg = style_runs
+                .and_then(|runs| {
+                    while let Some(run) = runs.get(run_idx) {
+                        if (col as u16) <= run.end_col {
+                            break;
+                        }
+                        run_idx = run_idx.saturating_add(1);
+                    }
+                    runs.get(run_idx).and_then(|run| {
+                        (col as u16 >= run.start_col && (col as u16) <= run.end_col).then_some(run)
+                    })
+                })
+                .map(|run| {
+                    let key = TextRunKey {
+                        fg: run.fg,
+                        flags: run.flags
+                            & (CELL_STYLE_FLAG_FAINT
+                                | CELL_STYLE_FLAG_BOLD
+                                | CELL_STYLE_FLAG_ITALIC
+                                | CELL_STYLE_FLAG_UNDERLINE
+                                | CELL_STYLE_FLAG_STRIKETHROUGH),
+                    };
+                    color_for_key(key)
+                })
+                .unwrap_or(default_fg);
+
+            let x = origin_x + px(cell_width * (col.saturating_sub(1)) as f32);
+            let cell_bounds = Bounds::new(point(x, y), size(px(cell_width), line_height));
+
+            if is_box {
+                out.extend(box_drawing_quads_for_char(
+                    cell_bounds,
+                    line_height,
+                    cell_width,
+                    fg,
+                    ch,
+                ));
+            } else if let Some(block_quads) =
+                block_char_quads_for_char(cell_bounds, line_height, cell_width, fg, ch)
+            {
+                out.extend(block_quads);
+            }
+        }
+
+        col = col.saturating_add(width);
+    }
+}
+
 struct TerminalTextElement {
     view: gpui::Entity<TerminalView>,
 }
@@ -1842,6 +2363,7 @@ impl Element for TerminalTextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let _prepaint_start = Instant::now();
         // Update last_bounds early (during prepaint) so that mouse event
         // handlers on the current frame have accurate bounds for coordinate
         // conversion. Without this, selection coordinates are offset by the
@@ -1886,17 +2408,46 @@ impl Element for TerminalTextElement {
         .map(|(w, _)| px(w));
 
         self.view.update(cx, |view, _cx| {
+            // Sub-line scroll: refresh the peek-row text/style if it's stale
+            // and currently visible. We do this here (not in render) so that
+            // the same prepaint pass shapes the peek line below.
+            if view.pixel_offset > 0.0 && view.peek_dirty {
+                view.peek_text = view
+                    .session
+                    .dump_screen_row(0)
+                    .ok()
+                    .flatten();
+                view.peek_runs = view
+                    .session
+                    .dump_screen_row_style_runs(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                view.peek_layout = None;
+                view.peek_dirty = false;
+                SCROLL_STATS.peek_fetches.fetch_add(1, Ordering::Relaxed);
+                if view.peek_text.is_none() {
+                    // Scrollback exhausted while we were waiting to render —
+                    // drop the offset so we don't show an empty strip.
+                    view.pixel_offset = 0.0;
+                }
+            }
+
             if view.viewport_lines.is_empty() {
                 view.line_layouts.clear();
                 view.line_layout_key = None;
+                view.peek_layout = None;
                 return;
             }
 
-            if view.line_layout_key != Some((font_size, line_height))
+            // Font/size change → invalidate every cached layout (viewport + peek).
+            let key_changed = view.line_layout_key != Some((font_size, line_height));
+            if key_changed
                 || view.line_layouts.len() != view.viewport_lines.len()
             {
                 view.line_layout_key = Some((font_size, line_height));
                 view.line_layouts = vec![None; view.viewport_lines.len()];
+                view.peek_layout = None;
             }
 
             for (idx, line) in view.viewport_lines.iter().enumerate() {
@@ -1911,71 +2462,12 @@ impl Element for TerminalTextElement {
                 }
 
                 let text = SharedString::from(line.clone());
-                let mut runs: Vec<TextRun> = Vec::new();
-
-                if let Some(style_runs) = view.viewport_style_runs.get(idx)
-                    && !style_runs.is_empty()
-                {
-                    let mut byte_pos = 0usize;
-                    for style in style_runs.iter() {
-                        let key = TextRunKey {
-                            fg: style.fg,
-                            flags: style.flags
-                                & (CELL_STYLE_FLAG_BOLD
-                                    | CELL_STYLE_FLAG_ITALIC
-                                    | CELL_STYLE_FLAG_UNDERLINE
-                                    | CELL_STYLE_FLAG_FAINT
-                                    | CELL_STYLE_FLAG_STRIKETHROUGH),
-                        };
-
-                        let start = byte_index_for_column_in_line(text.as_str(), style.start_col)
-                            .min(text.len());
-                        let end = byte_index_for_column_in_line(
-                            text.as_str(),
-                            style.end_col.saturating_add(1),
-                        )
-                        .min(text.len());
-
-                        if start > byte_pos {
-                            runs.push(TextRun {
-                                len: start.saturating_sub(byte_pos),
-                                font: run_font.clone(),
-                                color: run_color,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            });
-                            byte_pos = start;
-                        }
-
-                        if end > start {
-                            runs.push(text_run_for_key(&run_font, key, end.saturating_sub(start)));
-                            byte_pos = end;
-                        }
-                    }
-
-                    if byte_pos < text.len() {
-                        runs.push(TextRun {
-                            len: text.len().saturating_sub(byte_pos),
-                            font: run_font.clone(),
-                            color: run_color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        });
-                    }
-                }
-
-                if runs.is_empty() {
-                    runs.push(TextRun {
-                        len: text.len(),
-                        font: run_font.clone(),
-                        color: run_color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    });
-                }
+                let runs = build_runs_for_line(
+                    text.as_str(),
+                    view.viewport_style_runs.get(idx).map(|v| v.as_slice()).unwrap_or(&[]),
+                    &run_font,
+                    run_color,
+                );
 
                 let force_width = cell_width.and_then(|cell_width| {
                     use unicode_width::UnicodeWidthChar as _;
@@ -1987,40 +2479,94 @@ impl Element for TerminalTextElement {
                     .shape_line(text, font_size, &runs, force_width);
                 *slot = Some(shaped);
             }
+
+            // Shape the peek row (above viewport top) when it's both visible
+            // (`pixel_offset > 0`) and either un-shaped or stale.
+            if view.pixel_offset > 0.0
+                && let Some(peek_text) = view.peek_text.clone()
+            {
+                let needs_shape = view
+                    .peek_layout
+                    .as_ref()
+                    .map(|l| l.text.as_str() != peek_text.as_str())
+                    .unwrap_or(true);
+                if needs_shape {
+                    let text = SharedString::from(peek_text);
+                    let runs = build_runs_for_line(
+                        text.as_str(),
+                        &view.peek_runs,
+                        &run_font,
+                        run_color,
+                    );
+                    let force_width = cell_width.and_then(|cell_width| {
+                        use unicode_width::UnicodeWidthChar as _;
+                        let has_wide =
+                            text.as_str().chars().any(|ch| ch.width().unwrap_or(0) > 1);
+                        (!has_wide).then_some(cell_width)
+                    });
+                    view.peek_layout = Some(window.text_system().shape_line(
+                        text,
+                        font_size,
+                        &runs,
+                        force_width,
+                    ));
+                    SCROLL_STATS.peek_reshapes.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                view.peek_layout = None;
+            }
         });
 
         let default_bg = { self.view.read(cx).session.default_background() };
-        let background_quads = cell_metrics_with_overrides(window, &font, font_size_override, line_height_ratio_override)
-            .map(|(cell_width, _)| {
+        let cell_w_metric = cell_metrics_with_overrides(
+            window,
+            &font,
+            font_size_override,
+            line_height_ratio_override,
+        )
+        .map(|(w, _)| w);
+        let background_quads = cell_w_metric
+            .map(|cell_width| {
                 let origin = bounds.origin;
                 let mut quads: Vec<PaintQuad> = Vec::new();
 
                 let view = self.view.read(cx);
                 for (row, runs) in view.viewport_style_runs.iter().enumerate() {
-                    if runs.is_empty() {
-                        continue;
-                    }
-
                     let y = origin.y + line_height * row as f32;
-                    for run in runs.iter() {
-                        if run.bg == default_bg {
-                            continue;
-                        }
-
-                        let x =
-                            origin.x + px(cell_width * (run.start_col.saturating_sub(1)) as f32);
-                        let w = px(cell_width
-                            * (run.end_col.saturating_sub(run.start_col).saturating_add(1)) as f32);
-                        let color = rgba(
-                            (u32::from(run.bg.r) << 24)
-                                | (u32::from(run.bg.g) << 16)
-                                | (u32::from(run.bg.b) << 8)
-                                | 0xFF,
-                        );
-                        quads.push(fill(Bounds::new(point(x, y), size(w, line_height)), color));
-                    }
+                    build_bg_quads_for_row(
+                        runs,
+                        default_bg,
+                        origin.x,
+                        y,
+                        cell_width,
+                        line_height,
+                        &mut quads,
+                    );
                 }
 
+                quads
+            })
+            .unwrap_or_default();
+
+        // Peek-row background quads. Painted at content row "−1" (above
+        // viewport row 0). The same `pixel_offset` translation that's
+        // applied to viewport quads in paint also applies here.
+        let peek_background_quads = cell_w_metric
+            .map(|cell_width| {
+                let mut quads: Vec<PaintQuad> = Vec::new();
+                let view = self.view.read(cx);
+                if view.pixel_offset > 0.0 && !view.peek_runs.is_empty() {
+                    let y = bounds.origin.y - line_height;
+                    build_bg_quads_for_row(
+                        &view.peek_runs,
+                        default_bg,
+                        bounds.origin.x,
+                        y,
+                        cell_width,
+                        line_height,
+                        &mut quads,
+                    );
+                }
                 quads
             })
             .unwrap_or_default();
@@ -2163,9 +2709,8 @@ impl Element for TerminalTextElement {
             })
             .unwrap_or_default();
 
-        let box_drawing_quads = cell_metrics_with_overrides(window, &font, font_size_override, line_height_ratio_override)
-            .map(|(cell_width, _)| {
-                use unicode_width::UnicodeWidthChar as _;
+        let box_drawing_quads = cell_w_metric
+            .map(|cell_width| {
                 let default_fg = run_color;
                 let mut quads = Vec::new();
 
@@ -2173,73 +2718,41 @@ impl Element for TerminalTextElement {
                 for (row, line) in view.viewport_lines.iter().enumerate() {
                     let y = bounds.top() + line_height * row as f32;
                     let runs = view.viewport_style_runs.get(row).map(|v| v.as_slice());
-                    let mut run_idx: usize = 0;
-
-                    let mut col = 1usize;
-                    for ch in line.chars() {
-                        let width = ch.width().unwrap_or(0);
-                        if width == 0 {
-                            continue;
-                        }
-
-                        let is_box = box_drawing_mask(ch).is_some();
-                        let is_block = is_block_char(ch);
-
-                        if is_box || is_block {
-                            let fg = runs
-                                .and_then(|runs| {
-                                    while let Some(run) = runs.get(run_idx) {
-                                        if (col as u16) <= run.end_col {
-                                            break;
-                                        }
-                                        run_idx = run_idx.saturating_add(1);
-                                    }
-                                    runs.get(run_idx).and_then(|run| {
-                                        (col as u16 >= run.start_col && (col as u16) <= run.end_col)
-                                            .then_some(run)
-                                    })
-                                })
-                                .map(|run| {
-                                    let key = TextRunKey {
-                                        fg: run.fg,
-                                        flags: run.flags
-                                            & (CELL_STYLE_FLAG_FAINT
-                                                | CELL_STYLE_FLAG_BOLD
-                                                | CELL_STYLE_FLAG_ITALIC
-                                                | CELL_STYLE_FLAG_UNDERLINE
-                                                | CELL_STYLE_FLAG_STRIKETHROUGH),
-                                    };
-                                    color_for_key(key)
-                                })
-                                .unwrap_or(default_fg);
-
-                            let x = bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
-                            let cell_bounds =
-                                Bounds::new(point(x, y), size(px(cell_width), line_height));
-
-                            if is_box {
-                                quads.extend(box_drawing_quads_for_char(
-                                    cell_bounds,
-                                    line_height,
-                                    cell_width,
-                                    fg,
-                                    ch,
-                                ));
-                            } else if let Some(block_quads) = block_char_quads_for_char(
-                                cell_bounds,
-                                line_height,
-                                cell_width,
-                                fg,
-                                ch,
-                            ) {
-                                quads.extend(block_quads);
-                            }
-                        }
-
-                        col = col.saturating_add(width);
-                    }
+                    build_box_quads_for_row(
+                        line,
+                        runs,
+                        default_fg,
+                        bounds.left(),
+                        y,
+                        cell_width,
+                        line_height,
+                        &mut quads,
+                    );
                 }
 
+                quads
+            })
+            .unwrap_or_default();
+
+        let peek_box_drawing_quads = cell_w_metric
+            .map(|cell_width| {
+                let mut quads = Vec::new();
+                let view = self.view.read(cx);
+                if view.pixel_offset > 0.0
+                    && let Some(peek_text) = view.peek_text.as_deref()
+                {
+                    let y = bounds.top() - line_height;
+                    build_box_quads_for_row(
+                        peek_text,
+                        Some(view.peek_runs.as_slice()),
+                        run_color,
+                        bounds.left(),
+                        y,
+                        cell_width,
+                        line_height,
+                        &mut quads,
+                    );
+                }
                 quads
             })
             .unwrap_or_default();
@@ -2282,8 +2795,18 @@ impl Element for TerminalTextElement {
             ))
         });
 
+        let (pixel_offset, peek_line) = {
+            let view = self.view.read(cx);
+            (px(view.pixel_offset), view.peek_layout.clone())
+        };
+
+        let prepaint_us = _prepaint_start.elapsed().as_micros() as u64;
+        SCROLL_STATS.prepaint_calls.fetch_add(1, Ordering::Relaxed);
+        SCROLL_STATS.prepaint_us.fetch_add(prepaint_us, Ordering::Relaxed);
+
         TerminalPrepaintState {
             line_height,
+            pixel_offset,
             shaped_lines,
             background_quads,
             selection_quads,
@@ -2291,6 +2814,9 @@ impl Element for TerminalTextElement {
             marked_text,
             marked_text_background,
             cursor,
+            peek_line,
+            peek_background_quads,
+            peek_box_drawing_quads,
         }
     }
 
@@ -2304,6 +2830,7 @@ impl Element for TerminalTextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let paint_start = Instant::now();
         self.view.update(cx, |view, _cx| {
             view.last_bounds = Some(bounds);
         });
@@ -2319,17 +2846,49 @@ impl Element for TerminalTextElement {
             let default_bg = { self.view.read(cx).session.default_background() };
             window.paint_quad(fill(bounds, hsla_from_rgb(default_bg)));
 
+            // Sub-line scroll: every viewport-content y is shifted by
+            // `pixel_offset`. The peek row sits at content row "−1", i.e.
+            // its quads/text were prepared at `bounds.top() - line_height`
+            // and get the same shift, so it lands at
+            // `bounds.top() - line_height + pixel_offset` — partially
+            // revealed from the top edge. `paint_layer(bounds)` clips
+            // anything that overflows top/bottom.
+            let dy = prepaint.pixel_offset;
+            let translate = |q: &mut PaintQuad| {
+                q.bounds.origin.y += dy;
+            };
+
+            for quad in prepaint.peek_background_quads.drain(..) {
+                let mut q = quad;
+                translate(&mut q);
+                window.paint_quad(q);
+            }
             for quad in prepaint.background_quads.drain(..) {
-                window.paint_quad(quad);
+                let mut q = quad;
+                translate(&mut q);
+                window.paint_quad(q);
             }
 
             for quad in prepaint.selection_quads.drain(..) {
-                window.paint_quad(quad);
+                let mut q = quad;
+                translate(&mut q);
+                window.paint_quad(q);
             }
 
             let origin = bounds.origin;
+            if let Some(peek_line) = prepaint.peek_line.as_ref() {
+                let y = origin.y - prepaint.line_height + dy;
+                let _ = peek_line.paint(
+                    point(origin.x, y),
+                    prepaint.line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
             for (row, line) in prepaint.shaped_lines.iter().enumerate() {
-                let y = origin.y + prepaint.line_height * row as f32;
+                let y = origin.y + prepaint.line_height * row as f32 + dy;
                 let _ = line.paint(
                     point(origin.x, y),
                     prepaint.line_height,
@@ -2340,17 +2899,25 @@ impl Element for TerminalTextElement {
                 );
             }
 
+            for quad in prepaint.peek_box_drawing_quads.drain(..) {
+                let mut q = quad;
+                translate(&mut q);
+                window.paint_quad(q);
+            }
             for quad in prepaint.box_drawing_quads.drain(..) {
-                window.paint_quad(quad);
+                let mut q = quad;
+                translate(&mut q);
+                window.paint_quad(q);
             }
 
-            if let Some(bg) = prepaint.marked_text_background.take() {
+            if let Some(mut bg) = prepaint.marked_text_background.take() {
+                translate(&mut bg);
                 window.paint_quad(bg);
             }
 
             if let Some((line, origin)) = prepaint.marked_text.as_ref() {
                 let _ = line.paint(
-                    *origin,
+                    point(origin.x, origin.y + dy),
                     prepaint.line_height,
                     gpui::TextAlign::Left,
                     None,
@@ -2359,10 +2926,16 @@ impl Element for TerminalTextElement {
                 );
             }
 
-            if let Some(cursor) = prepaint.cursor.take() {
+            if let Some(mut cursor) = prepaint.cursor.take() {
+                translate(&mut cursor);
                 window.paint_quad(cursor);
             }
         });
+
+        let paint_us = paint_start.elapsed().as_micros() as u64;
+        SCROLL_STATS.paint_calls.fetch_add(1, Ordering::Relaxed);
+        SCROLL_STATS.paint_us.fetch_add(paint_us, Ordering::Relaxed);
+        SCROLL_STATS.maybe_emit();
     }
 }
 
