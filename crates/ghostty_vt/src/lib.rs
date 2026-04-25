@@ -390,6 +390,14 @@ impl Terminal {
         })
     }
 
+    /// Hard reset of the terminal state — equivalent to `tput reset` or
+    /// Terminal.app's "Reset" menu item. Clears scrollback, resets modes
+    /// and tab stops, forces a full redraw. The shell process is left
+    /// running; the next prompt will print as normal.
+    pub fn full_reset(&mut self) {
+        unsafe { ghostty_vt_sys::ghostty_vt_terminal_full_reset(self.ptr.as_ptr()) }
+    }
+
     pub fn take_viewport_scroll_delta(&mut self) -> i32 {
         unsafe { ghostty_vt_sys::ghostty_vt_terminal_take_viewport_scroll_delta(self.ptr.as_ptr()) }
     }

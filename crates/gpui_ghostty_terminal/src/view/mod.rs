@@ -81,7 +81,23 @@ impl ScrollStats {
         epoch.elapsed().as_millis() as u64
     }
 
+    /// Stderr emission is gated by `GPUI_GHOSTTY_SCROLL_TRACE=1`. Off by
+    /// default so a release build doesn't spam logs every 500 ms while
+    /// the user scrolls. The counters themselves are always updated so
+    /// flipping the env var without a rebuild is enough to start tracing.
+    fn tracing_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("GPUI_GHOSTTY_SCROLL_TRACE")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
     fn maybe_emit(&self) {
+        if !Self::tracing_enabled() {
+            return;
+        }
         let now = Self::now_ms();
         let last = self.last_emit_ms.load(Ordering::Relaxed);
         if last == 0 {
@@ -114,7 +130,7 @@ impl ScrollStats {
         let per_sec = |x: u64| (x as f64 * 1000.0) / dur_ms as f64;
         let avg_us = |total: u64, n: u64| if n == 0 { 0.0 } else { total as f64 / n as f64 };
         eprintln!(
-            "[scroll] {dur_ms}ms ev={events}({:.0}/s) sub={subline}({:.0}/s) snaps={snaps}({:.0}/s) clamps={clamps} sgr={sgr_evts} pty_notif={pty_notifies}({:.0}/s, {pty_bytes}B) | paint={paint_calls}({:.0}/s, {:.0}us) prep={prepaint_calls}({:.0}/s, {:.0}us)",
+            "[scroll] {dur_ms}ms ev={events}({:.0}/s) sub={subline}({:.0}/s) snaps={snaps}({:.0}/s) clamps={clamps} sgr={sgr_evts} pty_notif={pty_notifies}({:.0}/s, {pty_bytes}B) peek_fetch={fetches} peek_reshape={reshapes} | paint={paint_calls}({:.0}/s, {:.0}us) prep={prepaint_calls}({:.0}/s, {:.0}us)",
             per_sec(events),
             per_sec(subline),
             per_sec(snaps),
@@ -398,6 +414,12 @@ pub struct TerminalView {
     /// it every frame; on idle frames the cached value is accurate.
     scroll_pos: Option<ghostty_vt::ScrollPosition>,
     scroll_pos_dirty: bool,
+    /// When `true`, finishing a drag-to-select gesture (mouse-up while a
+    /// non-empty selection exists) automatically copies the selected text
+    /// to the system clipboard — mirrors iTerm2 / Terminal.app's "Copy on
+    /// Select" preference. Toggled at runtime by the host via
+    /// [`set_copy_on_select`].
+    copy_on_select: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -458,6 +480,7 @@ impl TerminalView {
             peek_dirty: false,
             scroll_pos: None,
             scroll_pos_dirty: true,
+            copy_on_select: false,
         }
         .with_refreshed_viewport()
     }
@@ -513,6 +536,7 @@ impl TerminalView {
             peek_dirty: false,
             scroll_pos: None,
             scroll_pos_dirty: true,
+            copy_on_select: false,
         }
         .with_refreshed_viewport()
     }
@@ -550,23 +574,25 @@ impl TerminalView {
             return;
         };
         let dur = std::time::Duration::from_millis(blink_ms);
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(dur).await;
-            if this
-                .update(cx, |view, cx| {
-                    if !view.cursor_blink_enabled {
-                        // Blink paused by host (unfocused pane); keep cursor
-                        // solid-on and issue no repaints.
-                        return;
-                    }
-                    view.cursor_blink_on = !view.cursor_blink_on;
-                    if view.window_active {
-                        cx.notify();
-                    }
-                })
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(dur).await;
+                if this
+                    .update(cx, |view, cx| {
+                        if !view.cursor_blink_enabled {
+                            // Blink paused by host (unfocused pane); keep cursor
+                            // solid-on and issue no repaints.
+                            return;
+                        }
+                        view.cursor_blink_on = !view.cursor_blink_on;
+                        if view.window_active {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -688,6 +714,12 @@ impl TerminalView {
             return;
         }
 
+        // Auto-snap to live: any user input (typed character, key combo,
+        // paste) jumps the viewport back to the active screen so the user
+        // can see what they're typing. Matches Terminal.app / iTerm2 /
+        // upstream Ghostty.
+        self.snap_to_live(cx);
+
         if let Some(input) = self.input.as_ref() {
             for bytes in parts {
                 input.send(bytes);
@@ -710,6 +742,39 @@ impl TerminalView {
         } else {
             let _ = self.session.feed(bytes);
         }
+    }
+
+    /// Snap the viewport to the live (active-screen) bottom. No-op if the
+    /// viewport is already there. Called on every user input keystroke so
+    /// typing always shows the prompt — matching the behaviour of macOS
+    /// Terminal, iTerm2, Alacritty, etc.
+    fn snap_to_live(&mut self, cx: &mut Context<Self>) {
+        // Discard any pending PTY-driven delta so the take below isolates
+        // exactly our scroll-bottom action.
+        let _ = self.session.take_viewport_scroll_delta();
+        let _ = self.session.scroll_viewport_bottom();
+        let delta = self.session.take_viewport_scroll_delta();
+
+        // Drop the sub-line offset regardless: typing while at offset > 0
+        // (mid-pixel-smooth scroll) should still snap to a clean line.
+        let had_offset = self.pixel_offset != 0.0;
+        if had_offset {
+            self.pixel_offset = 0.0;
+            self.peek_layout = None;
+            self.peek_dirty = true;
+        }
+
+        if delta == 0 && !had_offset {
+            // Already at live bottom — nothing to refresh, save the
+            // re-fetch + re-shape work.
+            return;
+        }
+
+        // VT moved (or only sub-line offset reset): re-pull viewport text
+        // and invalidate scrollbar position.
+        self.refresh_viewport();
+        self.scroll_pos_dirty = true;
+        cx.notify();
     }
 
     fn sync_viewport_scroll_tracking(&mut self) {
@@ -990,10 +1055,14 @@ impl TerminalView {
         // user types and the shell echoes). Blink timer will resume toggling.
         self.cursor_blink_on = true;
 
-        SCROLL_STATS.pty_input_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        SCROLL_STATS
+            .pty_input_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         if self.pending_output.len().saturating_add(bytes.len()) <= MAX_PENDING_OUTPUT_BYTES {
             self.pending_output.extend_from_slice(bytes);
-            SCROLL_STATS.pty_input_notifies.fetch_add(1, Ordering::Relaxed);
+            SCROLL_STATS
+                .pty_input_notifies
+                .fetch_add(1, Ordering::Relaxed);
             cx.notify();
             return;
         }
@@ -1024,6 +1093,24 @@ impl TerminalView {
         }
 
         self.pending_output.extend_from_slice(bytes);
+        cx.notify();
+    }
+
+    /// Hard-reset the terminal: clears scrollback, resets modes, repaints
+    /// from scratch. Equivalent of Terminal.app's "Reset" / `tput reset`.
+    /// The shell keeps running; on its next print the prompt redraws
+    /// normally. To make the shell *re-emit* the prompt right away, host
+    /// can additionally send `\n` or `Ctrl+L` after calling this.
+    pub fn reset_terminal(&mut self, cx: &mut Context<Self>) {
+        self.session.full_reset();
+        self.refresh_viewport();
+        self.peek_layout = None;
+        self.peek_text = None;
+        self.peek_runs.clear();
+        self.peek_dirty = true;
+        self.pixel_offset = 0.0;
+        self.scroll_pos_dirty = true;
+        self.selection = None;
         cx.notify();
     }
 
@@ -1059,6 +1146,18 @@ impl TerminalView {
     }
 
     fn on_paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        self.paste_from_clipboard(cx);
+    }
+
+    fn on_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection_to_clipboard(cx);
+    }
+
+    /// Read text from the system clipboard and inject it into the shell —
+    /// honouring bracketed-paste mode if the running program enabled it.
+    /// Public so a host can wire it to a context-menu / Edit menu item
+    /// without going through the Cmd+V keybinding.
+    pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
@@ -1070,7 +1169,9 @@ impl TerminalView {
         }
     }
 
-    fn on_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Copy the current selection (or the full visible viewport when nothing
+    /// is selected) to the system clipboard.
+    pub fn copy_selection_to_clipboard(&mut self, cx: &mut Context<Self>) {
         let selection = self
             .selection
             .map(|s| s.range())
@@ -1083,6 +1184,35 @@ impl TerminalView {
         cx.write_to_clipboard(item.clone());
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         cx.write_to_primary(item);
+    }
+
+    /// True when there is a non-empty text selection in the viewport.
+    /// Lets a host disable a "Copy" menu item when nothing is selected.
+    pub fn has_selection(&self) -> bool {
+        self.selection
+            .map(|s| !s.range().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Toggle the "Copy on Select" behaviour at runtime — when on, every
+    /// drag-to-select gesture writes the selected text to the system
+    /// clipboard on mouse-up.
+    pub fn set_copy_on_select(&mut self, enabled: bool) {
+        self.copy_on_select = enabled;
+    }
+
+    /// Update the terminal font size at runtime. Cell metrics will be
+    /// re-derived on the next render frame; the host should follow this
+    /// with a `resize_terminal` call so the PTY learns about the new
+    /// rows/cols (cell size determines how many cells fit in a fixed pane).
+    pub fn set_font_size(&mut self, size: Option<f32>, cx: &mut Context<Self>) {
+        self.session.set_font_size(size);
+        // Layout cache keyed on (font_size_px, line_height_px) — drop it so
+        // shape_line picks the new size on the next prepaint.
+        self.line_layout_key = None;
+        self.line_layouts.clear();
+        self.peek_layout = None;
+        cx.notify();
     }
 
     fn on_select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
@@ -1188,6 +1318,13 @@ impl TerminalView {
             if let Some(selection) = self.selection {
                 if selection.range().is_empty() {
                     self.selection = None;
+                } else if self.copy_on_select && event.button == MouseButton::Left {
+                    // User just finished dragging out a non-empty selection
+                    // and "Copy on Select" is enabled — copy now so they
+                    // don't have to also press Cmd+C. Right/middle clicks
+                    // shouldn't trigger this; only Left is the "select"
+                    // gesture in our model.
+                    self.copy_selection_to_clipboard(cx);
                 }
                 cx.notify();
             }
@@ -1472,7 +1609,9 @@ impl TerminalView {
                 let seq = sgr_mouse_sequence(button_value, col, row, true);
                 input.send(seq.as_bytes());
             }
-            SCROLL_STATS.sgr_wheel_events.fetch_add(steps as u64, Ordering::Relaxed);
+            SCROLL_STATS
+                .sgr_wheel_events
+                .fetch_add(steps as u64, Ordering::Relaxed);
             SCROLL_STATS.events.fetch_add(1, Ordering::Relaxed);
             SCROLL_STATS.maybe_emit();
             return;
@@ -1616,7 +1755,9 @@ impl TerminalView {
 
         SCROLL_STATS.events.fetch_add(1, Ordering::Relaxed);
         if whole != 0 {
-            SCROLL_STATS.line_snaps.fetch_add(whole.unsigned_abs() as u64, Ordering::Relaxed);
+            SCROLL_STATS
+                .line_snaps
+                .fetch_add(whole.unsigned_abs() as u64, Ordering::Relaxed);
         } else if offset_changed {
             SCROLL_STATS.subline_paints.fetch_add(1, Ordering::Relaxed);
         }
@@ -1659,9 +1800,7 @@ impl TerminalView {
         let row_index = row_index as usize;
 
         if let Some(Some(line)) = self.line_layouts.get(row_index) {
-            let byte_index = line
-                .closest_index_for_x(px(x))
-                .min(line.text.len());
+            let byte_index = line.closest_index_for_x(px(x)).min(line.text.len());
             let offset = *self.viewport_line_offsets.get(row_index).unwrap_or(&0);
             return Some(offset.saturating_add(byte_index));
         }
@@ -1669,8 +1808,12 @@ impl TerminalView {
         let cols = self.session.cols();
         let mut col = (x / cell_width).floor() as i32 + 1;
         let row = row_index as i32 + 1;
-        if col < 1 { col = 1; }
-        if col > cols as i32 { col = cols as i32; }
+        if col < 1 {
+            col = 1;
+        }
+        if col > cols as i32 {
+            col = cols as i32;
+        }
         let col = col as u16;
         let row_index = (row as u16).saturating_sub(1) as usize;
         let line = self.viewport_lines.get(row_index)?.as_str();
@@ -2027,11 +2170,34 @@ fn box_drawing_quads_for_char(
 pub(crate) fn is_block_char(ch: char) -> bool {
     matches!(
         ch,
-        '█' | '▀' | '▄' | '▌' | '▐'
-            | '▁' | '▂' | '▃' | '▅' | '▆' | '▇'
-            | '▏' | '▎' | '▍' | '▋' | '▊' | '▉'
-            | '▔' | '▕'
-            | '▖' | '▗' | '▘' | '▝' | '▙' | '▟' | '▛' | '▜' | '▚' | '▞'
+        '█' | '▀'
+            | '▄'
+            | '▌'
+            | '▐'
+            | '▁'
+            | '▂'
+            | '▃'
+            | '▅'
+            | '▆'
+            | '▇'
+            | '▏'
+            | '▎'
+            | '▍'
+            | '▋'
+            | '▊'
+            | '▉'
+            | '▔'
+            | '▕'
+            | '▖'
+            | '▗'
+            | '▘'
+            | '▝'
+            | '▙'
+            | '▟'
+            | '▛'
+            | '▜'
+            | '▚'
+            | '▞'
     )
 }
 
@@ -2056,10 +2222,7 @@ fn block_char_quads_for_char(
     let rect = |fx: f32, fy: f32, fw: f32, fh: f32| -> PaintQuad {
         let ox = x0 + w * fx;
         let oy = y0 + h * fy;
-        fill(
-            Bounds::new(point(ox, oy), size(w * fw, h * fh)),
-            color,
-        )
+        fill(Bounds::new(point(ox, oy), size(w * fw, h * fh)), color)
     };
 
     let quads: Vec<PaintQuad> = match ch {
@@ -2067,10 +2230,10 @@ fn block_char_quads_for_char(
         '█' => vec![rect(0., 0., 1., 1.)],
 
         // Half blocks
-        '▀' => vec![rect(0., 0., 1., 0.5)],            // upper half
-        '▄' => vec![rect(0., 0.5, 1., 0.5)],           // lower half
-        '▌' => vec![rect(0., 0., 0.5, 1.)],            // left half
-        '▐' => vec![rect(0.5, 0., 0.5, 1.)],           // right half
+        '▀' => vec![rect(0., 0., 1., 0.5)],  // upper half
+        '▄' => vec![rect(0., 0.5, 1., 0.5)], // lower half
+        '▌' => vec![rect(0., 0., 0.5, 1.)],  // left half
+        '▐' => vec![rect(0.5, 0., 0.5, 1.)], // right half
 
         // Lower eighths (▁ = 1/8, ▂ = 2/8, ..., ▇ = 7/8, ▄ already above = 4/8)
         '▁' => vec![rect(0., 7. / 8., 1., 1. / 8.)],
@@ -2089,17 +2252,17 @@ fn block_char_quads_for_char(
         '▉' => vec![rect(0., 0., 7. / 8., 1.)],
 
         // Upper block variants
-        '▔' => vec![rect(0., 0., 1., 1. / 8.)],         // upper one eighth block
-        '▕' => vec![rect(7. / 8., 0., 1. / 8., 1.)],    // right one eighth block
+        '▔' => vec![rect(0., 0., 1., 1. / 8.)], // upper one eighth block
+        '▕' => vec![rect(7. / 8., 0., 1. / 8., 1.)], // right one eighth block
 
         // Shaded blocks (░▒▓) — skipped: translucent quads would blend
         // with the underlying glyph. Font renderer handles them.
 
         // Quadrants
-        '▖' => vec![rect(0., 0.5, 0.5, 0.5)],          // lower-left
-        '▗' => vec![rect(0.5, 0.5, 0.5, 0.5)],         // lower-right
-        '▘' => vec![rect(0., 0., 0.5, 0.5)],           // upper-left
-        '▝' => vec![rect(0.5, 0., 0.5, 0.5)],          // upper-right
+        '▖' => vec![rect(0., 0.5, 0.5, 0.5)],  // lower-left
+        '▗' => vec![rect(0.5, 0.5, 0.5, 0.5)], // lower-right
+        '▘' => vec![rect(0., 0., 0.5, 0.5)],   // upper-left
+        '▝' => vec![rect(0.5, 0., 0.5, 0.5)],  // upper-right
         '▙' => vec![rect(0., 0., 0.5, 1.), rect(0.5, 0.5, 0.5, 0.5)],
         '▟' => vec![rect(0.5, 0., 0.5, 1.), rect(0., 0.5, 0.5, 0.5)],
         '▛' => vec![rect(0., 0., 1., 0.5), rect(0., 0.5, 0.5, 0.5)],
@@ -2260,8 +2423,8 @@ fn build_bg_quads_for_row(
             continue;
         }
         let x = origin_x + px(cell_width * (run.start_col.saturating_sub(1)) as f32);
-        let w = px(cell_width
-            * (run.end_col.saturating_sub(run.start_col).saturating_add(1)) as f32);
+        let w =
+            px(cell_width * (run.end_col.saturating_sub(run.start_col).saturating_add(1)) as f32);
         let color = rgba(
             (u32::from(run.bg.r) << 24)
                 | (u32::from(run.bg.g) << 16)
@@ -2498,11 +2661,7 @@ impl Element for TerminalTextElement {
             // and currently visible. We do this here (not in render) so that
             // the same prepaint pass shapes the peek line below.
             if view.pixel_offset > 0.0 && view.peek_dirty {
-                view.peek_text = view
-                    .session
-                    .dump_screen_row(0)
-                    .ok()
-                    .flatten();
+                view.peek_text = view.session.dump_screen_row(0).ok().flatten();
                 view.peek_runs = view
                     .session
                     .dump_screen_row_style_runs(0)
@@ -2528,9 +2687,7 @@ impl Element for TerminalTextElement {
 
             // Font/size change → invalidate every cached layout (viewport + peek).
             let key_changed = view.line_layout_key != Some((font_size, line_height));
-            if key_changed
-                || view.line_layouts.len() != view.viewport_lines.len()
-            {
+            if key_changed || view.line_layouts.len() != view.viewport_lines.len() {
                 view.line_layout_key = Some((font_size, line_height));
                 view.line_layouts = vec![None; view.viewport_lines.len()];
                 view.peek_layout = None;
@@ -2550,7 +2707,10 @@ impl Element for TerminalTextElement {
                 let text = SharedString::from(line.clone());
                 let runs = build_runs_for_line(
                     text.as_str(),
-                    view.viewport_style_runs.get(idx).map(|v| v.as_slice()).unwrap_or(&[]),
+                    view.viewport_style_runs
+                        .get(idx)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]),
                     &run_font,
                     run_color,
                 );
@@ -2578,16 +2738,11 @@ impl Element for TerminalTextElement {
                     .unwrap_or(true);
                 if needs_shape {
                     let text = SharedString::from(peek_text);
-                    let runs = build_runs_for_line(
-                        text.as_str(),
-                        &view.peek_runs,
-                        &run_font,
-                        run_color,
-                    );
+                    let runs =
+                        build_runs_for_line(text.as_str(), &view.peek_runs, &run_font, run_color);
                     let force_width = cell_width.and_then(|cell_width| {
                         use unicode_width::UnicodeWidthChar as _;
-                        let has_wide =
-                            text.as_str().chars().any(|ch| ch.width().unwrap_or(0) > 1);
+                        let has_wide = text.as_str().chars().any(|ch| ch.width().unwrap_or(0) > 1);
                         (!has_wide).then_some(cell_width)
                     });
                     view.peek_layout = Some(window.text_system().shape_line(
@@ -2684,7 +2839,12 @@ impl Element for TerminalTextElement {
                     return None;
                 }
                 let (col, row) = cursor_position?;
-                let (cell_width, _) = cell_metrics_with_overrides(window, &font, font_size_override, line_height_ratio_override)?;
+                let (cell_width, _) = cell_metrics_with_overrides(
+                    window,
+                    &font,
+                    font_size_override,
+                    line_height_ratio_override,
+                )?;
 
                 let origin_x = bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
                 let origin_y = bounds.top() + line_height * (row.saturating_sub(1)) as f32;
@@ -2843,11 +3003,32 @@ impl Element for TerminalTextElement {
             })
             .unwrap_or_default();
 
+        // Ensure the cached scroll position is fresh before the cursor
+        // block reads it — a stale value would either miss-hide the cursor
+        // when the user scrolls into history (no notify yet) or wrongly
+        // hide it after the auto-snap-on-input.
+        self.view.update(cx, |view, _cx| {
+            if view.scroll_pos_dirty {
+                view.scroll_pos = view.session.scroll_position();
+                view.scroll_pos_dirty = false;
+            }
+        });
+
         let cursor = {
             let view = self.view.read(cx);
+            // Hide cursor while the viewport is scrolled into history —
+            // `cursor_position()` returns active-screen coords, which would
+            // map to a *visually wrong* row in viewport space. Repainting it
+            // there made the cursor blink at random scrollback content.
+            // Live mode = viewport bottom touches the active screen, i.e.
+            // `viewport_top + viewport_rows >= total_rows`.
+            let at_live_bottom = view.scroll_pos.map_or(true, |p| {
+                u64::from(p.viewport_top) + u64::from(p.viewport_rows) >= u64::from(p.total_rows)
+            });
             if view.focus_handle.is_focused(window)
                 && view.session.cursor_visible()
                 && view.cursor_blink_on
+                && at_live_bottom
             {
                 view.session.cursor_position()
             } else {
@@ -2904,7 +3085,9 @@ impl Element for TerminalTextElement {
 
         let prepaint_us = _prepaint_start.elapsed().as_micros() as u64;
         SCROLL_STATS.prepaint_calls.fetch_add(1, Ordering::Relaxed);
-        SCROLL_STATS.prepaint_us.fetch_add(prepaint_us, Ordering::Relaxed);
+        SCROLL_STATS
+            .prepaint_us
+            .fetch_add(prepaint_us, Ordering::Relaxed);
 
         TerminalPrepaintState {
             line_height,
@@ -2945,8 +3128,25 @@ impl Element for TerminalTextElement {
             cx,
         );
 
-        window.paint_layer(bounds, |window| {
+        // Pixel-smooth scroll bleed: extend the paint layer one row above
+        // and one row below the visible terminal so the partial row that
+        // peeks/leaves during a sub-line scroll has somewhere to slide
+        // off instead of being clipped mid-glyph right at the visible
+        // edge. The clip is intersected with ancestor masks (TabPanel /
+        // DockArea), so the actual visible bleed extends only as far as
+        // the parent layout allows — typically into the panel's own
+        // padding and the dock separator below it.
+        let bleed = prepaint.line_height;
+        let paint_clip = Bounds::new(
+            point(bounds.left(), bounds.top() - bleed),
+            size(bounds.size.width, bounds.size.height + bleed * 2.0),
+        );
+        window.paint_layer(paint_clip, |window| {
             let default_bg = { self.view.read(cx).session.default_background() };
+            // Background fill stays at the *visible* bounds — we don't want
+            // the terminal's bg to leak into the bleed zone (that's the
+            // panel's own bg color). Glyphs and quads paint inside the
+            // expanded clip and slide off cleanly.
             window.paint_quad(fill(bounds, hsla_from_rgb(default_bg)));
 
             // Sub-line scroll: every viewport-content y is shifted by

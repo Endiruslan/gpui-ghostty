@@ -88,6 +88,8 @@ unsafe extern "C" {
 
     pub fn ghostty_vt_terminal_take_viewport_scroll_delta(terminal: *mut core::ffi::c_void) -> i32;
 
+    pub fn ghostty_vt_terminal_full_reset(terminal: *mut core::ffi::c_void);
+
     pub fn ghostty_vt_terminal_scroll_position(
         terminal: *mut core::ffi::c_void,
         out_viewport_top: *mut u32,

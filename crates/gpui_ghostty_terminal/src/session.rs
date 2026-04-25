@@ -78,6 +78,13 @@ impl TerminalSession {
         self.config.font_size
     }
 
+    /// Update the font-size override at runtime. The next render frame
+    /// will re-shape with the new size and the host should call
+    /// `resize_terminal` afterwards because cell metrics changed.
+    pub fn set_font_size(&mut self, size: Option<f32>) {
+        self.config.font_size = size;
+    }
+
     /// Override line height as multiplier of font size. `None` = inherit.
     pub fn line_height_ratio(&self) -> Option<f32> {
         self.config.line_height_ratio
@@ -405,6 +412,11 @@ impl TerminalSession {
     /// drive a scrollbar UI. See [`ghostty_vt::ScrollPosition`].
     pub fn scroll_position(&self) -> Option<ghostty_vt::ScrollPosition> {
         self.terminal.scroll_position()
+    }
+
+    /// Hard reset of terminal state. See [`ghostty_vt::Terminal::full_reset`].
+    pub fn full_reset(&mut self) {
+        self.terminal.full_reset();
     }
 
     pub fn cursor_position(&self) -> Option<(u16, u16)> {

@@ -770,6 +770,17 @@ export fn ghostty_vt_terminal_scroll_position(
     return true;
 }
 
+/// Hard-reset the terminal — equivalent to the `tput reset` shell command,
+/// or what Terminal.app's "Reset" menu item does. Clears scrollback, resets
+/// modes, scrolling region, tab stops, character set, and forces a full
+/// redraw. The shell process is unaffected — it'll print its prompt on the
+/// next opportunity.
+export fn ghostty_vt_terminal_full_reset(terminal_ptr: ?*anyopaque) callconv(.C) void {
+    if (terminal_ptr == null) return;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal.fullReset();
+}
+
 export fn ghostty_vt_terminal_take_viewport_scroll_delta(
     terminal_ptr: ?*anyopaque,
 ) callconv(.C) i32 {
