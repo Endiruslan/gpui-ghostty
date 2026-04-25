@@ -3327,10 +3327,6 @@ impl Render for TerminalView {
     }
 }
 
-pub(crate) fn cell_metrics(window: &mut gpui::Window, font: &gpui::Font) -> Option<(f32, f32)> {
-    cell_metrics_with_overrides(window, font, None, None)
-}
-
 /// Compute cell (width, height) in px. Overrides let callers force a
 /// specific font size / line-height ratio instead of inheriting from
 /// `window.text_style()`.
