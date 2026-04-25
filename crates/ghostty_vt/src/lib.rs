@@ -64,6 +64,24 @@ pub struct ScrollPosition {
     pub viewport_rows: u32,
 }
 
+/// OSC / control events surfaced from the terminal stream. Drained by the
+/// view on every tick via [`Terminal::drain_events`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalEvent {
+    /// Desktop notification request (OSC 9 / OSC 777). Either field may be
+    /// empty depending on which form the program used.
+    Notification { title: String, body: String },
+    /// Shell integration: a new prompt has started. Marks the boundary
+    /// between previous output and the next user command.
+    CommandStart,
+    /// Shell integration: a command has finished. `exit_code` may be 0 if
+    /// the shell did not include an explicit exit code.
+    CommandEnd { exit_code: u8 },
+    /// BEL (\x07) — usually a beep, but some agents use it as a generic
+    /// "done" signal.
+    Bell,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyModifiers {
     pub shift: bool,
@@ -398,6 +416,19 @@ impl Terminal {
         unsafe { ghostty_vt_sys::ghostty_vt_terminal_full_reset(self.ptr.as_ptr()) }
     }
 
+    /// Drain queued OSC / control events. Returns the events in arrival
+    /// order; the internal queue is cleared after the call.
+    pub fn drain_events(&mut self) -> Vec<TerminalEvent> {
+        let bytes = unsafe { ghostty_vt_sys::ghostty_vt_terminal_drain_events(self.ptr.as_ptr()) };
+        if bytes.ptr.is_null() || bytes.len == 0 {
+            return Vec::new();
+        }
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let out = parse_event_stream(slice);
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        out
+    }
+
     pub fn take_viewport_scroll_delta(&mut self) -> i32 {
         unsafe { ghostty_vt_sys::ghostty_vt_terminal_take_viewport_scroll_delta(self.ptr.as_ptr()) }
     }
@@ -470,4 +501,49 @@ impl Drop for Terminal {
 
 pub fn terminal_new(cols: u16, rows: u16) -> Result<Terminal, Error> {
     Terminal::new(cols, rows)
+}
+
+fn parse_event_stream(mut buf: &[u8]) -> Vec<TerminalEvent> {
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        let tag = buf[0];
+        buf = &buf[1..];
+        match tag {
+            0x01 => {
+                if buf.len() < 2 {
+                    break;
+                }
+                let title_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                buf = &buf[2..];
+                if buf.len() < title_len + 2 {
+                    break;
+                }
+                let title = String::from_utf8_lossy(&buf[..title_len]).into_owned();
+                buf = &buf[title_len..];
+                let body_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+                buf = &buf[2..];
+                if buf.len() < body_len {
+                    break;
+                }
+                let body = String::from_utf8_lossy(&buf[..body_len]).into_owned();
+                buf = &buf[body_len..];
+                out.push(TerminalEvent::Notification { title, body });
+            }
+            0x02 => out.push(TerminalEvent::CommandStart),
+            0x03 => {
+                if buf.is_empty() {
+                    break;
+                }
+                let exit_code = buf[0];
+                buf = &buf[1..];
+                out.push(TerminalEvent::CommandEnd { exit_code });
+            }
+            0x04 => out.push(TerminalEvent::Bell),
+            _ => {
+                // Unknown tag — bail to avoid mis-aligning.
+                break;
+            }
+        }
+    }
+    out
 }

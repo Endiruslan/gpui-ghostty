@@ -419,6 +419,12 @@ impl TerminalSession {
         self.terminal.full_reset();
     }
 
+    /// Drain queued OSC / control events (notifications, command boundaries,
+    /// bell). The internal queue is cleared.
+    pub fn drain_events(&mut self) -> Vec<ghostty_vt::TerminalEvent> {
+        self.terminal.drain_events()
+    }
+
     pub fn cursor_position(&self) -> Option<(u16, u16)> {
         self.terminal.cursor_position()
     }

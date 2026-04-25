@@ -1035,6 +1035,9 @@ impl TerminalView {
         if let Some(text) = self.session.take_clipboard_write() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        for event in self.session.drain_events() {
+            cx.emit(event);
+        }
     }
 
     pub fn feed_output_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -1866,6 +1869,8 @@ impl TerminalView {
         window_position_to_local(self.last_bounds, position)
     }
 }
+
+impl gpui::EventEmitter<ghostty_vt::TerminalEvent> for TerminalView {}
 
 impl EntityInputHandler for TerminalView {
     fn text_for_range(

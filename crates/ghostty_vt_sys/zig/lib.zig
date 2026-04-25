@@ -13,6 +13,15 @@ const TerminalHandle = struct {
     default_bg: terminal.color.RGB,
     viewport_top_y_screen: u32,
     has_viewport_top_y_screen: bool,
+    /// TLV event queue produced by the OSC handler. Drained by Rust via
+    /// `ghostty_vt_terminal_drain_events`. Each record is:
+    ///   tag (u8)  payload...
+    /// Tags:
+    ///   0x01 Notification: title_len(u16 LE) title... body_len(u16 LE) body...
+    ///   0x02 CommandStart: no payload
+    ///   0x03 CommandEnd:   exit_code(u8)
+    ///   0x04 Bell:         no payload
+    events: std.ArrayList(u8),
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
         const handle = try alloc.create(TerminalHandle);
@@ -30,14 +39,15 @@ const TerminalHandle = struct {
         handle.* = .{
             .alloc = alloc,
             .terminal = t,
-            .handler = .{ .terminal = undefined },
+            .handler = .{ .handle = undefined },
             .stream = undefined,
             .default_fg = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
             .default_bg = .{ .r = 0x00, .g = 0x00, .b = 0x00 },
             .viewport_top_y_screen = 0,
             .has_viewport_top_y_screen = true,
+            .events = std.ArrayList(u8).init(alloc),
         };
-        handle.handler.terminal = &handle.terminal;
+        handle.handler.handle = handle;
         handle.stream = terminal.Stream(*Handler).init(&handle.handler);
         handle.stream.parser.osc_parser.alloc = alloc;
         return handle;
@@ -46,41 +56,42 @@ const TerminalHandle = struct {
     fn deinit(self: *TerminalHandle) void {
         self.stream.deinit();
         self.terminal.deinit(self.alloc);
+        self.events.deinit();
         self.alloc.destroy(self);
     }
 };
 
 const Handler = struct {
-    terminal: *terminal.Terminal,
+    handle: *TerminalHandle,
 
     pub fn print(self: *Handler, c: u21) !void {
-        try self.terminal.print(c);
+        try self.handle.terminal.print(c);
     }
 
     pub fn backspace(self: *Handler) !void {
-        self.terminal.backspace();
+        self.handle.terminal.backspace();
     }
 
     pub fn horizontalTab(self: *Handler, count: u16) !void {
         for (0..@as(usize, count)) |_| {
-            try self.terminal.horizontalTab();
+            try self.handle.terminal.horizontalTab();
         }
     }
 
     pub fn linefeed(self: *Handler) !void {
-        try self.terminal.linefeed();
+        try self.handle.terminal.linefeed();
     }
 
     pub fn carriageReturn(self: *Handler) !void {
-        self.terminal.carriageReturn();
+        self.handle.terminal.carriageReturn();
     }
 
     pub fn setTopAndBottomMargin(self: *Handler, top: u16, bot: u16) !void {
-        self.terminal.setTopAndBottomMargin(top, bot);
+        self.handle.terminal.setTopAndBottomMargin(top, bot);
     }
 
     pub fn setLeftAndRightMarginAmbiguous(self: *Handler) !void {
-        if (self.terminal.modes.get(.enable_left_and_right_margin)) {
+        if (self.handle.terminal.modes.get(.enable_left_and_right_margin)) {
             try self.setLeftAndRightMargin(0, 0);
         } else {
             try self.saveCursor();
@@ -88,27 +99,27 @@ const Handler = struct {
     }
 
     pub fn setLeftAndRightMargin(self: *Handler, left: u16, right: u16) !void {
-        self.terminal.setLeftAndRightMargin(left, right);
+        self.handle.terminal.setLeftAndRightMargin(left, right);
     }
 
     pub fn reverseIndex(self: *Handler) !void {
-        self.terminal.reverseIndex();
+        self.handle.terminal.reverseIndex();
     }
 
     pub fn saveCursor(self: *Handler) !void {
-        self.terminal.saveCursor();
+        self.handle.terminal.saveCursor();
     }
 
     pub fn restoreCursor(self: *Handler) !void {
-        try self.terminal.restoreCursor();
+        try self.handle.terminal.restoreCursor();
     }
 
     pub fn insertBlanks(self: *Handler, count: u16) !void {
-        self.terminal.insertBlanks(count);
+        self.handle.terminal.insertBlanks(count);
     }
 
     pub fn setAttribute(self: *Handler, attr: terminal.Attribute) !void {
-        try self.terminal.setAttribute(attr);
+        try self.handle.terminal.setAttribute(attr);
     }
 
     pub fn invokeCharset(
@@ -117,11 +128,11 @@ const Handler = struct {
         slot: terminal.CharsetSlot,
         single: bool,
     ) !void {
-        self.terminal.invokeCharset(active, slot, single);
+        self.handle.terminal.invokeCharset(active, slot, single);
     }
 
     pub fn configureCharset(self: *Handler, slot: terminal.CharsetSlot, set: terminal.Charset) !void {
-        self.terminal.configureCharset(slot, set);
+        self.handle.terminal.configureCharset(slot, set);
     }
 
     pub fn handleColorOperation(
@@ -140,29 +151,29 @@ const Handler = struct {
             switch (req.*) {
                 .set => |set| switch (set.target) {
                     .palette => |i| {
-                        self.terminal.color_palette.colors[i] = set.color;
-                        self.terminal.color_palette.mask.set(i);
-                        self.terminal.flags.dirty.palette = true;
+                        self.handle.terminal.color_palette.colors[i] = set.color;
+                        self.handle.terminal.color_palette.mask.set(i);
+                        self.handle.terminal.flags.dirty.palette = true;
                     },
                     else => {},
                 },
                 .reset => |target| switch (target) {
                     .palette => |i| {
-                        self.terminal.color_palette.colors[i] = self.terminal.default_palette[i];
-                        self.terminal.color_palette.mask.unset(i);
-                        self.terminal.flags.dirty.palette = true;
+                        self.handle.terminal.color_palette.colors[i] = self.handle.terminal.default_palette[i];
+                        self.handle.terminal.color_palette.mask.unset(i);
+                        self.handle.terminal.flags.dirty.palette = true;
                     },
                     else => {},
                 },
                 .reset_palette => {
-                    const mask = &self.terminal.color_palette.mask;
+                    const mask = &self.handle.terminal.color_palette.mask;
                     var mask_iterator = mask.iterator(.{});
                     while (mask_iterator.next()) |idx| {
                         const i: usize = idx;
-                        self.terminal.color_palette.colors[i] = self.terminal.default_palette[i];
+                        self.handle.terminal.color_palette.colors[i] = self.handle.terminal.default_palette[i];
                     }
-                    self.terminal.color_palette.mask = .initEmpty();
-                    self.terminal.flags.dirty.palette = true;
+                    self.handle.terminal.color_palette.mask = .initEmpty();
+                    self.handle.terminal.flags.dirty.palette = true;
                 },
                 else => {},
             }
@@ -170,70 +181,132 @@ const Handler = struct {
     }
 
     pub fn setCursorLeft(self: *Handler, amount: u16) !void {
-        self.terminal.cursorLeft(amount);
+        self.handle.terminal.cursorLeft(amount);
     }
 
     pub fn setCursorRight(self: *Handler, amount: u16) !void {
-        self.terminal.cursorRight(amount);
+        self.handle.terminal.cursorRight(amount);
     }
 
     pub fn setCursorDown(self: *Handler, amount: u16, carriage: bool) !void {
-        self.terminal.cursorDown(amount);
-        if (carriage) self.terminal.carriageReturn();
+        self.handle.terminal.cursorDown(amount);
+        if (carriage) self.handle.terminal.carriageReturn();
     }
 
     pub fn setCursorUp(self: *Handler, amount: u16, carriage: bool) !void {
-        self.terminal.cursorUp(amount);
-        if (carriage) self.terminal.carriageReturn();
+        self.handle.terminal.cursorUp(amount);
+        if (carriage) self.handle.terminal.carriageReturn();
     }
 
     pub fn setCursorCol(self: *Handler, col: u16) !void {
-        self.terminal.setCursorPos(self.terminal.screen.cursor.y + 1, col);
+        self.handle.terminal.setCursorPos(self.handle.terminal.screen.cursor.y + 1, col);
     }
 
     pub fn setCursorRow(self: *Handler, row: u16) !void {
-        self.terminal.setCursorPos(row, self.terminal.screen.cursor.x + 1);
+        self.handle.terminal.setCursorPos(row, self.handle.terminal.screen.cursor.x + 1);
     }
 
     pub fn setCursorPos(self: *Handler, row: u16, col: u16) !void {
-        self.terminal.setCursorPos(row, col);
+        self.handle.terminal.setCursorPos(row, col);
     }
 
     pub fn eraseDisplay(self: *Handler, mode: terminal.EraseDisplay, protected: bool) !void {
-        self.terminal.eraseDisplay(mode, protected);
+        self.handle.terminal.eraseDisplay(mode, protected);
     }
 
     pub fn eraseLine(self: *Handler, mode: terminal.EraseLine, protected: bool) !void {
-        self.terminal.eraseLine(mode, protected);
+        self.handle.terminal.eraseLine(mode, protected);
     }
 
     pub fn startHyperlink(self: *Handler, uri: []const u8, id: ?[]const u8) !void {
-        try self.terminal.screen.startHyperlink(uri, id);
+        try self.handle.terminal.screen.startHyperlink(uri, id);
     }
 
     pub fn endHyperlink(self: *Handler) !void {
-        self.terminal.screen.endHyperlink();
+        self.handle.terminal.screen.endHyperlink();
     }
 
     pub fn setMode(self: *Handler, mode: terminal.Mode, enabled: bool) !void {
-        const prev = self.terminal.modes.get(mode);
-        self.terminal.modes.set(mode, enabled);
+        const prev = self.handle.terminal.modes.get(mode);
+        self.handle.terminal.modes.set(mode, enabled);
 
         if (prev != enabled) {
             switch (mode) {
-                .reverse_colors => self.terminal.flags.dirty.reverse_colors = true,
+                .reverse_colors => self.handle.terminal.flags.dirty.reverse_colors = true,
                 else => {},
             }
         }
 
         switch (mode) {
-            .alt_screen_legacy => self.terminal.switchScreenMode(.@"47", enabled),
-            .alt_screen => self.terminal.switchScreenMode(.@"1047", enabled),
-            .alt_screen_save_cursor_clear_enter => self.terminal.switchScreenMode(.@"1049", enabled),
+            .alt_screen_legacy => self.handle.terminal.switchScreenMode(.@"47", enabled),
+            .alt_screen => self.handle.terminal.switchScreenMode(.@"1047", enabled),
+            .alt_screen_save_cursor_clear_enter => self.handle.terminal.switchScreenMode(.@"1049", enabled),
             else => {},
         }
     }
+
+    // ---- OSC / control event handlers (queued for Rust drain) ----
+
+    pub fn bell(self: *Handler) !void {
+        try self.handle.events.append(0x04);
+    }
+
+    pub fn showDesktopNotification(self: *Handler, title: []const u8, body: []const u8) !void {
+        // Cap to avoid pathological payloads.
+        const max_len: usize = 4096;
+        const title_clipped = if (title.len > max_len) title[0..max_len] else title;
+        const body_clipped = if (body.len > max_len) body[0..max_len] else body;
+
+        try self.handle.events.append(0x01);
+        try appendU16Le(&self.handle.events, @intCast(title_clipped.len));
+        try self.handle.events.appendSlice(title_clipped);
+        try appendU16Le(&self.handle.events, @intCast(body_clipped.len));
+        try self.handle.events.appendSlice(body_clipped);
+    }
+
+    pub fn promptStart(self: *Handler, aid: ?[]const u8, redraw: bool) !void {
+        _ = aid;
+        _ = redraw;
+        try self.handle.events.append(0x02);
+    }
+
+    pub fn promptContinuation(self: *Handler, aid: ?[]const u8) !void {
+        _ = aid;
+        try self.handle.events.append(0x02);
+    }
+
+    pub fn promptEnd(self: *Handler) !void {
+        _ = self;
+        // No-op; we only care about start/end-of-command boundaries.
+    }
+
+    pub fn endOfInput(self: *Handler) !void {
+        // No-op; command-start tag (0x02) suffices.
+        _ = self;
+    }
+
+    pub fn endOfCommand(self: *Handler, exit_code: ?u8) !void {
+        try self.handle.events.append(0x03);
+        try self.handle.events.append(exit_code orelse 0);
+    }
 };
+
+fn appendU16Le(list: *std.ArrayList(u8), v: u16) !void {
+    try list.append(@intCast(v & 0xFF));
+    try list.append(@intCast((v >> 8) & 0xFF));
+}
+
+/// Drain the queued OSC/control events. The returned bytes are owned by the
+/// caller and must be freed with `ghostty_vt_bytes_free`. The internal queue
+/// is cleared.
+export fn ghostty_vt_terminal_drain_events(terminal_ptr: ?*anyopaque) callconv(.C) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    if (handle.events.items.len == 0) return .{ .ptr = null, .len = 0 };
+
+    const slice = handle.events.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = slice.ptr, .len = slice.len };
+}
 
 export fn ghostty_vt_terminal_new(cols: u16, rows: u16) callconv(.C) ?*anyopaque {
     const alloc = std.heap.c_allocator;

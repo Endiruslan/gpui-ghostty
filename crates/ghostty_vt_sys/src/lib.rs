@@ -90,6 +90,9 @@ unsafe extern "C" {
 
     pub fn ghostty_vt_terminal_full_reset(terminal: *mut core::ffi::c_void);
 
+    pub fn ghostty_vt_terminal_drain_events(terminal: *mut core::ffi::c_void)
+    -> ghostty_vt_bytes_t;
+
     pub fn ghostty_vt_terminal_scroll_position(
         terminal: *mut core::ffi::c_void,
         out_viewport_top: *mut u32,
