@@ -1659,6 +1659,20 @@ impl TerminalView {
         let keystroke = raw_keystroke.with_simulated_ime();
 
         if keystroke.modifiers.platform || keystroke.modifiers.function {
+            // Cmd+Backspace = kill line backward. Shells have no escape
+            // sequence for this, so send Ctrl+U like Zed and iTerm do
+            // (pattern from zed assets/keymaps/default-macos.json,
+            // terminal::SendText "\\u0015").
+            if keystroke.modifiers.platform
+                && !keystroke.modifiers.shift
+                && !keystroke.modifiers.alt
+                && !keystroke.modifiers.control
+                && keystroke.key.as_str() == "backspace"
+                && let Some(input) = self.input.as_ref()
+            {
+                input.send(&[0x15]);
+                return;
+            }
             return;
         }
 
