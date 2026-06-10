@@ -273,6 +273,10 @@ fn is_url_byte(b: u8) -> bool {
 }
 
 fn url_at_byte_index(text: &str, index: usize) -> Option<String> {
+    url_range_at_byte_index(text, index).map(|r| text[r].to_string())
+}
+
+fn url_range_at_byte_index(text: &str, index: usize) -> Option<std::ops::Range<usize>> {
     let bytes = text.as_bytes();
     if bytes.is_empty() {
         return None;
@@ -308,20 +312,167 @@ fn url_at_byte_index(text: &str, index: usize) -> Option<String> {
     }
 
     let candidate = std::str::from_utf8(&bytes[start..end]).ok()?;
-    if candidate.starts_with("https://") || candidate.starts_with("http://") {
-        Some(candidate.to_string())
-    } else {
-        None
+    // The run can include a prefix glued to the URL by bytes that are valid
+    // *inside* a URL but can't start one — `Fetch(https://…)`, `(https://…)`,
+    // `url='https://…'`. Cut the run at the scheme instead of requiring the
+    // whole run to start with it.
+    let scheme = candidate
+        .find("https://")
+        .or_else(|| candidate.find("http://"))?;
+    let start = start + scheme;
+    if idx < start {
+        // Pointer sits on the prefix (e.g. the `Fetch(` part), not the URL.
+        return None;
     }
+    Some(start..end)
 }
 
-fn url_at_column_in_line(line: &str, col: u16) -> Option<String> {
+/// Extract an `http(s)://` URL at (0-based `row`, 1-based `col`), joining
+/// soft-wrapped rows. `dump_viewport` emits `\n` after every row with no
+/// wrap-continuation flag, so the heuristic is: a row that fills the full
+/// terminal width (`cols` display columns) continues on the next row.
+/// Joining unrelated full-width rows is harmless — `url_at_byte_index`
+/// scans only the contiguous URL-byte run around the click point.
+pub(crate) fn url_at_cell_in_wrapped_lines(
+    lines: &[String],
+    cols: usize,
+    row: usize,
+    col: u16,
+) -> Option<String> {
+    url_spans_at_cell_in_wrapped_lines(lines, cols, row, col).map(|(url, _)| url)
+}
+
+/// Per-row segments of a hovered/clicked URL: (0-based row, byte range
+/// within that row's string). Used to paint the Cmd+hover underline.
+pub(crate) type LinkSpans = Vec<(usize, std::ops::Range<usize>)>;
+
+pub(crate) fn url_spans_at_cell_in_wrapped_lines(
+    lines: &[String],
+    cols: usize,
+    row: usize,
+    col: u16,
+) -> Option<(String, LinkSpans)> {
+    use unicode_width::UnicodeWidthStr as _;
+
+    let line = lines.get(row)?;
     if line.is_empty() {
         return None;
     }
-
     let local = byte_index_for_column_in_line(line, col).min(line.len().saturating_sub(1));
-    url_at_byte_index(line, local)
+
+    let is_full = |l: &String| cols > 0 && l.as_str().width() >= cols;
+
+    let mut start_row = row;
+    while start_row > 0 && lines.get(start_row - 1).is_some_and(is_full) {
+        start_row -= 1;
+    }
+    let mut end_row = row;
+    while end_row + 1 < lines.len() && lines.get(end_row).is_some_and(is_full) {
+        end_row += 1;
+    }
+
+    let mut joined = String::new();
+    let mut row_starts = Vec::with_capacity(end_row - start_row + 1);
+    let mut click_idx = local;
+    for (i, l) in lines[start_row..=end_row].iter().enumerate() {
+        if start_row + i == row {
+            click_idx = joined.len() + local;
+        }
+        row_starts.push(joined.len());
+        joined.push_str(l);
+    }
+
+    let range = url_range_at_byte_index(&joined, click_idx)?;
+    let url = joined[range.clone()].to_string();
+
+    let mut spans = LinkSpans::new();
+    for (i, l) in lines[start_row..=end_row].iter().enumerate() {
+        let row_start = row_starts[i];
+        let row_end = row_start + l.len();
+        let seg_start = range.start.clamp(row_start, row_end);
+        let seg_end = range.end.clamp(row_start, row_end);
+        if seg_start < seg_end {
+            spans.push((start_row + i, seg_start - row_start..seg_end - row_start));
+        }
+    }
+    Some((url, spans))
+}
+
+/// Extent of an OSC 8 hyperlink around cell (1-based `col`, `row`),
+/// expanded over neighbouring cells that carry the same URL — including
+/// wrapped continuations on adjacent rows (link runs to the row edge and
+/// resumes at the opposite edge of the next/previous row). Returns the
+/// URL plus per-row byte spans for underlining.
+///
+/// `hyperlink_at` is injected so tests can drive this without a live
+/// ghostty session (the real caller passes `session.hyperlink_at`).
+pub(crate) fn osc8_link_spans(
+    hyperlink_at: impl Fn(u16, u16) -> Option<String>,
+    lines: &[String],
+    cols: u16,
+    rows: u16,
+    col: u16,
+    row: u16,
+) -> Option<(String, LinkSpans)> {
+    let url = hyperlink_at(col, row)?;
+    let same = |c: u16, r: u16| hyperlink_at(c, r).as_deref() == Some(url.as_str());
+
+    // Expand within the hovered row.
+    let mut col_start = col;
+    while col_start > 1 && same(col_start - 1, row) {
+        col_start -= 1;
+    }
+    let mut col_end = col;
+    while col_end < cols && same(col_end + 1, row) {
+        col_end += 1;
+    }
+
+    let mut segments = vec![(row, col_start, col_end)];
+
+    // Wrapped continuation upward: link touches col 1 and resumes at the
+    // right edge of the row above.
+    let mut r = row;
+    let mut cs = col_start;
+    while cs == 1 && r > 1 && same(cols, r - 1) {
+        r -= 1;
+        let mut s = cols;
+        while s > 1 && same(s - 1, r) {
+            s -= 1;
+        }
+        segments.insert(0, (r, s, cols));
+        cs = s;
+    }
+    // Wrapped continuation downward: link touches the right edge and
+    // resumes at col 1 of the row below.
+    let mut r = row;
+    let mut ce = col_end;
+    while ce == cols && r < rows && same(1, r + 1) {
+        r += 1;
+        let mut e = 1;
+        while e < cols && same(e + 1, r) {
+            e += 1;
+        }
+        segments.push((r, 1, e));
+        ce = e;
+    }
+
+    let mut spans = LinkSpans::new();
+    for (r, c1, c2) in segments {
+        let row_idx = r.saturating_sub(1) as usize;
+        let Some(line) = lines.get(row_idx) else {
+            continue;
+        };
+        let start = byte_index_for_column_in_line(line, c1).min(line.len());
+        let end = if c2 >= cols {
+            line.len()
+        } else {
+            byte_index_for_column_in_line(line, c2 + 1).min(line.len())
+        };
+        if start < end {
+            spans.push((row_idx, start..end));
+        }
+    }
+    (!spans.is_empty()).then_some((url, spans))
 }
 
 type TerminalSendFn = dyn Fn(&[u8]) + Send + Sync + 'static;
@@ -369,6 +520,16 @@ pub struct TerminalView {
     pending_output: Vec<u8>,
     pending_refresh: bool,
     selection: Option<ByteSelection>,
+    /// Per-row byte ranges of the URL under the mouse while Cmd is held.
+    /// Drives the hover underline + pointer cursor; cleared when Cmd is
+    /// released or the mouse leaves the link.
+    hovered_link: Option<LinkSpans>,
+    /// Last mouse position seen by `on_mouse_move`, so a bare Cmd press /
+    /// release (no motion) can recompute the hover state.
+    last_mouse_position: Option<gpui::Point<Pixels>>,
+    /// Cell the last hover lookup ran for (only while Cmd is held).
+    /// Skips re-scanning when the mouse moves within one cell.
+    last_hover_cell: Option<(u16, u16)>,
     marked_text: Option<SharedString>,
     marked_selected_range_utf16: Range<usize>,
     font: gpui::Font,
@@ -466,6 +627,9 @@ impl TerminalView {
             pending_output: Vec::new(),
             pending_refresh: false,
             selection: None,
+            hovered_link: None,
+            last_mouse_position: None,
+            last_hover_cell: None,
             marked_text: None,
             marked_selected_range_utf16: 0..0,
             font,
@@ -522,6 +686,9 @@ impl TerminalView {
             pending_output: Vec::new(),
             pending_refresh: false,
             selection: None,
+            hovered_link: None,
+            last_mouse_position: None,
+            last_hover_cell: None,
             marked_text: None,
             marked_selected_range_utf16: 0..0,
             font,
@@ -1227,6 +1394,65 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Recompute the Cmd+hover link highlight for the given mouse position.
+    /// `platform_held` = Cmd on macOS. Notifies only when the state changes,
+    /// so calling this on every mouse move is cheap.
+    fn update_link_hover(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        platform_held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cell = if platform_held {
+            self.mouse_position_to_cell(position, window)
+        } else {
+            None
+        };
+        // Same cell as last time → hover state is already current. Gates
+        // the per-cell OSC 8 FFI scan off the 120 Hz mouse-move stream.
+        if cell.is_some() && cell == self.last_hover_cell {
+            return;
+        }
+        self.last_hover_cell = cell;
+
+        let new = cell.and_then(|(col, row)| {
+            osc8_link_spans(
+                |c, r| self.session.hyperlink_at(c, r),
+                &self.viewport_lines,
+                self.session.cols(),
+                self.session.rows(),
+                col,
+                row,
+            )
+            .map(|(_, spans)| spans)
+            .or_else(|| {
+                url_spans_at_cell_in_wrapped_lines(
+                    &self.viewport_lines,
+                    self.session.cols() as usize,
+                    row.saturating_sub(1) as usize,
+                    col,
+                )
+                .map(|(_, spans)| spans)
+            })
+        });
+        if self.hovered_link != new {
+            self.hovered_link = new;
+            cx.notify();
+        }
+    }
+
+    fn on_modifiers_changed(
+        &mut self,
+        event: &gpui::ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(position) = self.last_mouse_position {
+            self.update_link_hover(position, event.modifiers.platform, window, cx);
+        }
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -1242,20 +1468,17 @@ impl TerminalView {
         if event.button == MouseButton::Left && event.modifiers.platform {
             if let Some((col, row)) = self.mouse_position_to_cell(event.position, window) {
                 if let Some(link) = self.session.hyperlink_at(col, row) {
-                    let item = ClipboardItem::new_string(link);
-                    cx.write_to_clipboard(item.clone());
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                    cx.write_to_primary(item);
+                    cx.open_url(&link);
                     return;
                 }
 
-                if let Some(line) = self.viewport_lines.get(row.saturating_sub(1) as usize)
-                    && let Some(url) = url_at_column_in_line(line, col)
-                {
-                    let item = ClipboardItem::new_string(url);
-                    cx.write_to_clipboard(item.clone());
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                    cx.write_to_primary(item);
+                if let Some(url) = url_at_cell_in_wrapped_lines(
+                    &self.viewport_lines,
+                    self.session.cols() as usize,
+                    row.saturating_sub(1) as usize,
+                    col,
+                ) {
+                    cx.open_url(&url);
                     return;
                 }
             }
@@ -1263,10 +1486,7 @@ impl TerminalView {
             if let Some(index) = self.mouse_position_to_viewport_index(event.position, window)
                 && let Some(url) = self.url_at_viewport_index(index)
             {
-                let item = ClipboardItem::new_string(url);
-                cx.write_to_clipboard(item.clone());
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                cx.write_to_primary(item);
+                cx.open_url(&url);
                 return;
             }
         }
@@ -1364,6 +1584,12 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Hover underline is pure visual feedback — update it before the
+        // mouse-reporting forward below, so it works inside TUIs (Claude
+        // Code & co.) that enable mouse mode.
+        self.last_mouse_position = Some(event.position);
+        self.update_link_hover(event.position, event.modifiers.platform, window, cx);
+
         if !event.modifiers.shift
             && self.input.is_some()
             && self.session.mouse_reporting_enabled()
@@ -1990,6 +2216,8 @@ struct TerminalPrepaintState {
     shaped_lines: Vec<gpui::ShapedLine>,
     background_quads: Vec<PaintQuad>,
     selection_quads: Vec<PaintQuad>,
+    /// Thin underline quads beneath the Cmd+hovered URL (one per wrapped row).
+    link_underline_quads: Vec<PaintQuad>,
     box_drawing_quads: Vec<PaintQuad>,
     marked_text: Option<(gpui::ShapedLine, gpui::Point<Pixels>)>,
     marked_text_background: Option<PaintQuad>,
@@ -2960,6 +3188,38 @@ impl Element for TerminalTextElement {
             })
             .unwrap_or_default();
 
+        let link_underline_quads = {
+            let view = self.view.read(cx);
+            view.hovered_link
+                .as_ref()
+                .map(|spans| {
+                    let mut quads = Vec::with_capacity(spans.len());
+                    for (row, range) in spans {
+                        let Some(line) = shaped_lines.get(*row) else {
+                            continue;
+                        };
+                        let start = range.start.min(line.text.len());
+                        let end = range.end.min(line.text.len());
+                        if start >= end {
+                            continue;
+                        }
+                        let x1 = line.x_for_index(start);
+                        let x2 = line.x_for_index(end);
+                        // Sit the underline just above the row's bottom edge,
+                        // mirroring where shaped-text underlines land.
+                        let y = bounds.top() + line_height * (*row as f32 + 1.0) - px(2.0);
+                        quads.push(fill(
+                            Bounds::from_corners(
+                                point(bounds.left() + x1, y),
+                                point(bounds.left() + x2, y + px(1.0)),
+                            ),
+                            run_color,
+                        ));
+                    }
+                    quads
+                })
+                .unwrap_or_default()
+        };
         let box_drawing_quads = cell_w_metric
             .map(|cell_width| {
                 let default_fg = run_color;
@@ -3100,6 +3360,7 @@ impl Element for TerminalTextElement {
             shaped_lines,
             background_quads,
             selection_quads,
+            link_underline_quads,
             box_drawing_quads,
             marked_text,
             marked_text_background,
@@ -3207,6 +3468,12 @@ impl Element for TerminalTextElement {
                 );
             }
 
+            for quad in prepaint.link_underline_quads.drain(..) {
+                let mut q = quad;
+                translate(&mut q);
+                window.paint_quad(q);
+            }
+
             for quad in prepaint.peek_box_drawing_quads.drain(..) {
                 let mut q = quad;
                 translate(&mut q);
@@ -3312,6 +3579,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::on_tab_prev))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
@@ -3323,6 +3591,11 @@ impl Render for TerminalView {
             .text_color(gpui::white())
             .font(self.font.clone())
             .whitespace_nowrap()
+            // Pointer cursor while a Cmd+hovered link is underlined — same
+            // affordance as iTerm / Terminal.app.
+            .when(self.hovered_link.is_some(), |this| {
+                this.cursor(gpui::CursorStyle::PointingHand)
+            })
             .child(TerminalTextElement { view: cx.entity() })
     }
 }
@@ -3373,7 +3646,7 @@ pub(crate) fn cell_metrics_with_overrides(
 mod tests {
     use ghostty_vt::Rgb;
 
-    use super::{url_at_byte_index, url_at_column_in_line, window_position_to_local};
+    use super::{url_at_byte_index, url_at_cell_in_wrapped_lines, window_position_to_local};
 
     #[test]
     fn url_detection_finds_https_links() {
@@ -3387,13 +3660,13 @@ mod tests {
 
     #[test]
     fn url_detection_finds_https_links_by_cell_column() {
-        let line = "https://google.com";
+        let lines = vec!["https://google.com".to_string()];
         assert_eq!(
-            url_at_column_in_line(line, 1).as_deref(),
+            url_at_cell_in_wrapped_lines(&lines, 80, 0, 1).as_deref(),
             Some("https://google.com")
         );
         assert_eq!(
-            url_at_column_in_line(line, 10).as_deref(),
+            url_at_cell_in_wrapped_lines(&lines, 80, 0, 10).as_deref(),
             Some("https://google.com")
         );
     }

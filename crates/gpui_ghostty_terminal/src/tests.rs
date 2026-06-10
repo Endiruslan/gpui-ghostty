@@ -565,3 +565,152 @@ fn insert_blanks_shifts_content_without_touching_footer_rows() {
     assert!(row7.starts_with("FOOT7"), "row7={row7:?}");
     assert!(row8.starts_with("FOOT8"), "row8={row8:?}");
 }
+
+#[test]
+fn url_at_cell_single_line() {
+    use crate::view::url_at_cell_in_wrapped_lines;
+
+    let lines = vec!["see https://example.com/docs for info".to_string()];
+    // Click inside the URL (col is 1-based).
+    assert_eq!(
+        url_at_cell_in_wrapped_lines(&lines, 80, 0, 10),
+        Some("https://example.com/docs".to_string())
+    );
+    // Click outside the URL.
+    assert_eq!(url_at_cell_in_wrapped_lines(&lines, 80, 0, 2), None);
+}
+
+#[test]
+fn url_at_cell_joins_wrapped_rows() {
+    use crate::view::url_at_cell_in_wrapped_lines;
+
+    // 20-col terminal; URL wraps across three rows. Rows 0 and 1 are
+    // exactly full width → treated as soft-wrapped continuations.
+    let cols = 20;
+    let lines = vec![
+        "see https://example.".to_string(),
+        "com/a/very/long/path".to_string(),
+        "?q=1 and more text".to_string(),
+    ];
+    let expected = Some("https://example.com/a/very/long/path?q=1".to_string());
+
+    // Click on first row inside URL.
+    assert_eq!(url_at_cell_in_wrapped_lines(&lines, cols, 0, 8), expected);
+    // Click on middle row — must walk back to the URL start.
+    assert_eq!(url_at_cell_in_wrapped_lines(&lines, cols, 1, 5), expected);
+    // Click on last row inside the URL tail.
+    assert_eq!(url_at_cell_in_wrapped_lines(&lines, cols, 2, 2), expected);
+    // Click past the URL on the last row.
+    assert_eq!(url_at_cell_in_wrapped_lines(&lines, cols, 2, 10), None);
+}
+
+#[test]
+fn url_at_cell_does_not_join_short_rows() {
+    use crate::view::url_at_cell_in_wrapped_lines;
+
+    // Previous row is NOT full width → no continuation, rows independent.
+    let lines = vec!["https://example.com".to_string(), "unrelated".to_string()];
+    assert_eq!(
+        url_at_cell_in_wrapped_lines(&lines, 40, 0, 3),
+        Some("https://example.com".to_string())
+    );
+    assert_eq!(url_at_cell_in_wrapped_lines(&lines, 40, 1, 3), None);
+}
+
+#[test]
+fn url_at_cell_strips_trailing_punctuation() {
+    use crate::view::url_at_cell_in_wrapped_lines;
+
+    let lines = vec!["(https://example.com/x).".to_string()];
+    assert_eq!(
+        url_at_cell_in_wrapped_lines(&lines, 80, 0, 5),
+        Some("https://example.com/x".to_string())
+    );
+}
+
+#[test]
+fn url_spans_cover_each_wrapped_row() {
+    use crate::view::url_spans_at_cell_in_wrapped_lines;
+
+    let cols = 20;
+    let lines = vec![
+        "see https://example.".to_string(),
+        "com/a/very/long/path".to_string(),
+        "?q=1 and more text".to_string(),
+    ];
+    let (url, spans) = url_spans_at_cell_in_wrapped_lines(&lines, cols, 1, 5).unwrap();
+    assert_eq!(url, "https://example.com/a/very/long/path?q=1");
+    assert_eq!(
+        spans,
+        vec![(0usize, 4..20), (1usize, 0..20), (2usize, 0..4)]
+    );
+}
+
+#[test]
+fn osc8_link_spans_expand_over_link_cells() {
+    use crate::view::osc8_link_spans;
+
+    // 20-col, 3-row screen. "Docs Page" link occupies row 2, cols 6..=14.
+    let lines = vec![
+        "header text".to_string(),
+        "see  Docs Page  end".to_string(),
+        "footer".to_string(),
+    ];
+    let link = |c: u16, r: u16| {
+        (r == 2 && (6..=14).contains(&c)).then(|| "https://example.com/docs".to_string())
+    };
+
+    let (url, spans) = osc8_link_spans(link, &lines, 20, 3, 9, 2).unwrap();
+    assert_eq!(url, "https://example.com/docs");
+    assert_eq!(spans, vec![(1usize, 5..14)]);
+
+    // Hover outside the link region → no spans.
+    assert!(osc8_link_spans(link, &lines, 20, 3, 2, 2).is_none());
+}
+
+#[test]
+fn osc8_link_spans_join_wrapped_rows() {
+    use crate::view::osc8_link_spans;
+
+    // Link wraps: row 1 cols 15..=20, row 2 cols 1..=8.
+    let lines = vec![
+        "intro and link starts".to_string(),
+        "and ends here padded".to_string(),
+    ];
+    let link = |c: u16, r: u16| {
+        let hit = (r == 1 && (15..=20).contains(&c)) || (r == 2 && (1..=8).contains(&c));
+        hit.then(|| "https://example.com/wrapped".to_string())
+    };
+
+    // Hover on the second row's segment.
+    let (url, spans) = osc8_link_spans(link, &lines, 20, 2, 3, 2).unwrap();
+    assert_eq!(url, "https://example.com/wrapped");
+    assert_eq!(spans, vec![(0usize, 14..21), (1usize, 0..8)]);
+}
+
+#[test]
+fn url_detected_inside_tool_call_prefix() {
+    use crate::view::url_at_cell_in_wrapped_lines;
+
+    let lines = vec!["Fetch(https://amplitude.com/docs/data/persisted-properties)".to_string()];
+    // Click inside the URL (col 10 = byte 9, the "s" of https).
+    assert_eq!(
+        url_at_cell_in_wrapped_lines(&lines, 120, 0, 10),
+        Some("https://amplitude.com/docs/data/persisted-properties".to_string())
+    );
+    // Click on the "Fetch(" prefix → not a link.
+    assert_eq!(url_at_cell_in_wrapped_lines(&lines, 120, 0, 2), None);
+
+    // Same shape but wrapped across two rows at 30 cols.
+    let cols = 30;
+    let wrapped = vec![
+        "Fetch(https://amplitude.com/do".to_string(),
+        "cs/data/persisted-properties)".to_string(),
+    ];
+    let expected = Some("https://amplitude.com/docs/data/persisted-properties".to_string());
+    assert_eq!(
+        url_at_cell_in_wrapped_lines(&wrapped, cols, 0, 12),
+        expected
+    );
+    assert_eq!(url_at_cell_in_wrapped_lines(&wrapped, cols, 1, 5), expected);
+}
