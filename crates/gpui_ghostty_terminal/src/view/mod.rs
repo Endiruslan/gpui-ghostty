@@ -3328,8 +3328,23 @@ impl Element for TerminalTextElement {
             let y = bounds.top() + line_height * (row.saturating_sub(1)) as f32;
             let row_index = row.saturating_sub(1) as usize;
             let line = shaped_lines.get(row_index)?;
-            let byte_index = byte_index_for_column_in_line(line.text.as_str(), col);
-            let x = bounds.left() + line.x_for_index(byte_index.min(line.text.len()));
+            // `dump_viewport` trims trailing blanks, so the cursor column can
+            // sit past the end of the row's text (typing a space at the end
+            // of a prompt). Within the text, shaped glyph positions are
+            // exact; past it, extend the grid by whole cells. Clamping to
+            // the text end made the cursor look stuck after a trailing
+            // space until the next non-blank character arrived.
+            let line_cols = {
+                use unicode_width::UnicodeWidthStr as _;
+                line.text.as_str().width()
+            };
+            let x = if (col as usize) <= line_cols {
+                let byte_index = byte_index_for_column_in_line(line.text.as_str(), col);
+                bounds.left() + line.x_for_index(byte_index.min(line.text.len()))
+            } else {
+                let past_cells = (col as usize - 1 - line_cols) as f32;
+                bounds.left() + line.width() + cell_width.unwrap_or(px(8.0)) * past_cells
+            };
 
             let width = match cursor_style {
                 crate::CursorStyle::Block => cell_width.unwrap_or(px(8.0)),
