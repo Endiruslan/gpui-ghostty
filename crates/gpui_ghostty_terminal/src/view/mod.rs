@@ -1906,6 +1906,38 @@ impl TerminalView {
             return;
         }
 
+        // Alternate screen (fullscreen TUI: vim, htop, Claude Code
+        // `/tui fullscreen`) has no scrollback. Running the local
+        // pixel-smooth scroll here would scroll a non-existent history,
+        // smear rows by a sub-line `pixel_offset`, and paint a stale peek
+        // row — the "garbled scroll" the user sees, cleared only by a full
+        // refresh (e.g. selecting text). Match Ghostty/xterm: when mouse
+        // reporting is off and alternate scroll (DEC mode 1007) is on,
+        // translate the wheel into cursor keys; otherwise swallow it. Never
+        // touch local scrollback on the alt screen.
+        // Pattern from zed/.../gpui-ghostty vendor/ghostty/src/Surface.zig
+        // (scrollCallback: alternate screen + no mouse report + alt scroll).
+        if self.session.alternate_screen_active() {
+            if let Some(input) = self.input.as_ref()
+                && !event.modifiers.shift
+                && self.session.mouse_alternate_scroll_enabled()
+            {
+                let lines = (-dy_history / cell_h).round() as i32;
+                if lines != 0 {
+                    let seq: &[u8] = match (lines < 0, self.session.application_cursor_keys()) {
+                        (true, true) => b"\x1bOA",   // up, application cursor keys
+                        (true, false) => b"\x1b[A",  // up, normal cursor keys
+                        (false, true) => b"\x1bOB",  // down, application cursor keys
+                        (false, false) => b"\x1b[B", // down, normal cursor keys
+                    };
+                    for _ in 0..lines.unsigned_abs().min(10) {
+                        input.send(seq);
+                    }
+                }
+            }
+            return;
+        }
+
         // Phase reset: a brand-new gesture starts at whatever sub-line offset
         // is currently visible — we don't snap to a line boundary, that's
         // exactly the "stickiness" we're trying to eliminate. We only drop
@@ -3690,6 +3722,19 @@ impl Render for TerminalView {
             } else {
                 self.reconcile_dirty_viewport_after_output();
             }
+        }
+
+        // The alt screen has no scrollback. If we entered it while a sub-line
+        // scroll offset / peek row lingered from the primary screen, drop them
+        // so rows don't paint smeared by a fractional-line translation.
+        if self.session.alternate_screen_active()
+            && (self.pixel_offset != 0.0 || self.peek_text.is_some())
+        {
+            self.pixel_offset = 0.0;
+            self.peek_text = None;
+            self.peek_layout = None;
+            self.peek_dirty = true;
+            self.pending_refresh = true;
         }
 
         if self.pending_refresh {

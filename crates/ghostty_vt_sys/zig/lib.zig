@@ -106,6 +106,20 @@ const Handler = struct {
         self.handle.terminal.reverseIndex();
     }
 
+    // SU (CSI Ps S) — scroll the scrolling region up `count` lines. Without
+    // these, fullscreen TUIs that smooth-scroll via SU/SD (e.g. Claude Code
+    // `/tui fullscreen`, which scrolls its conversation region with `CSI Ps T`
+    // then redraws only the newly-exposed rows) leave the rest of the region
+    // un-scrolled — stale and freshly-drawn cells merge into garbage.
+    pub fn scrollUp(self: *Handler, count: u16) !void {
+        self.handle.terminal.scrollUp(count);
+    }
+
+    // SD (CSI Ps T) — scroll the scrolling region down `count` lines.
+    pub fn scrollDown(self: *Handler, count: u16) !void {
+        self.handle.terminal.scrollDown(count);
+    }
+
     pub fn saveCursor(self: *Handler) !void {
         self.handle.terminal.saveCursor();
     }

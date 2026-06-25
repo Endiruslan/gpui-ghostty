@@ -12,6 +12,19 @@ pub struct TerminalSession {
     mouse_button_event_enabled: bool,
     mouse_any_event_enabled: bool,
     mouse_sgr_enabled: bool,
+    /// Alternate screen buffer active (DEC modes 47 / 1047 / 1049). Set by
+    /// fullscreen TUIs (vim, htop, Claude Code `/tui fullscreen`). The alt
+    /// screen has no scrollback, so local scrollback scrolling must be
+    /// suppressed while it's active.
+    alternate_screen_active: bool,
+    /// DECCKM (mode 1): cursor keys send SS3 (`ESC O A`) instead of CSI
+    /// (`ESC [ A`). Needed to emit the right arrow-key encoding for
+    /// alternate-scroll wheel translation.
+    application_cursor_keys: bool,
+    /// Alternate scroll mode (DEC mode 1007). When the alt screen is active
+    /// and mouse reporting is off, the mouse wheel is translated to cursor
+    /// keys. Default ON, matching xterm / Ghostty.
+    mouse_alternate_scroll: bool,
     title: Option<String>,
     clipboard_write: Option<String>,
     parse_tail: Vec<u8>,
@@ -33,6 +46,9 @@ impl TerminalSession {
             mouse_button_event_enabled: false,
             mouse_any_event_enabled: false,
             mouse_sgr_enabled: false,
+            alternate_screen_active: false,
+            application_cursor_keys: false,
+            mouse_alternate_scroll: true,
             title: None,
             clipboard_write: None,
             parse_tail: Vec::new(),
@@ -140,6 +156,24 @@ impl TerminalSession {
         self.mouse_sgr_enabled
     }
 
+    /// Whether the alternate screen buffer is active (fullscreen TUI). While
+    /// active there is no scrollback, so the view must not run its local
+    /// pixel-smooth scrollback scroll.
+    pub fn alternate_screen_active(&self) -> bool {
+        self.alternate_screen_active
+    }
+
+    /// DECCKM state — `true` means cursor keys are encoded as SS3.
+    pub fn application_cursor_keys(&self) -> bool {
+        self.application_cursor_keys
+    }
+
+    /// Alternate scroll mode (DEC 1007). When set, wheel events on the alt
+    /// screen translate to cursor keys. Defaults to `true`.
+    pub fn mouse_alternate_scroll_enabled(&self) -> bool {
+        self.mouse_alternate_scroll
+    }
+
     pub fn mouse_button_event_enabled(&self) -> bool {
         self.mouse_button_event_enabled
     }
@@ -214,7 +248,10 @@ impl TerminalSession {
                     let enabled = b == b'h';
                     for ps in nums {
                         match ps {
+                            1 => self.application_cursor_keys = enabled,
                             25 => self.cursor_visible = enabled,
+                            47 | 1047 | 1049 => self.alternate_screen_active = enabled,
+                            1007 => self.mouse_alternate_scroll = enabled,
                             2004 => self.bracketed_paste_enabled = enabled,
                             2026 => self.synchronized_output_active = enabled,
                             1000 => self.mouse_x10_enabled = enabled,
