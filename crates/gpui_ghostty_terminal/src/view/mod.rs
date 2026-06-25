@@ -167,6 +167,32 @@ fn split_viewport_lines(viewport: &str) -> Vec<String> {
     viewport.split('\n').map(|line| line.to_string()).collect()
 }
 
+/// Character class for double-click word selection. A "word" is a maximal
+/// run of characters of the same class. `Word` keeps path/URL punctuation
+/// (`/`, `.`, `-`, `_`, `:`, `@`, …) attached so double-clicking grabs a
+/// whole path or URL the way iTerm/Terminal.app do; `Space` lets a
+/// double-click on blank padding select the whitespace run; everything else
+/// (quotes, brackets, separators) is `Other` and selects on its own.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum CharClass {
+    Word,
+    Space,
+    Other,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_whitespace() {
+        CharClass::Space
+    } else if matches!(
+        c,
+        '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '|'
+    ) {
+        CharClass::Other
+    } else {
+        CharClass::Word
+    }
+}
+
 pub(crate) fn should_skip_key_down_for_ime(has_input: bool, keystroke: &gpui::Keystroke) -> bool {
     if !has_input || !keystroke.is_ime_in_progress() {
         return false;
@@ -1499,9 +1525,29 @@ impl TerminalView {
             if event.button == MouseButton::Left
                 && let Some(index) = self.mouse_position_to_viewport_index(event.position, window)
             {
-                self.selection = Some(ByteSelection {
+                let point = ByteSelection {
                     anchor: index,
                     active: index,
+                };
+                // 1 click = caret/drag-anchor, 2 = word, 3+ = line — matching
+                // Terminal.app / iTerm. Word/line lookups fall back to the
+                // point selection when the click lands on empty space.
+                self.selection = Some(match event.click_count {
+                    2 => self
+                        .word_range_at_viewport_index(index)
+                        .map(|r| ByteSelection {
+                            anchor: r.start,
+                            active: r.end,
+                        })
+                        .unwrap_or(point),
+                    n if n >= 3 => self
+                        .line_range_at_viewport_index(index)
+                        .map(|r| ByteSelection {
+                            anchor: r.start,
+                            active: r.end,
+                        })
+                        .unwrap_or(point),
+                    _ => point,
                 });
                 cx.notify();
             }
@@ -2063,6 +2109,78 @@ impl TerminalView {
         let byte_index = byte_index_for_column_in_line(line, col).min(line.len());
         let offset = *self.viewport_line_offsets.get(row_index).unwrap_or(&0);
         Some(offset.saturating_add(byte_index))
+    }
+
+    /// Resolve a viewport byte index to `(row, line_start)`, mirroring the
+    /// reverse lookup used by `url_at_viewport_index`.
+    fn row_at_viewport_index(&self, index: usize) -> Option<(usize, usize)> {
+        if self.viewport_lines.is_empty() {
+            return None;
+        }
+        let idx = index.min(self.viewport_total_len.saturating_sub(1));
+        let row = self
+            .viewport_line_offsets
+            .iter()
+            .enumerate()
+            .rfind(|(_, offset)| **offset <= idx)
+            .map(|(i, _)| i)?;
+        let line_start = *self.viewport_line_offsets.get(row).unwrap_or(&0);
+        Some((row, line_start))
+    }
+
+    /// Word range around `index` for double-click selection: the maximal run
+    /// of same-class characters (see [`char_class`]) within the clicked line.
+    fn word_range_at_viewport_index(&self, index: usize) -> Option<Range<usize>> {
+        let (row, line_start) = self.row_at_viewport_index(index)?;
+        let line = self.viewport_lines.get(row)?.as_str();
+        if line.is_empty() {
+            return None;
+        }
+
+        let local = index.saturating_sub(line_start);
+        // Clicking past the last glyph targets the final char.
+        let target = if local >= line.len() {
+            line.len().saturating_sub(1)
+        } else {
+            local
+        };
+        let mut cur = target;
+        while cur > 0 && !line.is_char_boundary(cur) {
+            cur -= 1;
+        }
+
+        let class = char_class(line[cur..].chars().next()?);
+
+        // Walk left over same-class chars.
+        let mut start = cur;
+        while let Some((prev, ch)) = line[..start].char_indices().next_back() {
+            if char_class(ch) == class {
+                start = prev;
+            } else {
+                break;
+            }
+        }
+
+        // Walk right over same-class chars.
+        let mut end = cur;
+        for (off, ch) in line[cur..].char_indices() {
+            if char_class(ch) == class {
+                end = cur + off + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        Some((line_start + start)..(line_start + end))
+    }
+
+    /// Full line range around `index` for triple-click selection, with
+    /// trailing blank padding trimmed so copies don't grab cell fill.
+    fn line_range_at_viewport_index(&self, index: usize) -> Option<Range<usize>> {
+        let (row, line_start) = self.row_at_viewport_index(index)?;
+        let line = self.viewport_lines.get(row)?.as_str();
+        let trimmed_len = line.trim_end().len();
+        Some(line_start..(line_start + trimmed_len))
     }
 
     fn mouse_position_to_cell(
