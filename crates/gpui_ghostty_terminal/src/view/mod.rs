@@ -582,6 +582,12 @@ pub struct TerminalView {
     /// crosses a line boundary, [`apply_scroll_pixels`] snaps it back into
     /// range and advances the VT viewport by the corresponding line count.
     pixel_offset: f32,
+    /// Sub-line wheel accumulator (pixels) for the mouse-reporting / alt-scroll
+    /// forward paths. Trackpad events arrive as small sub-line pixel deltas;
+    /// accumulating them means slow scrolls register one line at a time instead
+    /// of being rounded away to zero (which forced a hard flick to scroll at
+    /// all). Reset at the start of each gesture.
+    wheel_accum_px: f32,
     /// Cached text of the row immediately above the viewport. `None` means
     /// scrollback is exhausted (no row above) — `pixel_offset` will be
     /// clamped to `0.0` in that case so we never reveal an empty strip.
@@ -664,6 +670,7 @@ impl TerminalView {
             window_active: true,
             _window_activation_sub: None,
             pixel_offset: 0.0,
+            wheel_accum_px: 0.0,
             peek_text: None,
             peek_runs: Vec::new(),
             peek_layout: None,
@@ -723,6 +730,7 @@ impl TerminalView {
             window_active: true,
             _window_activation_sub: None,
             pixel_offset: 0.0,
+            wheel_accum_px: 0.0,
             peek_text: None,
             peek_runs: Vec::new(),
             peek_layout: None,
@@ -1843,6 +1851,28 @@ impl TerminalView {
         }
     }
 
+    /// Accumulate sub-line wheel travel and return how many whole wheel notches
+    /// to emit this event (signed; sign follows `dy`). Trackpad events deliver
+    /// small sub-line pixel deltas — without accumulation they round to zero and
+    /// the wheel feels "stuck" until a hard flick. We emit one notch per
+    /// `cell_h` of travel and consume only what we emit (remainder stays in
+    /// `wheel_accum_px`), capped per event so a fast flick spreads across frames
+    /// instead of jumping violently.
+    fn accumulate_wheel_lines(&mut self, dy: f32, cell_h: f32) -> i32 {
+        const MAX_LINES_PER_EVENT: i32 = 4;
+        if cell_h <= 0.0 {
+            return 0;
+        }
+        self.wheel_accum_px += dy;
+        let whole = (self.wheel_accum_px / cell_h) as i32; // truncates toward zero
+        if whole == 0 {
+            return 0;
+        }
+        let capped = whole.clamp(-MAX_LINES_PER_EVENT, MAX_LINES_PER_EVENT);
+        self.wheel_accum_px -= capped as f32 * cell_h;
+        capped
+    }
+
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
@@ -1871,21 +1901,31 @@ impl TerminalView {
         // move up = page should reveal content above = into history.
         let dy_history = dy_px_in;
 
+        // A fresh gesture starts with a clean wheel accumulator so leftover
+        // sub-line motion from the previous gesture can't trigger a stray line.
+        if matches!(event.touch_phase, TouchPhase::Started) {
+            self.wheel_accum_px = 0.0;
+        }
+
         // Mouse-reporting branch — remote app handles the scroll itself; we
-        // pass discrete integer steps. No local pixel accumulation.
-        if let Some(input) = self.input.as_ref()
+        // forward discrete wheel notches. Trackpad deltas are sub-line pixels,
+        // so we ACCUMULATE them (`accumulate_wheel_lines`): a slow scroll emits
+        // one notch per line of finger travel instead of being rounded to zero
+        // (which forced a hard flick to scroll at all), and a fast flick is
+        // capped per event with the remainder carried — smooth at both ends.
+        if self.input.is_some()
             && !event.modifiers.shift
             && self.session.mouse_reporting_enabled()
             && self.session.mouse_sgr_enabled()
         {
-            let delta_lines = (-dy_history / cell_h).round() as i32;
-            if delta_lines == 0 {
+            let lines = self.accumulate_wheel_lines(-dy_history, cell_h);
+            if lines == 0 {
                 return;
             }
             let Some((col, row)) = self.mouse_position_to_cell(event.position, window) else {
                 return;
             };
-            let button = if delta_lines < 0 { 64 } else { 65 };
+            let button = if lines < 0 { 64 } else { 65 };
             let button_value = sgr_mouse_button_value(
                 button,
                 false,
@@ -1893,7 +1933,8 @@ impl TerminalView {
                 event.modifiers.alt,
                 event.modifiers.control,
             );
-            let steps = delta_lines.unsigned_abs().min(10);
+            let steps = lines.unsigned_abs();
+            let input = self.input.as_ref().expect("input present");
             for _ in 0..steps {
                 let seq = sgr_mouse_sequence(button_value, col, row, true);
                 input.send(seq.as_bytes());
@@ -1918,11 +1959,11 @@ impl TerminalView {
         // Pattern from zed/.../gpui-ghostty vendor/ghostty/src/Surface.zig
         // (scrollCallback: alternate screen + no mouse report + alt scroll).
         if self.session.alternate_screen_active() {
-            if let Some(input) = self.input.as_ref()
+            if self.input.is_some()
                 && !event.modifiers.shift
                 && self.session.mouse_alternate_scroll_enabled()
             {
-                let lines = (-dy_history / cell_h).round() as i32;
+                let lines = self.accumulate_wheel_lines(-dy_history, cell_h);
                 if lines != 0 {
                     let seq: &[u8] = match (lines < 0, self.session.application_cursor_keys()) {
                         (true, true) => b"\x1bOA",   // up, application cursor keys
@@ -1930,7 +1971,8 @@ impl TerminalView {
                         (false, true) => b"\x1bOB",  // down, application cursor keys
                         (false, false) => b"\x1b[B", // down, normal cursor keys
                     };
-                    for _ in 0..lines.unsigned_abs().min(10) {
+                    let input = self.input.as_ref().expect("input present");
+                    for _ in 0..lines.unsigned_abs() {
                         input.send(seq);
                     }
                 }
