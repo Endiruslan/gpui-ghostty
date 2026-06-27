@@ -28,6 +28,12 @@ pub struct TerminalConfig {
     pub cursor_color: Option<Rgb>,
     /// Cursor rendering shape.  Defaults to [`CursorStyle::Block`].
     pub cursor_style: CursorStyle,
+    /// Alpha (`0.0..=1.0`) applied to the terminal's full-background fill (the
+    /// default-bg layer painted behind all cells). `1.0` = opaque (default);
+    /// set below 1.0 (typically `0.0`) when the host window is translucent so
+    /// the terminal pane reveals whatever is painted behind it instead of a
+    /// solid background. Non-default cell backgrounds are unaffected.
+    pub background_alpha: f32,
 }
 
 /// Cursor shape for [`TerminalConfig::cursor_style`].
@@ -62,6 +68,7 @@ impl Default for TerminalConfig {
             cursor_blink_ms: None,
             cursor_color: None,
             cursor_style: CursorStyle::Block,
+            background_alpha: 1.0,
         }
     }
 }

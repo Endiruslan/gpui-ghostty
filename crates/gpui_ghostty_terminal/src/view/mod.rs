@@ -1337,6 +1337,14 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Set the default-background fill alpha (see
+    /// [`TerminalConfig::background_alpha`]). Use `0.0` to let a translucent
+    /// host window show through the terminal pane.
+    pub fn set_background_alpha(&mut self, alpha: f32, cx: &mut Context<Self>) {
+        self.session.set_background_alpha(alpha);
+        cx.notify();
+    }
+
     /// Override the cursor color (`Some`) or restore auto-contrast (`None`).
     pub fn set_cursor_color(&mut self, color: Option<Rgb>, cx: &mut Context<Self>) {
         self.session.set_cursor_color(color);
@@ -2442,6 +2450,130 @@ struct TerminalPrepaintState {
     scrollbar: Option<ScrollbarQuads>,
 }
 
+fn paint_terminal_contents(
+    bounds: Bounds<Pixels>,
+    default_bg: Rgb,
+    bg_alpha: f32,
+    prepaint: &mut TerminalPrepaintState,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // Background fill stays at the *visible* bounds — we don't want the
+    // terminal's bg to leak into the bleed zone (that's the panel's own bg
+    // color). Glyphs and quads paint inside the expanded clip and slide off
+    // cleanly.
+    //
+    // `bg_alpha` lets a translucent host window show through: at 0.0 we skip
+    // the fill entirely so the terminal pane reveals whatever is painted behind
+    // it (matching the rest of the translucent app).
+    if bg_alpha > 0.0 {
+        window.paint_quad(fill(bounds, hsla_from_rgb(default_bg).alpha(bg_alpha)));
+    }
+
+    // Sub-line scroll: every viewport-content y is shifted by `pixel_offset`.
+    // The peek row sits at content row "-1", i.e. its quads/text were prepared
+    // at `bounds.top() - line_height` and get the same shift, so it lands at
+    // `bounds.top() - line_height + pixel_offset` — partially revealed from the
+    // top edge. The caller clips to the bleed-expanded paint bounds.
+    let dy = prepaint.pixel_offset;
+    let translate = |q: &mut PaintQuad| {
+        q.bounds.origin.y += dy;
+    };
+
+    if bg_alpha >= 1.0 {
+        for quad in prepaint.peek_background_quads.drain(..) {
+            let mut q = quad;
+            translate(&mut q);
+            window.paint_quad(q);
+        }
+        for quad in prepaint.background_quads.drain(..) {
+            let mut q = quad;
+            translate(&mut q);
+            window.paint_quad(q);
+        }
+    } else {
+        prepaint.peek_background_quads.clear();
+        prepaint.background_quads.clear();
+    }
+
+    for quad in prepaint.selection_quads.drain(..) {
+        let mut q = quad;
+        translate(&mut q);
+        window.paint_quad(q);
+    }
+
+    let origin = bounds.origin;
+    if let Some(peek_line) = prepaint.peek_line.as_ref() {
+        let y = origin.y - prepaint.line_height + dy;
+        let _ = peek_line.paint(
+            point(origin.x, y),
+            prepaint.line_height,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+    for (row, line) in prepaint.shaped_lines.iter().enumerate() {
+        let y = origin.y + prepaint.line_height * row as f32 + dy;
+        let _ = line.paint(
+            point(origin.x, y),
+            prepaint.line_height,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    for quad in prepaint.link_underline_quads.drain(..) {
+        let mut q = quad;
+        translate(&mut q);
+        window.paint_quad(q);
+    }
+
+    for quad in prepaint.peek_box_drawing_quads.drain(..) {
+        let mut q = quad;
+        translate(&mut q);
+        window.paint_quad(q);
+    }
+    for quad in prepaint.box_drawing_quads.drain(..) {
+        let mut q = quad;
+        translate(&mut q);
+        window.paint_quad(q);
+    }
+
+    if let Some(mut bg) = prepaint.marked_text_background.take() {
+        translate(&mut bg);
+        window.paint_quad(bg);
+    }
+
+    if let Some((line, origin)) = prepaint.marked_text.as_ref() {
+        let _ = line.paint(
+            point(origin.x, origin.y + dy),
+            prepaint.line_height,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    if let Some(mut cursor) = prepaint.cursor.take() {
+        translate(&mut cursor);
+        window.paint_quad(cursor);
+    }
+
+    // Scrollbar paints on top of everything else, *not* shifted by pixel_offset
+    // — the bar lives in viewport-relative coords so a sub-line scroll can
+    // advance the thumb without the track sliding along. Track first, thumb on
+    // top.
+    if let Some(scrollbar) = prepaint.scrollbar.take() {
+        window.paint_quad(scrollbar.track);
+        window.paint_quad(scrollbar.thumb);
+    }
+}
+
 struct ScrollbarQuads {
     track: PaintQuad,
     thumb: PaintQuad,
@@ -2843,11 +2975,13 @@ fn build_runs_for_line(
 }
 
 /// Background-color quads for a single row at vertical offset `y`.
-/// Skips runs whose bg matches `default_bg` (those are painted by the
-/// element's outer fill).
+/// Skips runs whose bg matches a terminal default background (those are painted
+/// by the element's outer fill, or intentionally transparent in translucent
+/// hosts). The slice includes older defaults because already-snapshotted cells
+/// can retain the prior default RGB after a host theme switch.
 fn build_bg_quads_for_row(
     style_runs: &[StyleRun],
-    default_bg: Rgb,
+    transparent_default_bgs: &[Rgb],
     origin_x: Pixels,
     y: Pixels,
     cell_width: f32,
@@ -2858,7 +2992,7 @@ fn build_bg_quads_for_row(
         return;
     }
     for run in style_runs.iter() {
-        if run.bg == default_bg {
+        if transparent_default_bgs.contains(&run.bg) {
             continue;
         }
         let x = origin_x + px(cell_width * (run.start_col.saturating_sub(1)) as f32);
@@ -3197,7 +3331,13 @@ impl Element for TerminalTextElement {
             }
         });
 
-        let default_bg = { self.view.read(cx).session.default_background() };
+        let (default_bg, transparent_default_bgs) = {
+            let view = self.view.read(cx);
+            (
+                view.session.default_background(),
+                view.session.transparent_default_backgrounds().to_vec(),
+            )
+        };
         let cell_w_metric = cell_metrics_with_overrides(
             window,
             &font,
@@ -3215,7 +3355,7 @@ impl Element for TerminalTextElement {
                     let y = origin.y + line_height * row as f32;
                     build_bg_quads_for_row(
                         runs,
-                        default_bg,
+                        &transparent_default_bgs,
                         origin.x,
                         y,
                         cell_width,
@@ -3239,7 +3379,7 @@ impl Element for TerminalTextElement {
                     let y = bounds.origin.y - line_height;
                     build_bg_quads_for_row(
                         &view.peek_runs,
-                        default_bg,
+                        &transparent_default_bgs,
                         bounds.origin.x,
                         y,
                         cell_width,
@@ -3628,114 +3768,23 @@ impl Element for TerminalTextElement {
             point(bounds.left(), bounds.top() - bleed),
             size(bounds.size.width, bounds.size.height + bleed * 2.0),
         );
-        window.paint_layer(paint_clip, |window| {
-            let default_bg = { self.view.read(cx).session.default_background() };
-            // Background fill stays at the *visible* bounds — we don't want
-            // the terminal's bg to leak into the bleed zone (that's the
-            // panel's own bg color). Glyphs and quads paint inside the
-            // expanded clip and slide off cleanly.
-            window.paint_quad(fill(bounds, hsla_from_rgb(default_bg)));
+        let (default_bg, bg_alpha) = {
+            let v = self.view.read(cx);
+            (v.session.default_background(), v.session.background_alpha())
+        };
 
-            // Sub-line scroll: every viewport-content y is shifted by
-            // `pixel_offset`. The peek row sits at content row "−1", i.e.
-            // its quads/text were prepared at `bounds.top() - line_height`
-            // and get the same shift, so it lands at
-            // `bounds.top() - line_height + pixel_offset` — partially
-            // revealed from the top edge. `paint_layer(bounds)` clips
-            // anything that overflows top/bottom.
-            let dy = prepaint.pixel_offset;
-            let translate = |q: &mut PaintQuad| {
-                q.bounds.origin.y += dy;
-            };
-
-            for quad in prepaint.peek_background_quads.drain(..) {
-                let mut q = quad;
-                translate(&mut q);
-                window.paint_quad(q);
-            }
-            for quad in prepaint.background_quads.drain(..) {
-                let mut q = quad;
-                translate(&mut q);
-                window.paint_quad(q);
-            }
-
-            for quad in prepaint.selection_quads.drain(..) {
-                let mut q = quad;
-                translate(&mut q);
-                window.paint_quad(q);
-            }
-
-            let origin = bounds.origin;
-            if let Some(peek_line) = prepaint.peek_line.as_ref() {
-                let y = origin.y - prepaint.line_height + dy;
-                let _ = peek_line.paint(
-                    point(origin.x, y),
-                    prepaint.line_height,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-            }
-            for (row, line) in prepaint.shaped_lines.iter().enumerate() {
-                let y = origin.y + prepaint.line_height * row as f32 + dy;
-                let _ = line.paint(
-                    point(origin.x, y),
-                    prepaint.line_height,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-            }
-
-            for quad in prepaint.link_underline_quads.drain(..) {
-                let mut q = quad;
-                translate(&mut q);
-                window.paint_quad(q);
-            }
-
-            for quad in prepaint.peek_box_drawing_quads.drain(..) {
-                let mut q = quad;
-                translate(&mut q);
-                window.paint_quad(q);
-            }
-            for quad in prepaint.box_drawing_quads.drain(..) {
-                let mut q = quad;
-                translate(&mut q);
-                window.paint_quad(q);
-            }
-
-            if let Some(mut bg) = prepaint.marked_text_background.take() {
-                translate(&mut bg);
-                window.paint_quad(bg);
-            }
-
-            if let Some((line, origin)) = prepaint.marked_text.as_ref() {
-                let _ = line.paint(
-                    point(origin.x, origin.y + dy),
-                    prepaint.line_height,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-            }
-
-            if let Some(mut cursor) = prepaint.cursor.take() {
-                translate(&mut cursor);
-                window.paint_quad(cursor);
-            }
-
-            // Scrollbar paints on top of everything else, *not* shifted by
-            // pixel_offset — the bar lives in viewport-relative coords so a
-            // sub-line scroll can advance the thumb without the track sliding
-            // along. Track first, thumb on top.
-            if let Some(scrollbar) = prepaint.scrollbar.take() {
-                window.paint_quad(scrollbar.track);
-                window.paint_quad(scrollbar.thumb);
-            }
-        });
+        if bg_alpha < 1.0 {
+            // A terminal-wide scene layer with no opaque fill clears to black on
+            // translucent macOS windows. Use only a content mask in that mode so
+            // skipped default-background pixels reveal the host's root sheet.
+            window.with_content_mask(Some(gpui::ContentMask { bounds: paint_clip }), |window| {
+                paint_terminal_contents(bounds, default_bg, bg_alpha, prepaint, window, cx);
+            });
+        } else {
+            window.paint_layer(paint_clip, |window| {
+                paint_terminal_contents(bounds, default_bg, bg_alpha, prepaint, window, cx);
+            });
+        }
 
         let paint_us = paint_start.elapsed().as_micros() as u64;
         SCROLL_STATS.paint_calls.fetch_add(1, Ordering::Relaxed);
@@ -3801,6 +3850,9 @@ impl Render for TerminalView {
             }
         }
 
+        let bg_alpha = self.session.background_alpha();
+        let background = hsla_from_rgb(self.session.default_background());
+
         div()
             .size_full()
             .flex()
@@ -3821,7 +3873,7 @@ impl Render for TerminalView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
-            .bg(gpui::black())
+            .when(bg_alpha >= 1.0, |this| this.bg(background))
             .text_color(gpui::white())
             .font(self.font.clone())
             .whitespace_nowrap()

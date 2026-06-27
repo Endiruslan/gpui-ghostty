@@ -30,12 +30,14 @@ pub struct TerminalSession {
     parse_tail: Vec<u8>,
     dsr_state: DsrScanState,
     osc_query_state: OscQueryScanState,
+    transparent_default_bgs: Vec<Rgb>,
 }
 
 impl TerminalSession {
     pub fn new(config: TerminalConfig) -> Result<Self, Error> {
         let mut terminal = Terminal::new(config.cols, config.rows)?;
         terminal.set_default_colors(config.default_fg, config.default_bg);
+        let initial_bg = config.default_bg;
         Ok(Self {
             config,
             terminal,
@@ -54,6 +56,7 @@ impl TerminalSession {
             parse_tail: Vec::new(),
             dsr_state: DsrScanState::default(),
             osc_query_state: OscQueryScanState::default(),
+            transparent_default_bgs: vec![initial_bg],
         })
     }
 
@@ -73,6 +76,27 @@ impl TerminalSession {
         self.config.default_bg
     }
 
+    /// Alpha applied to the full default-background fill (see
+    /// [`TerminalConfig::background_alpha`]).
+    pub fn background_alpha(&self) -> f32 {
+        self.config.background_alpha
+    }
+
+    /// Set the default-background fill alpha at runtime (e.g. when the host
+    /// window toggles between opaque and translucent). Triggers no terminal
+    /// reset; the next paint picks it up.
+    pub fn set_background_alpha(&mut self, alpha: f32) {
+        self.config.background_alpha = alpha.clamp(0.0, 1.0);
+    }
+
+    /// Background RGBs that represented the terminal default background at some
+    /// point during this session. When the host makes the default background
+    /// transparent, existing cells may still snapshot an older default as a raw
+    /// RGB style run; those should also be treated as transparent.
+    pub fn transparent_default_backgrounds(&self) -> &[Rgb] {
+        &self.transparent_default_bgs
+    }
+
     /// Swap the terminal's default foreground and background colors at runtime.
     ///
     /// Affects every subsequently-rendered cell that uses the "default"
@@ -84,9 +108,21 @@ impl TerminalSession {
     /// reconstructing the `TerminalSession` (which would lose scrollback and
     /// reset the cursor).
     pub fn set_default_colors(&mut self, fg: Rgb, bg: Rgb) {
+        self.remember_transparent_default_bg(self.config.default_bg);
+        self.remember_transparent_default_bg(bg);
         self.config.default_fg = fg;
         self.config.default_bg = bg;
         self.terminal.set_default_colors(fg, bg);
+    }
+
+    fn remember_transparent_default_bg(&mut self, bg: Rgb) {
+        if self.transparent_default_bgs.contains(&bg) {
+            return;
+        }
+        self.transparent_default_bgs.push(bg);
+        if self.transparent_default_bgs.len() > 8 {
+            self.transparent_default_bgs.remove(0);
+        }
     }
 
     /// Override font size in pixels. `None` = inherit from `window.text_style()`.
