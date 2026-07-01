@@ -1570,6 +1570,14 @@ impl TerminalView {
             return;
         }
 
+        // A click forwarded to the app dismisses any lingering terminal
+        // selection (e.g. an earlier Shift-drag). Without this the highlight
+        // only cleared on another Shift-click. Mirrors Ghostty's
+        // `setSelection(null)` in the mouse-report path.
+        if self.selection.take().is_some() {
+            cx.notify();
+        }
+
         let Some((col, row)) = self.mouse_position_to_cell(event.position, window) else {
             return;
         };
@@ -2480,20 +2488,24 @@ fn paint_terminal_contents(
         q.bounds.origin.y += dy;
     };
 
-    if bg_alpha >= 1.0 {
-        for quad in prepaint.peek_background_quads.drain(..) {
-            let mut q = quad;
-            translate(&mut q);
-            window.paint_quad(q);
-        }
-        for quad in prepaint.background_quads.drain(..) {
-            let mut q = quad;
-            translate(&mut q);
-            window.paint_quad(q);
-        }
-    } else {
-        prepaint.peek_background_quads.clear();
-        prepaint.background_quads.clear();
+    // Non-default cell backgrounds are real content — a colored prompt, a
+    // status bar, or a fullscreen TUI's selection / hover highlight (Claude
+    // Code & co. paint those with a background color / reverse-video, which
+    // the Zig shim resolves into a concrete bg). Paint them even in a
+    // translucent window: only the *default* background is dropped for
+    // translucency, and `build_bg_quads_for_row` already excludes it via
+    // `transparent_default_bgs`. Clearing everything here (the old behavior)
+    // made the app's selection + hover highlight invisible in translucent
+    // windows. Matches Ghostty, which keeps colored cell backgrounds opaque.
+    for quad in prepaint.peek_background_quads.drain(..) {
+        let mut q = quad;
+        translate(&mut q);
+        window.paint_quad(q);
+    }
+    for quad in prepaint.background_quads.drain(..) {
+        let mut q = quad;
+        translate(&mut q);
+        window.paint_quad(q);
     }
 
     for quad in prepaint.selection_quads.drain(..) {
