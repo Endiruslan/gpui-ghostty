@@ -353,6 +353,127 @@ fn url_range_at_byte_index(text: &str, index: usize) -> Option<std::ops::Range<u
     Some(start..end)
 }
 
+/// Bytes that can appear inside a file-path token. Cut at whitespace and
+/// characters that commonly delimit paths in prose / tool output
+/// (quotes, brackets that open, `=` from KEY=value, `,` from lists);
+/// trailing punctuation is trimmed separately afterwards.
+// TODO(terminal file links, task 2): wire into click/hover handling; until
+// then these pure helpers are only reachable from tests.
+#[allow(dead_code)]
+fn is_path_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace()
+        && !matches!(
+            b,
+            b'"' | b'\'' | b'`' | b'(' | b'<' | b'>' | b'[' | b']' | b'=' | b','
+        )
+}
+
+/// Split a trailing `:LINE` or `:LINE:COL` suffix off `token`. Returns the
+/// byte length of the path part and the parsed 1-based line number.
+#[allow(dead_code)]
+fn split_line_suffix(token: &str) -> (usize, Option<u32>) {
+    let strip_num = |s: &str| -> Option<(usize, u32)> {
+        let colon = s.rfind(':')?;
+        let digits = &s[colon + 1..];
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some((colon, digits.parse().ok()?))
+    };
+    match strip_num(token) {
+        None => (token.len(), None),
+        Some((c1, n1)) => match strip_num(&token[..c1]) {
+            // `path:LINE:COL` — the inner number is the line.
+            Some((c2, n2)) => (c2, Some(n2)),
+            None => (c1, Some(n1)),
+        },
+    }
+}
+
+/// Heuristic: does the token plausibly name a file? Requires a directory
+/// separator, a home/dot prefix, or a `name.ext` shape. Existence is
+/// checked by the host-injected resolver, so a false positive here costs
+/// one stat and shows nothing.
+#[allow(dead_code)]
+fn looks_like_path(token: &str) -> bool {
+    if token.len() < 3 {
+        return false;
+    }
+    if token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.contains('/')
+    {
+        return true;
+    }
+    match token.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && (1..=8).contains(&ext.len())
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+                && !ext.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// A file-path-looking token at byte `index`: range of the path part within
+/// `text` (line/col suffix + trailing punctuation stripped) and the parsed
+/// 1-based line number from a `:LINE[:COL]` suffix. Pointer anywhere in the
+/// token — including on the suffix — hits the link. Pure lexical check;
+/// existence is the injected resolver's job.
+#[allow(dead_code)]
+fn path_range_at_byte_index(
+    text: &str,
+    index: usize,
+) -> Option<(std::ops::Range<usize>, Option<u32>)> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut idx = index.min(bytes.len() - 1);
+    if !is_path_byte(bytes[idx]) && idx > 0 && is_path_byte(bytes[idx - 1]) {
+        idx -= 1;
+    }
+    if !is_path_byte(bytes[idx]) {
+        return None;
+    }
+    let mut start = idx;
+    while start > 0 && is_path_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = idx + 1;
+    while end < bytes.len() && is_path_byte(bytes[end]) {
+        end += 1;
+    }
+    // Prose punctuation glued to the token: `docs/a.md.` `(docs/a.md)`.
+    while end > start
+        && matches!(
+            bytes[end - 1],
+            b'.' | b';' | b')' | b']' | b'}' | b'!' | b'?'
+        )
+    {
+        end -= 1;
+    }
+    // Compiler-style trailing colon(s): `src/lib.rs:10:` — strip so the
+    // suffix parse below sees `src/lib.rs:10`.
+    while end > start && bytes[end - 1] == b':' {
+        end -= 1;
+    }
+    let token = std::str::from_utf8(&bytes[start..end]).ok()?;
+    // URLs belong to the URL detector.
+    if token.contains("://") {
+        return None;
+    }
+    let (path_len, line) = split_line_suffix(token);
+    let token = &token[..path_len];
+    if !looks_like_path(token) {
+        return None;
+    }
+    Some((start..start + path_len, line))
+}
+
 /// Extract an `http(s)://` URL at (0-based `row`, 1-based `col`), joining
 /// soft-wrapped rows. `dump_viewport` emits `\n` after every row with no
 /// wrap-continuation flag, so the heuristic is: a row that fills the full
@@ -3944,7 +4065,10 @@ pub(crate) fn cell_metrics_with_overrides(
 mod tests {
     use ghostty_vt::Rgb;
 
-    use super::{url_at_byte_index, url_at_cell_in_wrapped_lines, window_position_to_local};
+    use super::{
+        path_range_at_byte_index, url_at_byte_index, url_at_cell_in_wrapped_lines,
+        window_position_to_local,
+    };
 
     #[test]
     fn url_detection_finds_https_links() {
@@ -3967,6 +4091,95 @@ mod tests {
             url_at_cell_in_wrapped_lines(&lines, 80, 0, 10).as_deref(),
             Some("https://google.com")
         );
+    }
+
+    #[test]
+    fn path_detection_relative_with_slash() {
+        let text = "see docs/researches/deposit-frequency.md for details";
+        let idx = text.find("researches").unwrap();
+        let (range, line) = path_range_at_byte_index(text, idx).unwrap();
+        assert_eq!(&text[range], "docs/researches/deposit-frequency.md");
+        assert_eq!(line, None);
+    }
+
+    #[test]
+    fn path_detection_absolute_home_and_dotted() {
+        for tok in ["/Users/x/notes.txt", "~/notes/x.md", "./a.sh", "../a/b.py"] {
+            let text = format!("open {tok} now");
+            let idx = text.find(tok).unwrap() + 1;
+            let (range, _) = path_range_at_byte_index(&text, idx).unwrap();
+            assert_eq!(&text[range], tok);
+        }
+    }
+
+    #[test]
+    fn path_detection_bare_filename() {
+        let text = "wrote README.md and Cargo.toml";
+        let idx = text.find("README").unwrap();
+        let (range, _) = path_range_at_byte_index(text, idx).unwrap();
+        assert_eq!(&text[range], "README.md");
+    }
+
+    #[test]
+    fn path_detection_line_and_col_suffix() {
+        let text = "error at src/main.rs:42:7 in build";
+        let idx = text.find("main").unwrap();
+        let (range, line) = path_range_at_byte_index(text, idx).unwrap();
+        assert_eq!(&text[range], "src/main.rs");
+        assert_eq!(line, Some(42));
+
+        // Compiler style with trailing colon: "src/lib.rs:10: message"
+        let text2 = "src/lib.rs:10: expected `;`";
+        let (range2, line2) = path_range_at_byte_index(text2, 2).unwrap();
+        assert_eq!(&text2[range2], "src/lib.rs");
+        assert_eq!(line2, Some(10));
+
+        // Hover on the suffix itself still hits the link.
+        let idx3 = text.find(":42").unwrap() + 1;
+        let (range3, line3) = path_range_at_byte_index(text, idx3).unwrap();
+        assert_eq!(&text[range3], "src/main.rs");
+        assert_eq!(line3, Some(42));
+    }
+
+    #[test]
+    fn path_detection_trims_trailing_punctuation() {
+        for (text, expect) in [
+            ("read (docs/a.md)", "docs/a.md"),
+            ("read docs/a.md,", "docs/a.md"),
+            ("read docs/a.md.", "docs/a.md"),
+            ("link [docs/a.md]", "docs/a.md"),
+        ] {
+            let idx = text.find("docs").unwrap();
+            let (range, _) = path_range_at_byte_index(text, idx).unwrap();
+            assert_eq!(&text[range], expect, "in {text:?}");
+        }
+    }
+
+    #[test]
+    fn path_detection_rejects_non_paths() {
+        // Bare words, numbers, versions, URLs (URL detector's job).
+        for (text, idx_word) in [
+            ("just a word here", "word"),
+            ("version 1.2.3 released", "1.2.3"),
+            ("https://a.io/docs/a.md page", "docs"),
+            ("total 42", "42"),
+        ] {
+            let idx = text.find(idx_word).unwrap();
+            assert_eq!(
+                path_range_at_byte_index(text, idx),
+                None,
+                "should reject in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_detection_env_var_prefix_not_glued() {
+        // `=` is a token boundary: FOO=docs/a.md must yield docs/a.md.
+        let text = "CONFIG=docs/a.md run";
+        let idx = text.find("docs").unwrap();
+        let (range, _) = path_range_at_byte_index(text, idx).unwrap();
+        assert_eq!(&text[range], "docs/a.md");
     }
 
     #[test]
