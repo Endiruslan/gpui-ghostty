@@ -357,9 +357,6 @@ fn url_range_at_byte_index(text: &str, index: usize) -> Option<std::ops::Range<u
 /// characters that commonly delimit paths in prose / tool output
 /// (quotes, brackets that open, `=` from KEY=value, `,` from lists);
 /// trailing punctuation is trimmed separately afterwards.
-// TODO(terminal file links, task 2): wire into click/hover handling; until
-// then these pure helpers are only reachable from tests.
-#[allow(dead_code)]
 fn is_path_byte(b: u8) -> bool {
     !b.is_ascii_whitespace()
         && !matches!(
@@ -370,7 +367,6 @@ fn is_path_byte(b: u8) -> bool {
 
 /// Split a trailing `:LINE` or `:LINE:COL` suffix off `token`. Returns the
 /// byte length of the path part and the parsed 1-based line number.
-#[allow(dead_code)]
 fn split_line_suffix(token: &str) -> (usize, Option<u32>) {
     let strip_num = |s: &str| -> Option<(usize, u32)> {
         let colon = s.rfind(':')?;
@@ -394,7 +390,6 @@ fn split_line_suffix(token: &str) -> (usize, Option<u32>) {
 /// separator, a home/dot prefix, or a `name.ext` shape. Existence is
 /// checked by the host-injected resolver, so a false positive here costs
 /// one stat and shows nothing.
-#[allow(dead_code)]
 fn looks_like_path(token: &str) -> bool {
     if token.len() < 3 {
         return false;
@@ -423,7 +418,6 @@ fn looks_like_path(token: &str) -> bool {
 /// 1-based line number from a `:LINE[:COL]` suffix. Pointer anywhere in the
 /// token — including on the suffix — hits the link. Pure lexical check;
 /// existence is the injected resolver's job.
-#[allow(dead_code)]
 fn path_range_at_byte_index(
     text: &str,
     index: usize,
@@ -493,12 +487,18 @@ pub(crate) fn url_at_cell_in_wrapped_lines(
 /// within that row's string). Used to paint the Cmd+hover underline.
 pub(crate) type LinkSpans = Vec<(usize, std::ops::Range<usize>)>;
 
-pub(crate) fn url_spans_at_cell_in_wrapped_lines(
+/// Join soft-wrapped rows around 0-based `row` (a row that fills the full
+/// terminal width continues on the next row) and locate 1-based `col`
+/// within the joined string. Returns (joined text, click byte index,
+/// first joined row, per-row byte offsets into the joined string).
+/// Joining unrelated full-width rows is harmless — token scanners only
+/// look at the contiguous run around the click point.
+fn join_wrapped_rows(
     lines: &[String],
     cols: usize,
     row: usize,
     col: u16,
-) -> Option<(String, LinkSpans)> {
+) -> Option<(String, usize, usize, Vec<usize>)> {
     use unicode_width::UnicodeWidthStr as _;
 
     let line = lines.get(row)?;
@@ -528,12 +528,21 @@ pub(crate) fn url_spans_at_cell_in_wrapped_lines(
         row_starts.push(joined.len());
         joined.push_str(l);
     }
+    Some((joined, click_idx, start_row, row_starts))
+}
 
-    let range = url_range_at_byte_index(&joined, click_idx)?;
-    let url = joined[range.clone()].to_string();
-
+/// Map a byte range within the joined string back to per-row spans.
+fn spans_for_joined_range(
+    lines: &[String],
+    start_row: usize,
+    row_starts: &[usize],
+    range: &std::ops::Range<usize>,
+) -> LinkSpans {
     let mut spans = LinkSpans::new();
-    for (i, l) in lines[start_row..=end_row].iter().enumerate() {
+    for (i, l) in lines[start_row..start_row + row_starts.len()]
+        .iter()
+        .enumerate()
+    {
         let row_start = row_starts[i];
         let row_end = row_start + l.len();
         let seg_start = range.start.clamp(row_start, row_end);
@@ -542,7 +551,39 @@ pub(crate) fn url_spans_at_cell_in_wrapped_lines(
             spans.push((start_row + i, seg_start - row_start..seg_end - row_start));
         }
     }
+    spans
+}
+
+pub(crate) fn url_spans_at_cell_in_wrapped_lines(
+    lines: &[String],
+    cols: usize,
+    row: usize,
+    col: u16,
+) -> Option<(String, LinkSpans)> {
+    let (joined, click_idx, start_row, row_starts) = join_wrapped_rows(lines, cols, row, col)?;
+    let range = url_range_at_byte_index(&joined, click_idx)?;
+    let url = joined[range.clone()].to_string();
+    let spans = spans_for_joined_range(lines, start_row, &row_starts, &range);
     Some((url, spans))
+}
+
+/// Path twin of [`url_spans_at_cell_in_wrapped_lines`]: file-path-looking
+/// token at (0-based `row`, 1-based `col`), with its parsed 1-based line
+/// number and per-row underline spans (suffix excluded from the spans).
+// TODO(terminal file links, task 3): wire into click/hover handling; until
+// then this is only reachable from tests.
+#[allow(dead_code)]
+pub(crate) fn path_token_at_cell_in_wrapped_lines(
+    lines: &[String],
+    cols: usize,
+    row: usize,
+    col: u16,
+) -> Option<(String, Option<u32>, LinkSpans)> {
+    let (joined, click_idx, start_row, row_starts) = join_wrapped_rows(lines, cols, row, col)?;
+    let (range, line) = path_range_at_byte_index(&joined, click_idx)?;
+    let token = joined[range.clone()].to_string();
+    let spans = spans_for_joined_range(lines, start_row, &row_starts, &range);
+    (!spans.is_empty()).then_some((token, line, spans))
 }
 
 /// Extent of an OSC 8 hyperlink around cell (1-based `col`, `row`),
@@ -4066,8 +4107,8 @@ mod tests {
     use ghostty_vt::Rgb;
 
     use super::{
-        path_range_at_byte_index, url_at_byte_index, url_at_cell_in_wrapped_lines,
-        window_position_to_local,
+        path_range_at_byte_index, path_token_at_cell_in_wrapped_lines, url_at_byte_index,
+        url_at_cell_in_wrapped_lines, url_spans_at_cell_in_wrapped_lines, window_position_to_local,
     };
 
     #[test]
@@ -4180,6 +4221,46 @@ mod tests {
         let idx = text.find("docs").unwrap();
         let (range, _) = path_range_at_byte_index(text, idx).unwrap();
         assert_eq!(&text[range], "docs/a.md");
+    }
+
+    #[test]
+    fn path_token_at_cell_basic() {
+        let lines = vec!["see docs/researches/a.md here".to_string()];
+        // col is 1-based; byte 5 = 'd' of docs → col 6.
+        let (token, line, spans) = path_token_at_cell_in_wrapped_lines(&lines, 80, 0, 6).unwrap();
+        assert_eq!(token, "docs/researches/a.md");
+        assert_eq!(line, None);
+        assert_eq!(spans, vec![(0usize, 4..24)]);
+    }
+
+    #[test]
+    fn path_token_at_cell_wrapped_across_rows() {
+        // 20-col terminal: "docs/very-long-name-here.md" wraps mid-token.
+        // Row 0 is exactly 20 cells wide → continuation heuristic joins row 1.
+        let lines = vec![
+            "see docs/very-long-n".to_string(),
+            "ame-here.md ok".to_string(),
+        ];
+        let (token, _, spans) = path_token_at_cell_in_wrapped_lines(&lines, 20, 1, 3).unwrap();
+        assert_eq!(token, "docs/very-long-name-here.md");
+        assert_eq!(spans, vec![(0usize, 4..20), (1usize, 0..11)]);
+    }
+
+    #[test]
+    fn path_token_at_cell_line_suffix_spans_exclude_suffix() {
+        let lines = vec!["at src/main.rs:42:7 done".to_string()];
+        let (token, line, spans) = path_token_at_cell_in_wrapped_lines(&lines, 80, 0, 5).unwrap();
+        assert_eq!(token, "src/main.rs");
+        assert_eq!(line, Some(42));
+        assert_eq!(spans, vec![(0usize, 3..14)]);
+    }
+
+    #[test]
+    fn url_spans_still_work_after_refactor() {
+        let lines = vec!["go https://a.io/x now".to_string()];
+        let (url, spans) = url_spans_at_cell_in_wrapped_lines(&lines, 80, 0, 5).unwrap();
+        assert_eq!(url, "https://a.io/x");
+        assert_eq!(spans, vec![(0usize, 3..17)]);
     }
 
     #[test]
