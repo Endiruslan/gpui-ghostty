@@ -570,9 +570,6 @@ pub(crate) fn url_spans_at_cell_in_wrapped_lines(
 /// Path twin of [`url_spans_at_cell_in_wrapped_lines`]: file-path-looking
 /// token at (0-based `row`, 1-based `col`), with its parsed 1-based line
 /// number and per-row underline spans (suffix excluded from the spans).
-// TODO(terminal file links, task 3): wire into click/hover handling; until
-// then this is only reachable from tests.
-#[allow(dead_code)]
 pub(crate) fn path_token_at_cell_in_wrapped_lines(
     lines: &[String],
     cols: usize,
@@ -665,6 +662,21 @@ pub(crate) fn osc8_link_spans(
 
 type TerminalSendFn = dyn Fn(&[u8]) + Send + Sync + 'static;
 
+/// Host-injected validator for file-path tokens found in the grid.
+/// Receives the raw token (no `:line` suffix); returns the resolved
+/// on-disk path when the token names a real file, `None` otherwise.
+/// Resolution policy (cwd, `~`, existence) is entirely the host's.
+pub type PathResolver = Box<dyn Fn(&str) -> Option<std::path::PathBuf>>;
+
+/// Emitted when the user Cmd+clicks a file path that the installed
+/// [`PathResolver`] mapped to a real file. The host decides how to open it.
+#[derive(Clone, Debug)]
+pub struct OpenPathRequest {
+    pub path: std::path::PathBuf,
+    /// 1-based line from a `path:LINE[:COL]` token, when present.
+    pub line: Option<u32>,
+}
+
 pub struct TerminalInput {
     send: Box<TerminalSendFn>,
 }
@@ -712,6 +724,9 @@ pub struct TerminalView {
     /// Drives the hover underline + pointer cursor; cleared when Cmd is
     /// released or the mouse leaves the link.
     hovered_link: Option<LinkSpans>,
+    /// Host-injected file-path validator. `None` (default) = path links off;
+    /// Cmd+hover/click then behaves exactly as before this feature.
+    path_resolver: Option<PathResolver>,
     /// Last mouse position seen by `on_mouse_move`, so a bare Cmd press /
     /// release (no motion) can recompute the hover state.
     last_mouse_position: Option<gpui::Point<Pixels>>,
@@ -822,6 +837,7 @@ impl TerminalView {
             pending_refresh: false,
             selection: None,
             hovered_link: None,
+            path_resolver: None,
             last_mouse_position: None,
             last_hover_cell: None,
             marked_text: None,
@@ -882,6 +898,7 @@ impl TerminalView {
             pending_refresh: false,
             selection: None,
             hovered_link: None,
+            path_resolver: None,
             last_mouse_position: None,
             last_hover_cell: None,
             marked_text: None,
@@ -1575,6 +1592,12 @@ impl TerminalView {
         self.copy_on_select = enabled;
     }
 
+    /// Install (or clear) the host-injected file-path validator. `None`
+    /// disables path-link detection entirely (hover underline + click).
+    pub fn set_path_resolver(&mut self, resolver: Option<PathResolver>) {
+        self.path_resolver = resolver;
+    }
+
     /// Update the terminal font size at runtime. Cell metrics will be
     /// re-derived on the next render frame; the host should follow this
     /// with a `resize_terminal` call so the PTY learns about the new
@@ -1639,6 +1662,16 @@ impl TerminalView {
                 )
                 .map(|(_, spans)| spans)
             })
+            .or_else(|| {
+                let resolver = self.path_resolver.as_ref()?;
+                let (token, _line, spans) = path_token_at_cell_in_wrapped_lines(
+                    &self.viewport_lines,
+                    self.session.cols() as usize,
+                    row.saturating_sub(1) as usize,
+                    col,
+                )?;
+                resolver(&token).map(|_| spans)
+            })
         });
         if self.hovered_link != new {
             self.hovered_link = new;
@@ -1683,6 +1716,19 @@ impl TerminalView {
                     col,
                 ) {
                     cx.open_url(&url);
+                    return;
+                }
+
+                if let Some(resolver) = self.path_resolver.as_ref()
+                    && let Some((token, line, _spans)) = path_token_at_cell_in_wrapped_lines(
+                        &self.viewport_lines,
+                        self.session.cols() as usize,
+                        row.saturating_sub(1) as usize,
+                        col,
+                    )
+                    && let Some(path) = resolver(&token)
+                {
+                    cx.emit(OpenPathRequest { path, line });
                     return;
                 }
             }
@@ -2481,6 +2527,8 @@ impl TerminalView {
 }
 
 impl gpui::EventEmitter<ghostty_vt::TerminalEvent> for TerminalView {}
+
+impl gpui::EventEmitter<OpenPathRequest> for TerminalView {}
 
 impl EntityInputHandler for TerminalView {
     fn text_for_range(
