@@ -6,3 +6,4 @@ crates/ghostty_vt_sys/zig/.zig-cache
 
 .zig-cache/
 crates/ghostty_vt_sys/zig/zig-pkg/
+.context/

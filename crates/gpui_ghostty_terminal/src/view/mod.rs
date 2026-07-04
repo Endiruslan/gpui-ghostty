@@ -790,6 +790,13 @@ pub struct TerminalView {
     /// Select" preference. Toggled at runtime by the host via
     /// [`set_copy_on_select`].
     copy_on_select: bool,
+    /// Scrollbar geometry captured at the last prepaint, in window
+    /// coordinates — the hit target for click/drag. `None` whenever no
+    /// scrollbar is drawn (content fits, alt screen, zero viewport).
+    scrollbar_layout: Option<ScrollbarLayout>,
+    /// Active scrollbar-thumb drag: vertical offset in pixels from the
+    /// thumb's top edge to the grab point. `None` when not dragging.
+    scrollbar_drag: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -856,6 +863,8 @@ impl TerminalView {
             scroll_pos: None,
             scroll_pos_dirty: true,
             copy_on_select: false,
+            scrollbar_layout: None,
+            scrollbar_drag: None,
         }
         .with_refreshed_viewport()
     }
@@ -917,6 +926,8 @@ impl TerminalView {
             scroll_pos: None,
             scroll_pos_dirty: true,
             copy_on_select: false,
+            scrollbar_layout: None,
+            scrollbar_drag: None,
         }
         .with_refreshed_viewport()
     }
@@ -1688,6 +1699,63 @@ impl TerminalView {
         if let Some(position) = self.last_mouse_position {
             self.update_link_hover(position, event.modifiers.platform, window, cx);
         }
+    }
+
+    /// Move the viewport so the scrollbar thumb follows a pointer at window
+    /// y-coordinate `y`, honoring the grab offset captured on mouse-down.
+    /// Geometry comes from the layout cached at the last prepaint; the
+    /// position is computed absolutely from the pointer (not incrementally),
+    /// so intermediate frames can't accumulate drift.
+    fn drag_scrollbar_thumb_to(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let Some(layout) = self.scrollbar_layout else {
+            return;
+        };
+        let Some(grab) = self.scrollbar_drag else {
+            return;
+        };
+        let track_h = f32::from(layout.track.size.height);
+        let thumb_h = f32::from(layout.thumb.size.height);
+        let scrollable_px = (track_h - thumb_h).max(1.0);
+        let thumb_top = f32::from(y) - f32::from(layout.track.top()) - grab;
+        let progress = (thumb_top / scrollable_px).clamp(0.0, 1.0);
+        let scrollable_rows = layout.total_rows.saturating_sub(layout.viewport_rows);
+        let target_top = (progress * scrollable_rows as f32).round() as i64;
+        self.scroll_viewport_to_top_row(target_top, cx);
+    }
+
+    /// Snap the VT viewport so its top row is `target_top` (0 = oldest
+    /// scrollback row). Mirrors the fast-path of [`apply_scroll_pixels`]:
+    /// line-aligned, no sub-line peek.
+    fn scroll_viewport_to_top_row(&mut self, target_top: i64, cx: &mut Context<Self>) {
+        if self.scroll_pos_dirty {
+            self.scroll_pos = self.session.scroll_position();
+            self.scroll_pos_dirty = false;
+        }
+        let Some(pos) = self.scroll_pos else {
+            return;
+        };
+        let delta = target_top - pos.viewport_top as i64;
+        if delta == 0 {
+            return;
+        }
+        let _ = self.session.take_viewport_scroll_delta();
+        let _ = self
+            .session
+            .scroll_viewport(delta.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+        let actual_delta = self.session.take_viewport_scroll_delta();
+        self.apply_viewport_scroll_delta(actual_delta);
+        let dirty_rows = self.session.take_dirty_viewport_rows();
+        if !dirty_rows.is_empty() && !self.apply_dirty_viewport_rows(&dirty_rows) {
+            self.pending_refresh = true;
+        }
+        self.apply_side_effects(cx);
+        if self.pixel_offset != 0.0 {
+            self.pixel_offset = 0.0;
+            self.peek_layout = None;
+        }
+        self.peek_dirty = true;
+        self.scroll_pos_dirty = true;
+        cx.notify();
     }
 
     fn on_mouse_down(
@@ -2796,6 +2864,79 @@ fn paint_terminal_contents(
     }
 }
 
+/// Make the painted scrollbar interactive: thumb drag scrolls, a click on
+/// the track jumps the thumb to that spot and keeps dragging. Registered as
+/// window-level listeners (pattern from mxds ui::scroll::Scrollbar) so a
+/// drag keeps tracking even after the pointer leaves the 6 px bar; the
+/// `stop_propagation` on mouse-down keeps the click from starting a text
+/// selection or being forwarded as an SGR mouse report.
+fn register_scrollbar_mouse_handlers(
+    view: &gpui::Entity<TerminalView>,
+    layout: ScrollbarLayout,
+    window: &mut Window,
+) {
+    {
+        let view = view.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
+            if !phase.bubble()
+                || event.button != MouseButton::Left
+                || !layout.hit_track(event.position)
+            {
+                return;
+            }
+            cx.stop_propagation();
+            view.update(cx, |view, cx| {
+                let grab = if layout.hit_thumb(event.position) {
+                    f32::from(event.position.y - layout.thumb.top())
+                } else {
+                    // Track click: jump so the thumb centers on the pointer,
+                    // then continue as a drag from the thumb's middle.
+                    f32::from(layout.thumb.size.height) / 2.0
+                };
+                view.scrollbar_drag = Some(grab);
+                view.drag_scrollbar_thumb_to(event.position.y, cx);
+                cx.notify();
+            });
+        });
+    }
+    {
+        let view = view.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+            if !phase.bubble() {
+                return;
+            }
+            if view.read(cx).scrollbar_drag.is_none() {
+                return;
+            }
+            view.update(cx, |view, cx| {
+                if event.pressed_button == Some(MouseButton::Left) {
+                    view.drag_scrollbar_thumb_to(event.position.y, cx);
+                } else {
+                    // Button released outside the window — end the drag.
+                    view.scrollbar_drag = None;
+                    cx.notify();
+                }
+            });
+        });
+    }
+    {
+        let view = view.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+            if !phase.bubble() || event.button != MouseButton::Left {
+                return;
+            }
+            if view.read(cx).scrollbar_drag.is_none() {
+                return;
+            }
+            cx.stop_propagation();
+            view.update(cx, |view, cx| {
+                view.scrollbar_drag = None;
+                cx.notify();
+            });
+        });
+    }
+}
+
 struct ScrollbarQuads {
     track: PaintQuad,
     thumb: PaintQuad,
@@ -3304,17 +3445,46 @@ fn build_box_quads_for_row(
     }
 }
 
-/// Build a track + proportional thumb for the right-side scrollbar.
+/// Scrollbar geometry in window coordinates, plus the scroll totals the
+/// drag math needs. Computed in prepaint, cached on the view as the mouse
+/// hit target, and turned into paint quads for drawing.
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarLayout {
+    track: Bounds<Pixels>,
+    thumb: Bounds<Pixels>,
+    total_rows: u32,
+    viewport_rows: u32,
+}
+
+impl ScrollbarLayout {
+    /// Extra grab width to the LEFT of the visual 6 px track — a 6 px bar
+    /// is a hostile click target; this widens it to ~14 px without
+    /// changing the visuals.
+    const HIT_SLOP_LEFT: f32 = 8.0;
+
+    fn hit_track(&self, p: gpui::Point<Pixels>) -> bool {
+        p.y >= self.track.top()
+            && p.y <= self.track.bottom()
+            && p.x >= self.track.left() - px(Self::HIT_SLOP_LEFT)
+            && p.x <= self.track.right() + px(1.0)
+    }
+
+    fn hit_thumb(&self, p: gpui::Point<Pixels>) -> bool {
+        self.hit_track(p) && p.y >= self.thumb.top() && p.y <= self.thumb.bottom()
+    }
+}
+
+/// Compute the track + proportional thumb for the right-side scrollbar.
 ///
 /// Layout: a 6 px track flush to the right edge with a 1 px gap, semi-
 /// transparent so it doesn't compete with terminal content. The thumb's
 /// height is proportional to `viewport_rows / total_rows` (with a 24 px
 /// minimum so it stays grabbable on tall scrollbacks) and its top is
 /// proportional to `viewport_top / scrollable_range`.
-fn build_scrollbar_quads(
+fn compute_scrollbar_layout(
     bounds: Bounds<Pixels>,
     pos: ghostty_vt::ScrollPosition,
-) -> ScrollbarQuads {
+) -> ScrollbarLayout {
     const TRACK_WIDTH: f32 = 6.0;
     const TRACK_RIGHT_GAP: f32 = 1.0;
     const MIN_THUMB_HEIGHT: f32 = 24.0;
@@ -3335,6 +3505,19 @@ fn build_scrollbar_quads(
     let progress = (pos.viewport_top as f32 / scrollable).clamp(0.0, 1.0);
     let thumb_y_offset = progress * (h_px - thumb_h);
 
+    ScrollbarLayout {
+        track: Bounds::new(point(track_x, track_y), size(track_w, track_h)),
+        thumb: Bounds::new(
+            point(track_x, track_y + px(thumb_y_offset)),
+            size(track_w, px(thumb_h)),
+        ),
+        total_rows: pos.total_rows,
+        viewport_rows: pos.viewport_rows,
+    }
+}
+
+fn build_scrollbar_quads(layout: &ScrollbarLayout) -> ScrollbarQuads {
+    const TRACK_WIDTH: f32 = 6.0;
     // Subtle achromatic bar that adapts to the terminal's default
     // background — blended over whatever's underneath, so it works on
     // dark and light themes without theming. The thumb is the same hue
@@ -3343,20 +3526,8 @@ fn build_scrollbar_quads(
     let track_color = hsla(0.0, 0.0, 0.5, 0.18);
     let thumb_color = hsla(0.0, 0.0, 0.5, 0.55);
 
-    let track = fill(
-        Bounds::new(point(track_x, track_y), size(track_w, track_h)),
-        track_color,
-    )
-    .corner_radii(px(TRACK_WIDTH * 0.5));
-
-    let thumb = fill(
-        Bounds::new(
-            point(track_x, track_y + px(thumb_y_offset)),
-            size(track_w, px(thumb_h)),
-        ),
-        thumb_color,
-    )
-    .corner_radii(px(TRACK_WIDTH * 0.5));
+    let track = fill(layout.track, track_color).corner_radii(px(TRACK_WIDTH * 0.5));
+    let thumb = fill(layout.thumb, thumb_color).corner_radii(px(TRACK_WIDTH * 0.5));
 
     ScrollbarQuads { track, thumb }
 }
@@ -3917,18 +4088,25 @@ impl Element for TerminalTextElement {
 
         // Refresh the cached scroll position if it's stale, then build
         // scrollbar quads. Skip when total rows fit entirely in the viewport
-        // (nothing to scroll).
+        // (nothing to scroll). The geometry is also cached on the view
+        // (`scrollbar_layout`) as the hit target for click/drag handlers
+        // registered in paint.
         let scrollbar = self.view.update(cx, |view, _cx| {
             if view.scroll_pos_dirty {
                 view.scroll_pos = view.session.scroll_position();
                 view.scroll_pos_dirty = false;
             }
-            view.scroll_pos.and_then(|pos| {
+            let layout = view.scroll_pos.and_then(|pos| {
                 if pos.total_rows <= pos.viewport_rows || pos.viewport_rows == 0 {
                     return None;
                 }
-                Some(build_scrollbar_quads(bounds, pos))
-            })
+                Some(compute_scrollbar_layout(bounds, pos))
+            });
+            view.scrollbar_layout = layout;
+            if layout.is_none() {
+                view.scrollbar_drag = None;
+            }
+            layout.map(|l| build_scrollbar_quads(&l))
         });
 
         let prepaint_us = _prepaint_start.elapsed().as_micros() as u64;
@@ -4006,6 +4184,13 @@ impl Element for TerminalTextElement {
             window.paint_layer(paint_clip, |window| {
                 paint_terminal_contents(bounds, default_bg, bg_alpha, prepaint, window, cx);
             });
+        }
+
+        // Scrollbar interaction — registered every frame the bar is drawn,
+        // scoped to this view's own geometry (multiple split panes each get
+        // their own handlers with disjoint hit targets).
+        if let Some(layout) = self.view.read(cx).scrollbar_layout {
+            register_scrollbar_mouse_handlers(&self.view, layout, window);
         }
 
         let paint_us = paint_start.elapsed().as_micros() as u64;
