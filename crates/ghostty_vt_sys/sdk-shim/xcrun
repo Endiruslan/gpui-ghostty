@@ -1,0 +1,21 @@
+#!/bin/bash
+# SDK shim for zig <= 0.15 on macOS 26 (Tahoe).
+#
+# zig 0.15's linker cannot consume the macOS 26 SDK's libSystem.tbd — every
+# link (including zig's own build runner) fails with "undefined symbol:
+# _abort/_bzero/...". zig resolves the SDK by running `xcrun
+# --show-sdk-path` from PATH, so build.rs prepends this directory to PATH,
+# and this shim answers with a macOS 15.x SDK from Command Line Tools when
+# one is installed. Everything else passes through to the real xcrun.
+for a in "$@"; do
+  if [ "$a" = "--show-sdk-path" ]; then
+    for sdk in /Library/Developer/CommandLineTools/SDKs/MacOSX15.*.sdk; do
+      if [ -d "$sdk" ]; then
+        echo "$sdk"
+        exit 0
+      fi
+    done
+    break
+  fi
+done
+exec /usr/bin/xcrun "$@"
