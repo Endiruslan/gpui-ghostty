@@ -30,6 +30,15 @@ const TerminalHandle = struct {
         const t = try terminal.Terminal.init(alloc, .{
             .cols = cols,
             .rows = rows,
+            // Enable grapheme clustering (DEC mode 2027) by default, matching
+            // upstream ghostty (Termio derives this from the .unicode default of
+            // `grapheme-width-method`). Without it, multi-codepoint graphemes —
+            // notably flag emoji (Regional Indicator pairs) — are printed
+            // codepoint-by-codepoint, each taking its own table width (RIS = 2),
+            // so a flag occupies 4 cells instead of 2 and TUIs that assume
+            // grapheme-clustered widths (Claude Code, etc.) render misaligned
+            // tables. `default_modes` also seeds the RIS reset default.
+            .default_modes = .{ .grapheme_cluster = true },
         });
         errdefer {
             var tmp = t;

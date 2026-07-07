@@ -3135,6 +3135,34 @@ pub(crate) fn is_block_char(ch: char) -> bool {
     )
 }
 
+/// True for glyphs that `build_box_quads_for_row` paints as crisp quads
+/// (box-drawing + solid/eighth/quadrant blocks — NOT shaded blocks ░▒▓,
+/// which fall through to the font renderer). Such chars must be stripped from
+/// the shaped text so they aren't drawn twice: once as a quad, once as a font
+/// glyph. The double-draw is invisible when glyphs snap to the grid
+/// (`force_width` set), but shows as doubled lines on rows containing a wide
+/// grapheme (e.g. a flag emoji), where `force_width` is disabled and the
+/// shaped glyphs drift sub-pixel from the grid-locked quads.
+pub(crate) fn char_drawn_as_quad(ch: char) -> bool {
+    box_drawing_mask(ch).is_some() || is_block_char(ch)
+}
+
+/// Replace quad-drawn glyphs (see [`char_drawn_as_quad`]) with spaces for text
+/// shaping. All such chars are single-width, so replacing them with a space
+/// keeps columns and style-run indices aligned. Returns the input borrowed
+/// when the row has no such glyphs (the common case) to avoid an allocation.
+fn strip_quad_glyphs_for_shaping(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.chars().any(char_drawn_as_quad) {
+        std::borrow::Cow::Owned(
+            line.chars()
+                .map(|ch| if char_drawn_as_quad(ch) { ' ' } else { ch })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    }
+}
+
 /// Render block / shade / eighth-block characters as filled quads.
 ///
 /// Returns `None` for chars that aren't block drawing → caller falls back
@@ -3664,13 +3692,14 @@ impl Element for TerminalTextElement {
                     continue;
                 };
 
+                let shape_src = strip_quad_glyphs_for_shaping(line);
                 if let Some(existing) = slot.as_ref()
-                    && existing.text.as_str() == line.as_str()
+                    && existing.text.as_str() == shape_src.as_ref()
                 {
                     continue;
                 }
 
-                let text = SharedString::from(line.clone());
+                let text = SharedString::from(shape_src.into_owned());
                 let runs = build_runs_for_line(
                     text.as_str(),
                     view.viewport_style_runs
@@ -3681,11 +3710,12 @@ impl Element for TerminalTextElement {
                     run_color,
                 );
 
-                let force_width = cell_width.and_then(|cell_width| {
-                    use unicode_width::UnicodeWidthChar as _;
-                    let has_wide = text.as_str().chars().any(|ch| ch.width().unwrap_or(0) > 1);
-                    (!has_wide).then_some(cell_width)
-                });
+                // Always force the monospace grid. gpui's
+                // `apply_force_width_to_layout` advances the cell counter by
+                // each glyph's display width, so wide graphemes (flag emoji,
+                // CJK) land on the grid instead of pulling the rest of the row
+                // left — no need to disable forcing on wide-char rows.
+                let force_width = cell_width;
                 let shaped = window
                     .text_system()
                     .shape_line(text, font_size, &runs, force_width);
@@ -3697,20 +3727,17 @@ impl Element for TerminalTextElement {
             if view.pixel_offset > 0.0
                 && let Some(peek_text) = view.peek_text.clone()
             {
+                let shape_src = strip_quad_glyphs_for_shaping(&peek_text);
                 let needs_shape = view
                     .peek_layout
                     .as_ref()
-                    .map(|l| l.text.as_str() != peek_text.as_str())
+                    .map(|l| l.text.as_str() != shape_src.as_ref())
                     .unwrap_or(true);
                 if needs_shape {
-                    let text = SharedString::from(peek_text);
+                    let text = SharedString::from(shape_src.into_owned());
                     let runs =
                         build_runs_for_line(text.as_str(), &view.peek_runs, &run_font, run_color);
-                    let force_width = cell_width.and_then(|cell_width| {
-                        use unicode_width::UnicodeWidthChar as _;
-                        let has_wide = text.as_str().chars().any(|ch| ch.width().unwrap_or(0) > 1);
-                        (!has_wide).then_some(cell_width)
-                    });
+                    let force_width = cell_width;
                     view.peek_layout = Some(window.text_system().shape_line(
                         text,
                         font_size,
@@ -3834,11 +3861,10 @@ impl Element for TerminalTextElement {
                     }),
                     strikethrough: None,
                 };
-                let force_width = {
-                    use unicode_width::UnicodeWidthChar as _;
-                    let has_wide = text.as_str().chars().any(|ch| ch.width().unwrap_or(0) > 1);
-                    (!has_wide).then_some(px(cell_width))
-                };
+                // Always force the grid — gpui advances by each glyph's display
+                // width, so wide graphemes stay grid-aligned (see the viewport
+                // shaping path above).
+                let force_width = Some(px(cell_width));
                 let shaped =
                     window
                         .text_system()
@@ -4340,9 +4366,40 @@ mod tests {
     use ghostty_vt::Rgb;
 
     use super::{
-        path_range_at_byte_index, path_token_at_cell_in_wrapped_lines, url_at_byte_index,
-        url_at_cell_in_wrapped_lines, url_spans_at_cell_in_wrapped_lines, window_position_to_local,
+        char_drawn_as_quad, path_range_at_byte_index, path_token_at_cell_in_wrapped_lines,
+        strip_quad_glyphs_for_shaping, url_at_byte_index, url_at_cell_in_wrapped_lines,
+        url_spans_at_cell_in_wrapped_lines, window_position_to_local,
     };
+
+    #[test]
+    fn quad_glyphs_stripped_from_shaped_text() {
+        // Box-drawing + solid blocks are painted as quads → replaced by spaces
+        // so they aren't also drawn as font glyphs (which drift from the grid
+        // on wide-grapheme rows, producing doubled lines).
+        assert!(char_drawn_as_quad('│'));
+        assert!(char_drawn_as_quad('─'));
+        assert!(char_drawn_as_quad('█'));
+        // Shaded blocks fall through to the font renderer → NOT stripped.
+        assert!(!char_drawn_as_quad('░'));
+        assert!(!char_drawn_as_quad('▒'));
+        // Regular content (incl. a flag emoji) is untouched.
+        assert!(!char_drawn_as_quad('A'));
+        assert!(!char_drawn_as_quad('\u{1F1EB}'));
+
+        // A table row: borders become spaces, columns preserved, flag kept.
+        let row = "\u{1F1EB}\u{1F1F7}France │ 41 │";
+        let stripped = strip_quad_glyphs_for_shaping(row);
+        assert_eq!(stripped.as_ref(), "\u{1F1EB}\u{1F1F7}France   41  ");
+        assert_eq!(stripped.chars().count(), row.chars().count());
+        // No box glyph survives in the shaped text.
+        assert!(!stripped.chars().any(|c| char_drawn_as_quad(c)));
+
+        // Rows without quad glyphs are returned borrowed (no allocation).
+        assert!(matches!(
+            strip_quad_glyphs_for_shaping("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn url_detection_finds_https_links() {
