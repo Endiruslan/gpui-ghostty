@@ -59,7 +59,10 @@ to install Zig 0.15.2 into .context/zig/zig"
         parts.extend(std::env::split_paths(&current));
         std::env::join_paths(parts).expect("join PATH")
     };
-    println!("cargo:rerun-if-changed={}", shim_dir.join("xcrun").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        shim_dir.join("xcrun").display()
+    );
 
     let status = Command::new(&zig)
         .current_dir(manifest_dir.join("zig"))

@@ -41,7 +41,10 @@ fn lf_at_bottom_margin_scrolls_region_and_blanks_exposed_row() {
     assert_eq!(after[1], "B", "region row 2 should now hold B");
     assert_eq!(after[2], "C");
     assert_eq!(after[3], "D");
-    assert_eq!(after[4], "", "exposed bottom region row must be BLANK, not stale A/D");
+    assert_eq!(
+        after[4], "",
+        "exposed bottom region row must be BLANK, not stale A/D"
+    );
     assert_eq!(after[5], "BOTTOM", "row below region must not move");
 }
 

@@ -86,7 +86,8 @@ fn altscreen_region_scroll_matches_full_dump() {
     t.feed(b"\x1b[1;5r").unwrap();
     // Home, fill the region with 5 lines.
     t.feed(b"\x1b[1;1H").unwrap();
-    t.feed(b"line-A\r\nline-B\r\nline-C\r\nline-D\r\nline-E").unwrap();
+    t.feed(b"line-A\r\nline-B\r\nline-C\r\nline-D\r\nline-E")
+        .unwrap();
     reconcile(&mut t, rows, &mut lines);
     assert_eq!(lines, full_dump(&t), "after initial region fill");
 

@@ -2,7 +2,11 @@ use ghostty_vt::Terminal;
 
 fn rows(t: &Terminal) -> Vec<String> {
     let v = t.dump_viewport().unwrap_or_default();
-    v.strip_suffix('\n').unwrap_or(&v).split('\n').map(|s| s.trim_end().to_string()).collect()
+    v.strip_suffix('\n')
+        .unwrap_or(&v)
+        .split('\n')
+        .map(|s| s.trim_end().to_string())
+        .collect()
 }
 
 fn fill(t: &mut Terminal, n: u16) {
@@ -40,7 +44,13 @@ fn sd_within_region_claude_pattern() {
     // Expect: rows 1 and 5 fixed; region 2..4 scrolled down: row2 blank, 2->3, 3->4.
     assert_eq!(
         rows(&t),
-        vec!["1".to_string(), "".to_string(), "2".to_string(), "3".to_string(), "5".to_string()],
+        vec![
+            "1".to_string(),
+            "".to_string(),
+            "2".to_string(),
+            "3".to_string(),
+            "5".to_string()
+        ],
         "SD within region must scroll rows 2..4 down and blank row 2"
     );
 }
@@ -54,7 +64,13 @@ fn su_within_region_claude_pattern() {
     t.feed(b"\x1b[r").unwrap();
     assert_eq!(
         rows(&t),
-        vec!["1".to_string(), "3".to_string(), "4".to_string(), "".to_string(), "5".to_string()],
+        vec![
+            "1".to_string(),
+            "3".to_string(),
+            "4".to_string(),
+            "".to_string(),
+            "5".to_string()
+        ],
         "SU within region must scroll rows 2..4 up and blank row 4"
     );
 }
