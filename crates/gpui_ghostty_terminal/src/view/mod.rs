@@ -702,6 +702,9 @@ fn font_for_session(session: &TerminalSession) -> gpui::Font {
     if let Some(family) = session.font_family() {
         font.family = family.to_string().into();
     }
+    if let Some(weight) = session.font_weight() {
+        font.weight = gpui::FontWeight(weight);
+    }
     font
 }
 

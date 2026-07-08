@@ -147,6 +147,11 @@ impl TerminalSession {
         self.config.font_family.as_deref()
     }
 
+    /// Primary font weight (CSS numeric scale). `None` = Normal.
+    pub fn font_weight(&self) -> Option<f32> {
+        self.config.font_weight
+    }
+
     /// Cursor blink interval in ms. `None` = no blink.
     pub fn cursor_blink_ms(&self) -> Option<u64> {
         self.config.cursor_blink_ms
