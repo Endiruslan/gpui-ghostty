@@ -147,9 +147,23 @@ impl TerminalSession {
         self.config.font_family.as_deref()
     }
 
+    /// Update the primary font family override at runtime. `None` =
+    /// `default_terminal_font()`. The host should rebuild the base font and
+    /// invalidate any shaped-line cache after calling this.
+    pub fn set_font_family(&mut self, family: Option<String>) {
+        self.config.font_family = family;
+    }
+
     /// Primary font weight (CSS numeric scale). `None` = Normal.
     pub fn font_weight(&self) -> Option<f32> {
         self.config.font_weight
+    }
+
+    /// Update the primary font weight override at runtime. `None` = Normal.
+    /// The host should rebuild the base font and invalidate any shaped-line
+    /// cache after calling this.
+    pub fn set_font_weight(&mut self, weight: Option<f32>) {
+        self.config.font_weight = weight;
     }
 
     /// Cursor blink interval in ms. `None` = no blink.

@@ -1626,6 +1626,32 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Update the terminal font family at runtime. Rebuilds the base font
+    /// (family drives the shaped runs) and drops the shaped-line cache so the
+    /// next prepaint re-shapes with the new family. Cell metrics change, so
+    /// the host should follow this with a `resize_terminal` call (the mxds
+    /// resize tracker re-derives metrics each frame automatically).
+    pub fn set_font_family(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        self.session.set_font_family(family);
+        self.font = font_for_session(&self.session);
+        self.line_layout_key = None;
+        self.line_layouts.clear();
+        self.peek_layout = None;
+        cx.notify();
+    }
+
+    /// Update the terminal font weight at runtime. Rebuilds the base font and
+    /// drops the shaped-line cache so the next prepaint re-shapes with the new
+    /// weight.
+    pub fn set_font_weight(&mut self, weight: Option<f32>, cx: &mut Context<Self>) {
+        self.session.set_font_weight(weight);
+        self.font = font_for_session(&self.session);
+        self.line_layout_key = None;
+        self.line_layouts.clear();
+        self.peek_layout = None;
+        cx.notify();
+    }
+
     fn on_select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
         self.selection = Some(ByteSelection {
             anchor: 0,
