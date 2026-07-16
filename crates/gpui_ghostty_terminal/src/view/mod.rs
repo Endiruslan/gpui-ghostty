@@ -2912,6 +2912,13 @@ struct TerminalPrepaintState {
     box_drawing_quads: Vec<PaintQuad>,
     marked_text: Option<(gpui::ShapedLine, gpui::Point<Pixels>)>,
     marked_text_background: Option<PaintQuad>,
+    /// Autosuggest ghost text: the shaped suffix plus its paint origin, in
+    /// the same pre-`pixel_offset` coordinate space as [`Self::cursor`] —
+    /// `paint_terminal_contents` applies the shared sub-line-scroll
+    /// translation to both right before painting. `None` whenever
+    /// `TerminalView::suggestion_suffix()` is `None`, the row can't be
+    /// resolved, or the suffix is empty after gutter truncation.
+    suggestion: Option<(gpui::ShapedLine, gpui::Point<Pixels>)>,
     cursor: Option<PaintQuad>,
     /// Optional bleed-row shown above viewport row 0 when `pixel_offset > 0`.
     /// All three vectors are in *content* coords (no pixel_offset applied);
@@ -3030,6 +3037,17 @@ fn paint_terminal_contents(
     }
 
     if let Some((line, origin)) = prepaint.marked_text.as_ref() {
+        let _ = line.paint(
+            point(origin.x, origin.y + dy),
+            prepaint.line_height,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    if let Some((line, origin)) = prepaint.suggestion.as_ref() {
         let _ = line.paint(
             point(origin.x, origin.y + dy),
             prepaint.line_height,
@@ -3164,6 +3182,30 @@ fn cursor_color_for_background(background: Rgb) -> gpui::Hsla {
     };
     cursor.a = 0.72;
     cursor
+}
+
+/// Autosuggest ghost-text color, approximating the ANSI "bright black"
+/// convention fish/zsh use for inline suggestions.
+///
+/// `ghostty_vt` has no FFI to query an arbitrary numbered palette entry —
+/// only the resolved per-cell `fg`/`bg` a row already carries (see
+/// `StyleRun`) and the terminal's configured default fg/bg (see
+/// `TerminalSession::default_foreground`/`default_background`) are exposed.
+/// Adding a palette-index query would mean new `ghostty_vt`/C-FFI surface,
+/// out of scope for wiring up rendering of an already-computed suggestion.
+/// Blending the default foreground 55% toward the default background gives
+/// a muted grey that tracks the active theme (dark-on-light or
+/// light-on-dark) without a real palette lookup.
+fn ghost_text_color(fg: Rgb, bg: Rgb) -> gpui::Hsla {
+    const TOWARD_BG: f32 = 0.55;
+    let mix = |a: u8, b: u8| -> u8 {
+        (f32::from(a) * (1.0 - TOWARD_BG) + f32::from(b) * TOWARD_BG).round() as u8
+    };
+    hsla_from_rgb(Rgb {
+        r: mix(fg.r, bg.r),
+        g: mix(fg.g, bg.g),
+        b: mix(fg.b, bg.b),
+    })
 }
 
 fn font_for_flags(base: &gpui::Font, flags: u8) -> gpui::Font {
@@ -4341,6 +4383,85 @@ impl Element for TerminalTextElement {
             ))
         });
 
+        // Autosuggest ghost text (Task 8): shape the suffix here — paint
+        // only draws it. Reuses `cursor_position` (already fetched above
+        // for marked-text) instead of re-querying the session: the
+        // invariant in `extract_input_prefix` guarantees the typed prefix
+        // is single-row with the cursor sitting exactly at its end, so
+        // "where typed text ends" and "the cursor" are the same cell
+        // whenever a suggestion is showing. Gated on the same live-bottom
+        // check the cursor quad uses above (via the cached `scroll_pos`, no
+        // new session call) so ghost text disappears the instant the user
+        // scrolls into scrollback — mirrors Task 7's alt-screen/dismissed-
+        // prefix gating already baked into `self.suggestion` itself.
+        let suggestion = {
+            let view = self.view.read(cx);
+            let at_live_bottom = view.scroll_pos.is_none_or(|p| {
+                u64::from(p.viewport_top) + u64::from(p.viewport_rows) >= u64::from(p.total_rows)
+            });
+            at_live_bottom.then(|| view.suggestion_suffix().map(str::to_string))
+        }
+        .flatten()
+        .zip(cursor_position)
+        .and_then(|(suffix, (col, row))| {
+            // v1 scope (see `extract_input_prefix`) is ASCII-only for the
+            // typed prefix; the provider-supplied suffix isn't constrained
+            // by that check, so guard here too — a wide/multibyte char
+            // would desync the cell-based truncation below (and risks
+            // slicing off a UTF-8 byte boundary).
+            if !suffix.is_ascii() {
+                return None;
+            }
+
+            let row_idx = row.saturating_sub(1) as usize;
+            let line = shaped_lines.get(row_idx)?;
+            let line_cols = {
+                use unicode_width::UnicodeWidthStr as _;
+                line.text.as_str().width()
+            };
+            let cw = cell_width.unwrap_or(px(8.0));
+            // Same column→x mapping as the cursor quad above: exact glyph
+            // position within the shaped text, whole-cell steps past it.
+            let x = if (col as usize) <= line_cols {
+                let byte_index = byte_index_for_column_in_line(line.text.as_str(), col);
+                bounds.left() + line.x_for_index(byte_index.min(line.text.len()))
+            } else {
+                let past_cells = (col as usize - 1 - line_cols) as f32;
+                bounds.left() + line.width() + cw * past_cells
+            };
+            let y = bounds.top() + line_height * row_idx as f32;
+
+            // Truncate so the suffix can't render under the (semi-
+            // transparent) scrollbar track, which would look like bleed —
+            // `TRACK_WIDTH + TRACK_RIGHT_GAP` from `compute_scrollbar_layout`,
+            // reserved unconditionally since the scrollbar Option below
+            // isn't computed until after this block runs.
+            const SCROLLBAR_GUTTER: Pixels = px(7.0);
+            let max_width = (bounds.right() - SCROLLBAR_GUTTER - x).max(px(0.0));
+            let max_chars = (f32::from(max_width) / f32::from(cw.max(px(1.0)))).floor() as usize;
+            let suffix = &suffix[..max_chars.min(suffix.len())];
+            if suffix.is_empty() {
+                return None;
+            }
+
+            let color = ghost_text_color(default_fg, default_bg);
+            let run = TextRun {
+                len: suffix.len(),
+                font: run_font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window.text_system().shape_line(
+                SharedString::from(suffix.to_string()),
+                font_size,
+                &[run],
+                cell_width,
+            );
+            Some((shaped, point(x, y)))
+        });
+
         let (pixel_offset, peek_line) = {
             let view = self.view.read(cx);
             (px(view.pixel_offset), view.peek_layout.clone())
@@ -4385,6 +4506,7 @@ impl Element for TerminalTextElement {
             box_drawing_quads,
             marked_text,
             marked_text_background,
+            suggestion,
             cursor,
             peek_line,
             peek_background_quads,
