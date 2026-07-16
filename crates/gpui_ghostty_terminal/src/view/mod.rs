@@ -668,6 +668,13 @@ type TerminalSendFn = dyn Fn(&[u8]) + Send + Sync + 'static;
 /// Resolution policy (cwd, `~`, existence) is entirely the host's.
 pub type PathResolver = Box<dyn Fn(&str) -> Option<std::path::PathBuf>>;
 
+/// Host-injected shell-history lookup for terminal autosuggest. Receives
+/// the text typed so far at the prompt (the "prefix") and returns the
+/// **suffix** to ghost-render after the cursor, or `None` for no match.
+/// Called only from [`TerminalView::refresh_suggestion`] (on new PTY
+/// output), never from a render/paint path.
+pub type SuggestionProvider = Box<dyn Fn(&str) -> Option<String>>;
+
 /// Emitted when the user Cmd+clicks a file path that the installed
 /// [`PathResolver`] mapped to a real file. The host decides how to open it.
 #[derive(Clone, Debug)]
@@ -800,6 +807,27 @@ pub struct TerminalView {
     /// Active scrollbar-thumb drag: vertical offset in pixels from the
     /// thumb's top edge to the grab point. `None` when not dragging.
     scrollbar_drag: Option<f32>,
+    /// Host-injected history lookup for ghost-text autosuggest. `None`
+    /// (default) disables the feature entirely — `suggestion` then never
+    /// becomes `Some`.
+    suggestion_provider: Option<SuggestionProvider>,
+    /// Current autosuggest match: `(prefix_at_match, suffix)`. The prefix
+    /// is what the user had typed when the provider was queried (or last
+    /// passively revalidated); the suffix is the ghost text to render
+    /// after the cursor. Recomputed by [`Self::refresh_suggestion`], never
+    /// touched during render/paint.
+    suggestion: Option<(String, String)>,
+    /// Prefix the user Esc-dismissed the suggestion for. Suppresses the
+    /// provider for exactly this prefix; cleared once the prefix changes
+    /// (including shrinking back to empty).
+    dismissed_prefix: Option<String>,
+    /// Most recent non-empty [`Self::current_input_prefix`] observed while
+    /// input was live. Captured on every [`Self::refresh_suggestion`] call
+    /// so it survives past the point `CommandStart` clears the VT's input
+    /// anchor — see [`TerminalSession::drain_events`] for why the capture
+    /// must happen before draining. Consumed (via `take`) when forwarding
+    /// `CommandStart` to the host.
+    last_input_snapshot: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -868,6 +896,10 @@ impl TerminalView {
             copy_on_select: false,
             scrollbar_layout: None,
             scrollbar_drag: None,
+            suggestion_provider: None,
+            suggestion: None,
+            dismissed_prefix: None,
+            last_input_snapshot: None,
         }
         .with_refreshed_viewport()
     }
@@ -931,6 +963,10 @@ impl TerminalView {
             copy_on_select: false,
             scrollbar_layout: None,
             scrollbar_drag: None,
+            suggestion_provider: None,
+            suggestion: None,
+            dismissed_prefix: None,
+            last_input_snapshot: None,
         }
         .with_refreshed_viewport()
     }
@@ -1429,9 +1465,101 @@ impl TerminalView {
         if let Some(text) = self.session.take_clipboard_write() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        // Recompute suggestion state (and snapshot the input-so-far for
+        // command capture) *before* draining. `TerminalSession::drain_events`
+        // clears `input_anchor` as soon as it observes CommandStart /
+        // CommandEnd in this batch — anything downstream that needs the
+        // pre-boundary anchor must read it first. See that method's doc
+        // comment for the same contract from the session side.
+        self.refresh_suggestion(cx);
         for event in self.session.drain_events() {
+            let event = match event {
+                ghostty_vt::TerminalEvent::CommandStart { .. } => {
+                    // The line just submitted is done being "input" — turn
+                    // off ghost text and hand the captured command to the
+                    // host on this same event.
+                    self.suggestion = None;
+                    ghostty_vt::TerminalEvent::CommandStart {
+                        cmd: self.last_input_snapshot.take(),
+                    }
+                }
+                other => other,
+            };
             cx.emit(event);
         }
+    }
+
+    /// True when the viewport's bottom edge touches the live screen — i.e.
+    /// we're not scrolled up into scrollback. Same formula the paint code
+    /// uses to gate cursor visibility, but read fresh from the session
+    /// rather than the paint-cycle `scroll_pos` cache: `apply_side_effects`
+    /// (and thus this) runs on feed, before that cache is refreshed.
+    fn at_live_bottom(&self) -> bool {
+        self.session.scroll_position().is_none_or(|p| {
+            u64::from(p.viewport_top) + u64::from(p.viewport_rows) >= u64::from(p.total_rows)
+        })
+    }
+
+    /// Text the user has typed at the prompt so far: grid content from the
+    /// input anchor to the cursor, restricted to a single row. `None` when
+    /// there's no anchor, input has wrapped/gone multiline, the cursor
+    /// sits mid-line (user navigated left), or the row can't be modeled in
+    /// v1 — see [`extract_input_prefix`].
+    fn current_input_prefix(&self) -> Option<String> {
+        let anchor = self.session.input_anchor()?;
+        let cursor = self.session.cursor_position()?;
+        // `dump_viewport_row` takes a 0-based row index; `input_anchor` /
+        // `cursor_position` are 1-based — same convention the cursor-paint
+        // code uses (`row.saturating_sub(1)` there).
+        let line = self
+            .session
+            .dump_viewport_row(anchor.1.saturating_sub(1))
+            .ok()?;
+        extract_input_prefix(anchor, cursor, &line)
+    }
+
+    /// Recompute the autosuggest state and the input-capture snapshot.
+    /// Called once per fed batch, from [`Self::apply_side_effects`] —
+    /// never from render/paint. Provider calls only ever happen here.
+    fn refresh_suggestion(&mut self, cx: &mut Context<Self>) {
+        let prefix = self.current_input_prefix();
+        if let Some(p) = prefix.as_deref().filter(|p| !p.is_empty()) {
+            self.last_input_snapshot = Some(p.to_string());
+        }
+
+        let had = self.suggestion.is_some();
+        self.suggestion = self.compute_suggestion(prefix);
+        if had != self.suggestion.is_some() || had {
+            cx.notify();
+        }
+    }
+
+    fn compute_suggestion(&mut self, prefix: Option<String>) -> Option<(String, String)> {
+        let provider = self.suggestion_provider.as_ref()?;
+        if self.session.alternate_screen_active() || !self.at_live_bottom() {
+            return None;
+        }
+        let prefix = prefix?;
+        if prefix.is_empty() {
+            self.dismissed_prefix = None;
+            return None;
+        }
+        if self.dismissed_prefix.as_deref() == Some(prefix.as_str()) {
+            return None; // Esc-dismissed until the prefix changes
+        }
+        self.dismissed_prefix = None;
+        // Passive revalidation: the user typed chars that extend into the
+        // suggestion already shown — shrink the suffix instead of
+        // re-querying the provider (covers fast typing and multi-char
+        // paste alike, since it's just a prefix-of-`full` check).
+        if let Some((old_prefix, old_suffix)) = &self.suggestion {
+            let full = format!("{old_prefix}{old_suffix}");
+            if full.starts_with(&prefix) && full.len() > prefix.len() {
+                return Some((prefix.clone(), full[prefix.len()..].to_string()));
+            }
+        }
+        let suffix = provider(&prefix)?;
+        (!suffix.is_empty()).then_some((prefix, suffix))
     }
 
     pub fn feed_output_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -1610,6 +1738,34 @@ impl TerminalView {
     /// disables path-link detection entirely (hover underline + click).
     pub fn set_path_resolver(&mut self, resolver: Option<PathResolver>) {
         self.path_resolver = resolver;
+    }
+
+    /// Install (or clear) the host-injected autosuggest history lookup.
+    /// `None` disables ghost-text suggestions entirely and clears any
+    /// suggestion currently shown.
+    pub fn set_suggestion_provider(&mut self, provider: Option<SuggestionProvider>) {
+        self.suggestion_provider = provider;
+        if self.suggestion_provider.is_none() {
+            self.suggestion = None;
+        }
+    }
+
+    /// The ghost-text suffix to render after the cursor, if any. `None`
+    /// means: no provider installed, no match, alt-screen, scrolled into
+    /// history, or the current prefix was Esc-dismissed.
+    pub fn suggestion_suffix(&self) -> Option<&str> {
+        self.suggestion.as_ref().map(|(_, suffix)| suffix.as_str())
+    }
+
+    /// Dismiss the current suggestion (e.g. bound to Esc by the host).
+    /// The provider won't be re-queried for this exact prefix again until
+    /// it changes — see the `dismissed_prefix` check in
+    /// [`Self::compute_suggestion`].
+    pub fn dismiss_suggestion(&mut self, cx: &mut Context<Self>) {
+        if let Some((prefix, _)) = self.suggestion.take() {
+            self.dismissed_prefix = Some(prefix);
+            cx.notify();
+        }
     }
 
     /// Update the terminal font size at runtime. Cell metrics will be
@@ -3323,6 +3479,49 @@ pub(crate) fn byte_index_for_column_in_line(line: &str, col: u16) -> usize {
     line.len()
 }
 
+/// Pure core of [`TerminalView::current_input_prefix`] — split out so it's
+/// unit-testable without a live `TerminalSession`/GPUI context. `anchor`
+/// and `cursor` are 1-based `(col, row)`, matching
+/// [`TerminalSession::input_anchor`] / [`TerminalSession::cursor_position`];
+/// `line` is the anchor row's text as returned by `dump_viewport_row`
+/// (caller already converted the 1-based row to that method's 0-based
+/// index).
+fn extract_input_prefix(anchor: (u16, u16), cursor: (u16, u16), line: &str) -> Option<String> {
+    let (acol, arow) = anchor;
+    let (ccol, crow) = cursor;
+    if crow != arow || ccol < acol {
+        return None; // wrapped/multiline input, or cursor before the anchor
+    }
+
+    // v1 constraint: cells map 1:1 to `chars()` indices only for narrow
+    // (display-width-1) glyphs. A wide CJK/emoji cell would desync the
+    // column count from the char index (see `byte_index_for_column_in_line`
+    // above for the general column→byte mapping selection/cursor rendering
+    // use). Rather than replicate that width-walking for an in-progress
+    // prompt line, bail out on any non-ASCII row — no suggestion/capture
+    // for input lines containing wide or combining characters yet.
+    if !line.is_ascii() {
+        return None;
+    }
+
+    let chars: Vec<char> = line.chars().collect();
+    let cursor_idx = ccol.saturating_sub(1) as usize;
+    let anchor_idx = acol.saturating_sub(1) as usize;
+
+    // Cursor must sit at the end of the typed text — nothing but blanks
+    // after it. Mid-line editing (cursor moved left of the last typed
+    // char) is out of v1 scope.
+    if chars
+        .get(cursor_idx..)
+        .is_some_and(|rest| rest.iter().any(|c| !c.is_whitespace()))
+    {
+        return None;
+    }
+
+    let text: String = chars.get(anchor_idx..cursor_idx)?.iter().collect();
+    Some(text.trim_end().to_string())
+}
+
 /// Build the GPUI [`TextRun`] sequence for a single terminal row from its
 /// raw text and per-cell style runs. Extracted so it can be shared by the
 /// main viewport shaping loop and the peek-row shaper.
@@ -4395,9 +4594,9 @@ mod tests {
     use ghostty_vt::Rgb;
 
     use super::{
-        char_drawn_as_quad, path_range_at_byte_index, path_token_at_cell_in_wrapped_lines,
-        strip_quad_glyphs_for_shaping, url_at_byte_index, url_at_cell_in_wrapped_lines,
-        url_spans_at_cell_in_wrapped_lines, window_position_to_local,
+        char_drawn_as_quad, extract_input_prefix, path_range_at_byte_index,
+        path_token_at_cell_in_wrapped_lines, strip_quad_glyphs_for_shaping, url_at_byte_index,
+        url_at_cell_in_wrapped_lines, url_spans_at_cell_in_wrapped_lines, window_position_to_local,
     };
 
     #[test]
@@ -4610,5 +4809,60 @@ mod tests {
         });
         assert!(cursor.l > 0.8);
         assert!((cursor.a - 0.72).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn input_prefix_extracted_from_anchor_to_cursor() {
+        // Anchor at col 3 (right after "$ "), cursor at col 5 (right after
+        // "gi", 0-based index == line length) -> "gi" typed.
+        assert_eq!(
+            extract_input_prefix((3, 1), (5, 1), "$ gi").as_deref(),
+            Some("gi")
+        );
+    }
+
+    #[test]
+    fn input_prefix_none_without_anchor_row_match() {
+        // Cursor has moved to a different row than the anchor — wrapped or
+        // multiline input, out of v1 scope.
+        assert!(extract_input_prefix((3, 1), (5, 2), "$ gi").is_none());
+    }
+
+    #[test]
+    fn input_prefix_none_when_cursor_before_anchor() {
+        assert!(extract_input_prefix((6, 1), (3, 1), "$ gi").is_none());
+    }
+
+    #[test]
+    fn input_prefix_none_with_mid_line_cursor() {
+        // Cursor sits before the end of typed text (user pressed Left) —
+        // there's non-blank content after the cursor on the row.
+        assert!(extract_input_prefix((3, 1), (5, 1), "$ git").is_none());
+    }
+
+    #[test]
+    fn input_prefix_none_on_non_ascii_row() {
+        // v1 bail-out: wide/combining glyphs would desync col vs. char
+        // index, so any non-ASCII row is rejected wholesale.
+        assert!(extract_input_prefix((3, 1), (6, 1), "$ 日本").is_none());
+    }
+
+    #[test]
+    fn input_prefix_trims_trailing_blanks() {
+        // Cursor sits past the trimmed text (typed a trailing space) —
+        // still valid, and the trailing whitespace is trimmed from the
+        // returned prefix.
+        assert_eq!(
+            extract_input_prefix((3, 1), (7, 1), "$ git ").as_deref(),
+            Some("git")
+        );
+    }
+
+    #[test]
+    fn input_prefix_empty_right_after_anchor() {
+        assert_eq!(
+            extract_input_prefix((3, 1), (3, 1), "$ ").as_deref(),
+            Some("")
+        );
     }
 }

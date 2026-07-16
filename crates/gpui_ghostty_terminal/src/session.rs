@@ -534,6 +534,12 @@ impl TerminalSession {
     /// bell, shell-integration prompt/input markers). The internal queue is
     /// cleared. Also updates [`Self::input_anchor`] from `InputStart` /
     /// `CommandStart` / `CommandEnd` as they're observed here.
+    ///
+    /// Ordering contract: the anchor is cleared as part of *this* call, for
+    /// every `CommandStart`/`CommandEnd` in the drained batch — a caller
+    /// that needs the pre-boundary anchor (e.g. to capture the input line
+    /// that was just submitted) must read [`Self::input_anchor`] (or
+    /// anything derived from it) *before* calling `drain_events`, not after.
     pub fn drain_events(&mut self) -> Vec<ghostty_vt::TerminalEvent> {
         let events = self.terminal.drain_events();
         for event in &events {
@@ -543,7 +549,7 @@ impl TerminalSession {
                     // the start-of-input anchor.
                     self.input_anchor = self.cursor_position();
                 }
-                ghostty_vt::TerminalEvent::CommandStart
+                ghostty_vt::TerminalEvent::CommandStart { .. }
                 | ghostty_vt::TerminalEvent::CommandEnd { .. } => {
                     // Input is over (command about to run) or already ran —
                     // the anchor no longer describes an in-progress input

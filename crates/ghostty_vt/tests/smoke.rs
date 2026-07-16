@@ -52,7 +52,7 @@ fn osc_133_full_prompt_cycle_drains_in_order() {
         vec![
             TerminalEvent::PromptStart,
             TerminalEvent::InputStart,
-            TerminalEvent::CommandStart
+            TerminalEvent::CommandStart { cmd: None }
         ]
     );
 

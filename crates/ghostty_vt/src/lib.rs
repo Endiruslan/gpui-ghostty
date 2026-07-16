@@ -72,8 +72,12 @@ pub enum TerminalEvent {
     /// empty depending on which form the program used.
     Notification { title: String, body: String },
     /// Shell integration: a new prompt has started. Marks the boundary
-    /// between previous output and the next user command.
-    CommandStart,
+    /// between previous output and the next user command. `cmd` is always
+    /// `None` at this layer (the VT parser has no notion of "what the user
+    /// typed") — it's filled in by the consumer that tracks the input
+    /// grid (see `gpui_ghostty_terminal::view::TerminalView::apply_side_effects`)
+    /// before the event reaches the host.
+    CommandStart { cmd: Option<String> },
     /// Shell integration: a command has finished. `exit_code` may be 0 if
     /// the shell did not include an explicit exit code.
     CommandEnd { exit_code: u8 },
@@ -534,7 +538,7 @@ fn parse_event_stream(mut buf: &[u8]) -> Vec<TerminalEvent> {
                 buf = &buf[body_len..];
                 out.push(TerminalEvent::Notification { title, body });
             }
-            0x02 => out.push(TerminalEvent::CommandStart),
+            0x02 => out.push(TerminalEvent::CommandStart { cmd: None }),
             0x03 => {
                 if buf.is_empty() {
                     break;
