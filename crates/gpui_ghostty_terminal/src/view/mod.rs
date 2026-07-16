@@ -1533,8 +1533,21 @@ impl TerminalView {
     /// never from render/paint. Provider calls only ever happen here.
     fn refresh_suggestion(&mut self, cx: &mut Context<Self>) {
         let prefix = self.current_input_prefix();
-        if let Some(p) = prefix.as_deref().filter(|p| !p.is_empty()) {
-            self.last_input_snapshot = Some(p.to_string());
+        match prefix.as_deref() {
+            Some(p) if !p.is_empty() => {
+                self.last_input_snapshot = Some(p.to_string());
+            }
+            Some(_) => {
+                // Prefix extracted cleanly but is empty — input was erased
+                // (backspaced to nothing, or Ctrl+C cleared the line).
+                // Nothing to capture; clear any stale snapshot so a
+                // subsequent Enter doesn't record a phantom history entry.
+                self.last_input_snapshot = None;
+            }
+            None => {
+                // Row-bail (e.g. anchor/cursor/row lookup failed this
+                // frame) — keep whatever snapshot we already have.
+            }
         }
 
         let had = self.suggestion.is_some();
