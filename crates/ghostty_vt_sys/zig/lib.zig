@@ -21,6 +21,8 @@ const TerminalHandle = struct {
     ///   0x02 CommandStart: no payload
     ///   0x03 CommandEnd:   exit_code(u8)
     ///   0x04 Bell:         no payload
+    ///   0x05 PromptStart:  no payload  (OSC 133;A)
+    ///   0x06 InputStart:   no payload  (OSC 133;B)
     events: std.ArrayList(u8),
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
@@ -101,6 +103,13 @@ const Handler = struct {
 
             .semantic_prompt => {
                 switch (value.action) {
+                    // OSC 133;A — a fresh prompt is about to be drawn. The
+                    // canonical "prompt start" signal in semantic-prompt
+                    // shell integrations (zsh precmd, fish fish_prompt, …).
+                    .fresh_line_new_prompt => try self.handle.events.append(self.handle.alloc, 0x05),
+                    // OSC 133;B — prompt finished drawing, user input is
+                    // about to begin. Cursor sits right after the prompt.
+                    .end_prompt_start_input => try self.handle.events.append(self.handle.alloc, 0x06),
                     // OSC 133;C — user hit enter, command is about to
                     // execute. The canonical "command start" signal in
                     // semantic-prompt shell integrations (zsh preexec,

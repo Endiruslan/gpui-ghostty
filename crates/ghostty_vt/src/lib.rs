@@ -80,6 +80,11 @@ pub enum TerminalEvent {
     /// BEL (\x07) — usually a beep, but some agents use it as a generic
     /// "done" signal.
     Bell,
+    /// Shell integration (OSC 133;A): a fresh prompt is about to be drawn.
+    PromptStart,
+    /// Shell integration (OSC 133;B): the prompt finished drawing and user
+    /// input is about to begin. The cursor sits right after the prompt.
+    InputStart,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -539,6 +544,8 @@ fn parse_event_stream(mut buf: &[u8]) -> Vec<TerminalEvent> {
                 out.push(TerminalEvent::CommandEnd { exit_code });
             }
             0x04 => out.push(TerminalEvent::Bell),
+            0x05 => out.push(TerminalEvent::PromptStart),
+            0x06 => out.push(TerminalEvent::InputStart),
             _ => {
                 // Unknown tag — bail to avoid mis-aligning.
                 break;

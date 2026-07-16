@@ -17,6 +17,15 @@ pub struct TerminalSession {
     /// screen has no scrollback, so local scrollback scrolling must be
     /// suppressed while it's active.
     alternate_screen_active: bool,
+    /// Cursor position (1-based `(col, row)`) captured the moment
+    /// [`ghostty_vt::TerminalEvent::InputStart`] (OSC 133;B) is drained —
+    /// the cursor sits right after the shell's prompt, at the start of
+    /// whatever the user is about to type. Cleared on `CommandStart`,
+    /// `CommandEnd` (both OSC 133), alt-screen entry, resize, and hard
+    /// reset — all cases where the anchor no longer describes "where input
+    /// begins" for the current line. Consumed by prefix-extraction for
+    /// terminal history autosuggest.
+    input_anchor: Option<(u16, u16)>,
     /// DECCKM (mode 1): cursor keys send SS3 (`ESC O A`) instead of CSI
     /// (`ESC [ A`). Needed to emit the right arrow-key encoding for
     /// alternate-scroll wheel translation.
@@ -49,6 +58,7 @@ impl TerminalSession {
             mouse_any_event_enabled: false,
             mouse_sgr_enabled: false,
             alternate_screen_active: false,
+            input_anchor: None,
             application_cursor_keys: false,
             mouse_alternate_scroll: true,
             title: None,
@@ -305,7 +315,15 @@ impl TerminalSession {
                         match ps {
                             1 => self.application_cursor_keys = enabled,
                             25 => self.cursor_visible = enabled,
-                            47 | 1047 | 1049 => self.alternate_screen_active = enabled,
+                            47 | 1047 | 1049 => {
+                                self.alternate_screen_active = enabled;
+                                if enabled {
+                                    // Entering the alt screen (fullscreen
+                                    // TUI) — the anchor no longer refers to
+                                    // a shell prompt on the primary screen.
+                                    self.input_anchor = None;
+                                }
+                            }
                             1007 => self.mouse_alternate_scroll = enabled,
                             2004 => self.bracketed_paste_enabled = enabled,
                             2026 => self.synchronized_output_active = enabled,
@@ -509,12 +527,34 @@ impl TerminalSession {
     /// Hard reset of terminal state. See [`ghostty_vt::Terminal::full_reset`].
     pub fn full_reset(&mut self) {
         self.terminal.full_reset();
+        self.input_anchor = None;
     }
 
     /// Drain queued OSC / control events (notifications, command boundaries,
-    /// bell). The internal queue is cleared.
+    /// bell, shell-integration prompt/input markers). The internal queue is
+    /// cleared. Also updates [`Self::input_anchor`] from `InputStart` /
+    /// `CommandStart` / `CommandEnd` as they're observed here.
     pub fn drain_events(&mut self) -> Vec<ghostty_vt::TerminalEvent> {
-        self.terminal.drain_events()
+        let events = self.terminal.drain_events();
+        for event in &events {
+            match event {
+                ghostty_vt::TerminalEvent::InputStart => {
+                    // Cursor sits right after the prompt — snapshot it as
+                    // the start-of-input anchor.
+                    self.input_anchor = self.cursor_position();
+                }
+                ghostty_vt::TerminalEvent::CommandStart
+                | ghostty_vt::TerminalEvent::CommandEnd { .. } => {
+                    // Input is over (command about to run) or already ran —
+                    // the anchor no longer describes an in-progress input
+                    // line. Any consumer that needs it must have already
+                    // read it before this point.
+                    self.input_anchor = None;
+                }
+                _ => {}
+            }
+        }
+        events
     }
 
     pub fn cursor_position(&self) -> Option<(u16, u16)> {
@@ -536,7 +576,16 @@ impl TerminalSession {
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Error> {
         self.config.cols = cols;
         self.config.rows = rows;
+        self.input_anchor = None;
         self.terminal.resize(cols, rows)
+    }
+
+    /// Cursor position (1-based `(col, row)`) captured when `InputStart`
+    /// (OSC 133;B) was last drained — i.e. where the user's current input
+    /// line begins. `None` if no prompt has started input yet, or if it was
+    /// cleared by a command boundary, alt-screen entry, resize, or reset.
+    pub fn input_anchor(&self) -> Option<(u16, u16)> {
+        self.input_anchor
     }
 
     pub(crate) fn take_dirty_viewport_rows(&mut self) -> Vec<u16> {
