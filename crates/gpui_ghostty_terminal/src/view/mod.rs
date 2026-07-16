@@ -1483,6 +1483,12 @@ impl TerminalView {
                         cmd: self.last_input_snapshot.take(),
                     }
                 }
+                ghostty_vt::TerminalEvent::InputStart => {
+                    // New prompt boundary — invalidate stale input snapshot
+                    // so it's not incorrectly captured on the next CommandStart.
+                    self.last_input_snapshot = None;
+                    ghostty_vt::TerminalEvent::InputStart
+                }
                 other => other,
             };
             cx.emit(event);
