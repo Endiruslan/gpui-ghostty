@@ -915,9 +915,13 @@ impl TerminalView {
     fn send_tab(&mut self, reverse: bool, cx: &mut Context<Self>) {
         if reverse {
             self.send_input_parts(&[b"\x1b[Z"], cx);
-        } else {
-            self.send_input_parts(&[b"\t"], cx);
+            return;
         }
+        if let Some((_, suffix)) = self.suggestion.take() {
+            self.send_input_parts(&[suffix.as_bytes()], cx);
+            return;
+        }
+        self.send_input_parts(&[b"\t"], cx);
     }
 
     pub fn new_with_input(
@@ -1763,17 +1767,6 @@ impl TerminalView {
         self.suggestion.as_ref().map(|(_, suffix)| suffix.as_str())
     }
 
-    /// Dismiss the current suggestion (e.g. bound to Esc by the host).
-    /// The provider won't be re-queried for this exact prefix again until
-    /// it changes — see the `dismissed_prefix` check in
-    /// [`Self::compute_suggestion`].
-    pub fn dismiss_suggestion(&mut self, cx: &mut Context<Self>) {
-        if let Some((prefix, _)) = self.suggestion.take() {
-            self.dismissed_prefix = Some(prefix);
-            cx.notify();
-        }
-    }
-
     /// Update the terminal font size at runtime. Cell metrics will be
     /// re-derived on the next render frame; the host should follow this
     /// with a `resize_terminal` call so the PTY learns about the new
@@ -2194,6 +2187,15 @@ impl TerminalView {
             return;
         }
         let keystroke = raw_keystroke.with_simulated_ime();
+
+        if keystroke.key.as_str() == "escape"
+            && let Some((prefix, _)) = self.suggestion.take()
+        {
+            self.dismissed_prefix = Some(prefix);
+            cx.notify();
+            // Dismissal is a side effect only — fall through so the escape
+            // byte still reaches the pty via the normal encode path below.
+        }
 
         if keystroke.modifiers.platform || keystroke.modifiers.function {
             // Cmd+Backspace = kill line backward. Shells have no escape
