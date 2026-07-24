@@ -2,10 +2,11 @@ use super::TerminalSession;
 use ghostty_vt::{KeyModifiers, Rgb, StyleRun, encode_key_named};
 use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
-    EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyBinding, KeyDownEvent,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Style, TextRun, TouchPhase, UTF16Selection,
-    UnderlineStyle, Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size,
+    EntityInputHandler, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, IntoElement,
+    KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, Style, TextRun,
+    TouchPhase, UTF16Selection, UnderlineStyle, Window, actions, div, fill, hsla, point,
+    prelude::*, px, relative, rgba, size,
 };
 use std::ops::Range;
 use std::sync::Once;
@@ -2947,6 +2948,10 @@ struct TerminalPrepaintState {
     /// content + cursor, on top, without `pixel_offset` translation since
     /// the scrollbar lives in viewport-relative space.
     scrollbar: Option<ScrollbarQuads>,
+    /// Hitbox over the scrollbar's grab area ([`ScrollbarLayout::hit_bounds`]),
+    /// used in paint to swap the I-beam text cursor for an arrow while the
+    /// pointer is on the bar. `None` whenever the scrollbar isn't drawn.
+    scrollbar_hitbox: Option<Hitbox>,
 }
 
 fn paint_terminal_contents(
@@ -3781,11 +3786,22 @@ impl ScrollbarLayout {
     /// changing the visuals.
     const HIT_SLOP_LEFT: f32 = 8.0;
 
+    /// The grab rectangle: the visual track widened left by `HIT_SLOP_LEFT`
+    /// plus a pixel on the right so the window edge counts. Shared by
+    /// hit-testing and the cursor-shape hitbox, so the pointer switches to an
+    /// arrow over exactly the area where a click grabs the bar.
+    fn hit_bounds(&self) -> Bounds<Pixels> {
+        let left = self.track.left() - px(Self::HIT_SLOP_LEFT);
+        let right = self.track.right() + px(1.0);
+        Bounds::new(
+            point(left, self.track.top()),
+            size(right - left, self.track.size.height),
+        )
+    }
+
     fn hit_track(&self, p: gpui::Point<Pixels>) -> bool {
-        p.y >= self.track.top()
-            && p.y <= self.track.bottom()
-            && p.x >= self.track.left() - px(Self::HIT_SLOP_LEFT)
-            && p.x <= self.track.right() + px(1.0)
+        let b = self.hit_bounds();
+        p.y >= b.top() && p.y <= b.bottom() && p.x >= b.left() && p.x <= b.right()
     }
 
     fn hit_thumb(&self, p: gpui::Point<Pixels>) -> bool {
@@ -3795,8 +3811,10 @@ impl ScrollbarLayout {
 
 /// Compute the track + proportional thumb for the right-side scrollbar.
 ///
-/// Layout: a 6 px track flush to the right edge with a 1 px gap, semi-
-/// transparent so it doesn't compete with terminal content. The thumb's
+/// Layout: a 6 px track flush against the right edge of the terminal's
+/// bounds, semi-transparent so it doesn't compete with terminal content.
+/// No gap — a split pane's bar would otherwise float off its divider. The
+/// thumb's
 /// height is proportional to `viewport_rows / total_rows` (with a 24 px
 /// minimum so it stays grabbable on tall scrollbacks) and its top is
 /// proportional to `viewport_top / scrollable_range`.
@@ -3805,10 +3823,9 @@ fn compute_scrollbar_layout(
     pos: ghostty_vt::ScrollPosition,
 ) -> ScrollbarLayout {
     const TRACK_WIDTH: f32 = 6.0;
-    const TRACK_RIGHT_GAP: f32 = 1.0;
     const MIN_THUMB_HEIGHT: f32 = 24.0;
 
-    let track_x = bounds.right() - px(TRACK_WIDTH + TRACK_RIGHT_GAP);
+    let track_x = bounds.right() - px(TRACK_WIDTH);
     let track_w = px(TRACK_WIDTH);
     let track_y = bounds.top();
     let track_h = bounds.size.height;
@@ -4448,10 +4465,10 @@ impl Element for TerminalTextElement {
 
             // Truncate so the suffix can't render under the (semi-
             // transparent) scrollbar track, which would look like bleed —
-            // `TRACK_WIDTH + TRACK_RIGHT_GAP` from `compute_scrollbar_layout`,
-            // reserved unconditionally since the scrollbar Option below
-            // isn't computed until after this block runs.
-            const SCROLLBAR_GUTTER: Pixels = px(7.0);
+            // `TRACK_WIDTH` from `compute_scrollbar_layout`, reserved
+            // unconditionally since the scrollbar Option below isn't
+            // computed until after this block runs.
+            const SCROLLBAR_GUTTER: Pixels = px(6.0);
             let max_width = (bounds.right() - SCROLLBAR_GUTTER - x).max(px(0.0));
             let max_chars = (f32::from(max_width) / f32::from(cw.max(px(1.0)))).floor() as usize;
             let suffix = &suffix[..max_chars.min(suffix.len())];
@@ -4505,6 +4522,16 @@ impl Element for TerminalTextElement {
             layout.map(|l| build_scrollbar_quads(&l))
         });
 
+        // Hitbox over the same grab area the click/drag handlers use, so paint
+        // can override the pane's I-beam with an arrow while the pointer is on
+        // the bar. `HitboxBehavior::Normal` — it only names a region for the
+        // cursor lookup, mouse events still reach the terminal underneath.
+        let scrollbar_hitbox = self
+            .view
+            .read(cx)
+            .scrollbar_layout
+            .map(|l| window.insert_hitbox(l.hit_bounds(), HitboxBehavior::Normal));
+
         let prepaint_us = _prepaint_start.elapsed().as_micros() as u64;
         SCROLL_STATS.prepaint_calls.fetch_add(1, Ordering::Relaxed);
         SCROLL_STATS
@@ -4527,6 +4554,7 @@ impl Element for TerminalTextElement {
             peek_background_quads,
             peek_box_drawing_quads,
             scrollbar,
+            scrollbar_hitbox,
         }
     }
 
@@ -4588,6 +4616,14 @@ impl Element for TerminalTextElement {
         // their own handlers with disjoint hit targets).
         if let Some(layout) = self.view.read(cx).scrollbar_layout {
             register_scrollbar_mouse_handlers(&self.view, layout, window);
+        }
+
+        // Arrow instead of the pane's I-beam over the bar: the scrollbar is a
+        // widget, not text. Registered here (after the host div's own cursor
+        // request) because GPUI resolves cursor styles last-registered-first
+        // (`Frame::cursor_style` in gpui/src/window.rs).
+        if let Some(hitbox) = prepaint.scrollbar_hitbox.as_ref() {
+            window.set_cursor_style(gpui::CursorStyle::Arrow, hitbox);
         }
 
         let paint_us = paint_start.elapsed().as_micros() as u64;
