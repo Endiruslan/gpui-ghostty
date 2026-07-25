@@ -89,23 +89,14 @@ pub enum TerminalEvent {
     /// Shell integration (OSC 133;B): the prompt finished drawing and user
     /// input is about to begin. The cursor sits right after the prompt.
     InputStart,
-    /// OSC 9;4 (ConEmu progress report). `progress` is `None` when the
-    /// program didn't send a percentage (e.g. `remove` / `indeterminate`).
-    ProgressReport {
-        state: ProgressState,
-        progress: Option<u8>,
-    },
-}
-
-/// `osc.Command.ProgressReport.State` (ConEmu OSC 9;4), in ghostty's
-/// declaration order — see `vendor/ghostty/src/terminal/osc.zig:199-204`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProgressState {
-    Remove,
-    Set,
-    Error,
-    Indeterminate,
-    Pause,
+    /// OSC 9;4 (ConEmu progress report). `payload` is the raw text after
+    /// the "9;" prefix, verbatim (e.g. `"4;1;-1"`, `"4;0;0"`) — not
+    /// ghostty's parsed state/percentage, which its own OSC 9;4 parser
+    /// (`vendor/ghostty/src/terminal/osc/parsers/osc9.zig`) mangles for
+    /// exact-match purposes (drops the percentage for `remove` /
+    /// `indeterminate`, defaults `set` to 0 when absent). Agent-detection
+    /// manifests match this verbatim string.
+    ProgressReport { payload: String },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -571,24 +562,14 @@ fn parse_event_stream(mut buf: &[u8]) -> Vec<TerminalEvent> {
                 if buf.len() < 2 {
                     break;
                 }
-                let state = match buf[0] {
-                    0 => ProgressState::Remove,
-                    1 => ProgressState::Set,
-                    2 => ProgressState::Error,
-                    3 => ProgressState::Indeterminate,
-                    4 => ProgressState::Pause,
-                    _ => break, // unknown state — bail, same as other malformed arms
-                };
-                // Zig side stores -1 (0xFF) as a bit-cast i8 when there's no
-                // percentage; `as i8` here reverses that bit-cast.
-                let progress = buf[1] as i8;
+                let payload_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
                 buf = &buf[2..];
-                let progress = if progress < 0 {
-                    None
-                } else {
-                    Some(progress as u8)
-                };
-                out.push(TerminalEvent::ProgressReport { state, progress });
+                if buf.len() < payload_len {
+                    break;
+                }
+                let payload = String::from_utf8_lossy(&buf[..payload_len]).into_owned();
+                buf = &buf[payload_len..];
+                out.push(TerminalEvent::ProgressReport { payload });
             }
             _ => {
                 // Unknown tag — bail to avoid mis-aligning.
@@ -603,31 +584,47 @@ fn parse_event_stream(mut buf: &[u8]) -> Vec<TerminalEvent> {
 mod tests {
     use super::*;
 
+    /// Hand-build a `0x07` (`ProgressReport`) record: tag, u16 LE payload
+    /// length, payload bytes — same framing as the `0x01` (`Notification`)
+    /// arm's length-prefixed strings.
+    fn progress_report_record(payload: &str) -> Vec<u8> {
+        let mut buf = vec![0x07];
+        buf.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        buf.extend_from_slice(payload.as_bytes());
+        buf
+    }
+
     #[test]
-    fn parses_progress_report_with_percentage() {
-        // tag 0x07, state=1 (set), progress=0
-        let buf = [0x07, 1, 0];
+    fn parses_progress_report_payload_verbatim() {
+        // Working-state payload, as sent by grok's OSC 9;4 while busy.
+        let buf = progress_report_record("4;1;-1");
         let events = parse_event_stream(&buf);
         assert_eq!(
             events,
             vec![TerminalEvent::ProgressReport {
-                state: ProgressState::Set,
-                progress: Some(0),
+                payload: "4;1;-1".to_string(),
             }]
         );
     }
 
     #[test]
-    fn parses_progress_report_without_percentage() {
-        // tag 0x07, state=1 (set), progress=-1 (0xFF) => no percentage
-        let buf = [0x07, 1, 0xFF];
+    fn parses_progress_report_payload_idle() {
+        // Idle-state payload, as sent by grok's OSC 9;4 when done.
+        let buf = progress_report_record("4;0;0");
         let events = parse_event_stream(&buf);
         assert_eq!(
             events,
             vec![TerminalEvent::ProgressReport {
-                state: ProgressState::Set,
-                progress: None,
+                payload: "4;0;0".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn progress_report_truncated_payload_stops_decoding() {
+        // Length prefix claims 6 bytes but only 3 are present — malformed,
+        // same "stop decoding" contract as the other length-prefixed arm.
+        let buf = [0x07, 6, 0, b'4', b';', b'1'];
+        assert!(parse_event_stream(&buf).is_empty());
     }
 }

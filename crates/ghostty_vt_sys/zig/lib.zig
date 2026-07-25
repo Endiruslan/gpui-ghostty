@@ -23,7 +23,8 @@ const TerminalHandle = struct {
     ///   0x04 Bell:         no payload
     ///   0x05 PromptStart:  no payload  (OSC 133;A)
     ///   0x06 InputStart:   no payload  (OSC 133;B)
-    ///   0x07 ProgressReport: state(u8) progress(i8, -1 = none)  (OSC 9;4)
+    ///   0x07 ProgressReport: payload_len(u16 LE) payload...  (OSC 9;4, raw
+    ///                        bytes after "9;", verbatim; capped at 256B)
     events: std.ArrayList(u8),
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
@@ -107,17 +108,30 @@ const Handler = struct {
             // is a no-op for terminal state today — we still forward to
             // `self.inner.vt` for parity with the other host-event arms in
             // case that ever changes.
+            //
+            // `value` only carries ghostty's already-parsed state/percentage,
+            // which its own OSC 9;4 parser (osc/parsers/osc9.zig) mangles for
+            // exact matching purposes: `remove`/`indeterminate` always drop
+            // the percentage, and `set` defaults to 0 when absent. Agent-
+            // detection manifests match the *raw* payload verbatim, so read
+            // it straight out of the OSC accumulator instead. That
+            // accumulator holds everything after the "9;" prefix (the
+            // prefix itself is consumed by the parser's own state machine
+            // before the OSC-9 sub-parser ever runs), and isn't reset until
+            // the *next* OSC sequence begins (`Parser.zig`'s `.osc_string`
+            // entry) — i.e. strictly after this dispatch returns — so it's
+            // safe to read here.
             .progress_report => {
-                const state: u8 = @intCast(@intFromEnum(value.state));
-                // Mirror ghostty's own osc.Command.ProgressReport.cval(),
-                // which clamps to 0..100 before narrowing to the C i8 field.
-                const progress: i8 = if (value.progress) |p|
-                    @intCast(std.math.clamp(p, 0, 100))
-                else
-                    -1;
-                try self.handle.events.append(self.handle.alloc, 0x07);
-                try self.handle.events.append(self.handle.alloc, state);
-                try self.handle.events.append(self.handle.alloc, @bitCast(progress));
+                const max_len: usize = 256;
+                if (self.handle.stream.parser.osc_parser.writer) |writer| {
+                    const data = writer.buffered();
+                    if (data.len > 0) {
+                        const clipped = if (data.len > max_len) data[0..max_len] else data;
+                        try self.handle.events.append(self.handle.alloc, 0x07);
+                        try appendU16Le(&self.handle.events, self.handle.alloc, @intCast(clipped.len));
+                        try self.handle.events.appendSlice(self.handle.alloc, clipped);
+                    }
+                }
                 try self.inner.vt(action, value);
             },
 

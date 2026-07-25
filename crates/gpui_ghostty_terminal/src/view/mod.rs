@@ -829,10 +829,10 @@ pub struct TerminalView {
     /// must happen before draining. Consumed (via `take`) when forwarding
     /// `CommandStart` to the host.
     last_input_snapshot: Option<String>,
-    /// Latest OSC 9;4 (ConEmu progress report), preformatted as
-    /// `4;<state>;<progress>` (`-1` when the program sent no percentage) —
-    /// the exact shape agent-detection manifests match against. Built once
-    /// per event in [`Self::apply_side_effects`], not on every
+    /// Latest OSC 9;4 (ConEmu progress report) raw payload — the text after
+    /// "9;", verbatim (e.g. `"4;1;-1"`, `"4;0;0"`), exactly as
+    /// agent-detection manifests match against. Cached once per event in
+    /// [`Self::apply_side_effects`], not rebuilt on every
     /// [`Self::osc_progress`] call. Empty before the first report.
     osc_progress: String,
 }
@@ -1502,13 +1502,12 @@ impl TerminalView {
                     self.last_input_snapshot = None;
                     ghostty_vt::TerminalEvent::InputStart
                 }
-                ghostty_vt::TerminalEvent::ProgressReport { state, progress } => {
-                    // Cache the formatted string once here — [`Self::osc_progress`]
-                    // is polled every ~350ms by the host's agent-detection pump,
-                    // so it must not reformat on every read.
-                    let progress_num = progress.map_or(-1i32, i32::from);
-                    self.osc_progress = format!("4;{};{progress_num}", state as u8);
-                    ghostty_vt::TerminalEvent::ProgressReport { state, progress }
+                ghostty_vt::TerminalEvent::ProgressReport { payload } => {
+                    // Cache the raw payload once here — [`Self::osc_progress`]
+                    // is polled every ~350ms by the host's agent-detection
+                    // pump, so there must be nothing to (re)build on read.
+                    self.osc_progress = payload.clone();
+                    ghostty_vt::TerminalEvent::ProgressReport { payload }
                 }
                 other => other,
             };
@@ -1805,10 +1804,9 @@ impl TerminalView {
         self.session.dump_viewport().unwrap_or_default()
     }
 
-    /// Latest OSC 9;4 report, formatted the way agent-detection manifests
-    /// expect: `4;<state>;<progress>` with `-1` when the program sent no
-    /// percentage (e.g. `4;1;-1`, `4;0;0`). Empty string before the first
-    /// report.
+    /// Latest OSC 9;4 report's raw payload — the text after "9;", verbatim
+    /// (e.g. `"4;1;-1"`, `"4;0;0"`), exactly as agent-detection manifests
+    /// match against. Empty string before the first report.
     pub fn osc_progress(&self) -> &str {
         &self.osc_progress
     }

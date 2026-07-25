@@ -65,30 +65,31 @@ fn osc_133_full_prompt_cycle_drains_in_order() {
 
 #[test]
 fn osc_9_4_progress_report_events_drain() {
-    use ghostty_vt::{ProgressState, TerminalEvent};
+    use ghostty_vt::TerminalEvent;
 
     let mut t = ghostty_vt::Terminal::new(80, 24).unwrap();
 
-    // ConEmu OSC 9;4 — state=1 (set), no percentage.
+    // ConEmu OSC 9;4 — grok's "working" payload. `payload` must be the raw
+    // text after "9;" verbatim: ghostty's own parsed state/percentage
+    // (osc/parsers/osc9.zig) can't reproduce this exact string (it drops
+    // the percentage for `remove`/`indeterminate` and defaults `set` to 0),
+    // which is exactly what agent-detection manifests match against
+    // (grok.toml's `osc_progress_working`/`osc_progress_idle` rules).
     t.feed(b"\x1b]9;4;1;-1\x07").unwrap();
     assert_eq!(
         t.drain_events(),
         vec![TerminalEvent::ProgressReport {
-            state: ProgressState::Set,
-            progress: None,
+            payload: "4;1;-1".to_string(),
         }]
     );
 
-    // state=0 (remove). Ghostty's OSC 9;4 parser never reads a percentage
-    // for `.remove`/`.indeterminate` states (vendor/ghostty/src/terminal/
-    // osc/parsers/osc9.zig) — progress is always `None` here regardless of
-    // what trails the state digit in the escape sequence.
+    // grok's "idle" payload — note the trailing "0" survives verbatim here,
+    // even though ghostty's own parser would have discarded it.
     t.feed(b"\x1b]9;4;0;0\x07").unwrap();
     assert_eq!(
         t.drain_events(),
         vec![TerminalEvent::ProgressReport {
-            state: ProgressState::Remove,
-            progress: None,
+            payload: "4;0;0".to_string(),
         }]
     );
 }
