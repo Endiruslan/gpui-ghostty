@@ -62,3 +62,33 @@ fn osc_133_full_prompt_cycle_drains_in_order() {
         vec![TerminalEvent::CommandEnd { exit_code: 0 }]
     );
 }
+
+#[test]
+fn osc_9_4_progress_report_events_drain() {
+    use ghostty_vt::{ProgressState, TerminalEvent};
+
+    let mut t = ghostty_vt::Terminal::new(80, 24).unwrap();
+
+    // ConEmu OSC 9;4 — state=1 (set), no percentage.
+    t.feed(b"\x1b]9;4;1;-1\x07").unwrap();
+    assert_eq!(
+        t.drain_events(),
+        vec![TerminalEvent::ProgressReport {
+            state: ProgressState::Set,
+            progress: None,
+        }]
+    );
+
+    // state=0 (remove). Ghostty's OSC 9;4 parser never reads a percentage
+    // for `.remove`/`.indeterminate` states (vendor/ghostty/src/terminal/
+    // osc/parsers/osc9.zig) — progress is always `None` here regardless of
+    // what trails the state digit in the escape sequence.
+    t.feed(b"\x1b]9;4;0;0\x07").unwrap();
+    assert_eq!(
+        t.drain_events(),
+        vec![TerminalEvent::ProgressReport {
+            state: ProgressState::Remove,
+            progress: None,
+        }]
+    );
+}

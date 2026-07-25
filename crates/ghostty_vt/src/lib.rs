@@ -89,6 +89,23 @@ pub enum TerminalEvent {
     /// Shell integration (OSC 133;B): the prompt finished drawing and user
     /// input is about to begin. The cursor sits right after the prompt.
     InputStart,
+    /// OSC 9;4 (ConEmu progress report). `progress` is `None` when the
+    /// program didn't send a percentage (e.g. `remove` / `indeterminate`).
+    ProgressReport {
+        state: ProgressState,
+        progress: Option<u8>,
+    },
+}
+
+/// `osc.Command.ProgressReport.State` (ConEmu OSC 9;4), in ghostty's
+/// declaration order — see `vendor/ghostty/src/terminal/osc.zig:199-204`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    Remove,
+    Set,
+    Error,
+    Indeterminate,
+    Pause,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -550,6 +567,29 @@ fn parse_event_stream(mut buf: &[u8]) -> Vec<TerminalEvent> {
             0x04 => out.push(TerminalEvent::Bell),
             0x05 => out.push(TerminalEvent::PromptStart),
             0x06 => out.push(TerminalEvent::InputStart),
+            0x07 => {
+                if buf.len() < 2 {
+                    break;
+                }
+                let state = match buf[0] {
+                    0 => ProgressState::Remove,
+                    1 => ProgressState::Set,
+                    2 => ProgressState::Error,
+                    3 => ProgressState::Indeterminate,
+                    4 => ProgressState::Pause,
+                    _ => break, // unknown state — bail, same as other malformed arms
+                };
+                // Zig side stores -1 (0xFF) as a bit-cast i8 when there's no
+                // percentage; `as i8` here reverses that bit-cast.
+                let progress = buf[1] as i8;
+                buf = &buf[2..];
+                let progress = if progress < 0 {
+                    None
+                } else {
+                    Some(progress as u8)
+                };
+                out.push(TerminalEvent::ProgressReport { state, progress });
+            }
             _ => {
                 // Unknown tag — bail to avoid mis-aligning.
                 break;
@@ -557,4 +597,37 @@ fn parse_event_stream(mut buf: &[u8]) -> Vec<TerminalEvent> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_progress_report_with_percentage() {
+        // tag 0x07, state=1 (set), progress=0
+        let buf = [0x07, 1, 0];
+        let events = parse_event_stream(&buf);
+        assert_eq!(
+            events,
+            vec![TerminalEvent::ProgressReport {
+                state: ProgressState::Set,
+                progress: Some(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_progress_report_without_percentage() {
+        // tag 0x07, state=1 (set), progress=-1 (0xFF) => no percentage
+        let buf = [0x07, 1, 0xFF];
+        let events = parse_event_stream(&buf);
+        assert_eq!(
+            events,
+            vec![TerminalEvent::ProgressReport {
+                state: ProgressState::Set,
+                progress: None,
+            }]
+        );
+    }
 }

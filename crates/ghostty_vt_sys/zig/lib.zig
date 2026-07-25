@@ -23,6 +23,7 @@ const TerminalHandle = struct {
     ///   0x04 Bell:         no payload
     ///   0x05 PromptStart:  no payload  (OSC 133;A)
     ///   0x06 InputStart:   no payload  (OSC 133;B)
+    ///   0x07 ProgressReport: state(u8) progress(i8, -1 = none)  (OSC 9;4)
     events: std.ArrayList(u8),
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
@@ -99,6 +100,25 @@ const Handler = struct {
 
             .show_desktop_notification => {
                 try self.showDesktopNotification(value.title, value.body);
+            },
+
+            // OSC 9;4 (ConEmu progress report). `progress_report` is in the
+            // readonly handler's no-op list (stream_readonly.zig), so this
+            // is a no-op for terminal state today — we still forward to
+            // `self.inner.vt` for parity with the other host-event arms in
+            // case that ever changes.
+            .progress_report => {
+                const state: u8 = @intCast(@intFromEnum(value.state));
+                // Mirror ghostty's own osc.Command.ProgressReport.cval(),
+                // which clamps to 0..100 before narrowing to the C i8 field.
+                const progress: i8 = if (value.progress) |p|
+                    @intCast(std.math.clamp(p, 0, 100))
+                else
+                    -1;
+                try self.handle.events.append(self.handle.alloc, 0x07);
+                try self.handle.events.append(self.handle.alloc, state);
+                try self.handle.events.append(self.handle.alloc, @bitCast(progress));
+                try self.inner.vt(action, value);
             },
 
             .semantic_prompt => {
