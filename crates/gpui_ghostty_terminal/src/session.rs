@@ -264,13 +264,24 @@ impl TerminalSession {
     }
 
     fn update_state_from_output(&mut self, bytes: &[u8]) {
-        const TAIL_LIMIT: usize = 2048;
+        /// How much of the *scanned* stream is carried into the next call, so a
+        /// sequence split across two PTY reads is still seen whole. Only a
+        /// carry — never a limit on what gets scanned (see below).
+        const CARRY_LIMIT: usize = 2048;
 
+        // Everything new is scanned, however large the batch. Truncating the
+        // buffer *before* the scan (as this did until 2026-07-28) silently
+        // dropped the head of any batch over `CARRY_LIMIT`, and the modes that
+        // matter arrive exactly there: a `zmx` re-attach replays the session in
+        // one ~130 KB write whose first bytes are `?1000h ?1002h ?1006h
+        // ?1049h`. The C terminal still got every byte, so the screen looked
+        // right while `alternate_screen_active` / `mouse_*` stayed false — the
+        // wheel then scrolled a scrollback the fullscreen app does not have,
+        // and mxds's terminal appeared to ignore scrolling until the pane was
+        // resized (which made the app redraw in batches small enough to fit
+        // the window). OSC titles and OSC 52 clipboard writes were lost the
+        // same way.
         self.parse_tail.extend_from_slice(bytes);
-        if self.parse_tail.len() > TAIL_LIMIT {
-            let drop_len = self.parse_tail.len() - TAIL_LIMIT;
-            self.parse_tail.drain(0..drop_len);
-        }
         let buf = self.parse_tail.as_slice();
 
         let mut i = 0usize;
@@ -422,6 +433,15 @@ impl TerminalSession {
         }
         if let Some(clipboard) = last_clipboard {
             self.clipboard_write = Some(clipboard);
+        }
+
+        // Now that the whole buffer has been scanned, keep only enough of its
+        // tail to complete a sequence cut in half by the read boundary. The
+        // carry is re-scanned on the next call, which is why every effect above
+        // is idempotent (flag assignments and last-wins title/clipboard).
+        let len = self.parse_tail.len();
+        if len > CARRY_LIMIT {
+            self.parse_tail.drain(0..len - CARRY_LIMIT);
         }
     }
 
@@ -760,4 +780,78 @@ fn decode_osc_52(payload: &[u8]) -> Option<String> {
 
     let decoded = STANDARD.decode(data).ok()?;
     Some(String::from_utf8_lossy(&decoded).into_owned())
+}
+
+#[cfg(test)]
+mod state_scan_tests {
+    use super::{TerminalConfig, TerminalSession};
+
+    fn session() -> TerminalSession {
+        TerminalSession::new(TerminalConfig::default()).expect("terminal session")
+    }
+
+    /// The reattach bug (2026-07-28): a `zmx` re-attach replays the whole
+    /// session in one ~130 KB write whose *first* bytes set the modes. Scanning
+    /// only the tail of that write left the pane believing it was on the primary
+    /// screen with mouse reporting off, so the wheel scrolled a scrollback the
+    /// fullscreen app does not have and the terminal looked frozen to scrolling
+    /// until the pane was resized.
+    #[test]
+    fn modes_at_the_head_of_a_huge_batch_are_applied() {
+        let mut vt = session();
+        let mut replay =
+            b"\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1049h".to_vec();
+        // Well past the carry window — the live replay is ~64× this.
+        replay.extend(std::iter::repeat_n(b'x', 128 * 1024));
+        vt.feed(&replay).expect("feed");
+
+        assert!(vt.alternate_screen_active(), "?1049h lost");
+        assert!(vt.mouse_reporting_enabled(), "?1000h/?1002h/?1003h lost");
+        assert!(vt.mouse_sgr_enabled(), "?1006h lost");
+    }
+
+    /// Same batch, same loss: the pane's title (and an OSC 52 clipboard write)
+    /// rode in the head of the replay too.
+    #[test]
+    fn an_osc_title_at_the_head_of_a_huge_batch_is_applied() {
+        let mut vt = session();
+        let mut replay = b"\x1b]0;claude - analytics-ops\x07".to_vec();
+        replay.extend(std::iter::repeat_n(b'y', 64 * 1024));
+        vt.feed(&replay).expect("feed");
+
+        assert_eq!(vt.title(), Some("claude - analytics-ops"));
+    }
+
+    /// What the carry buffer is actually for: a sequence cut in half by a read
+    /// boundary must still be seen once its second half arrives. Deleting the
+    /// carry entirely would keep the test above green.
+    #[test]
+    fn a_mode_split_across_two_batches_is_applied() {
+        let mut vt = session();
+        vt.feed(b"\x1b[?10").expect("feed head");
+        assert!(
+            !vt.mouse_sgr_enabled(),
+            "half a sequence must decide nothing"
+        );
+        vt.feed(b"06h").expect("feed tail");
+        assert!(
+            vt.mouse_sgr_enabled(),
+            "the split ?1006h was never completed"
+        );
+    }
+
+    /// The carry stays bounded across a long stream, or a busy pane grows a
+    /// buffer that is re-scanned on every batch forever.
+    #[test]
+    fn the_carry_stays_bounded() {
+        let mut vt = session();
+        for _ in 0..8 {
+            vt.feed(&vec![b'z'; 64 * 1024]).expect("feed");
+        }
+        assert!(
+            vt.parse_tail.len() <= 2048,
+            "carry grew to {} bytes",
+            vt.parse_tail.len()
+        );
+    }
 }
