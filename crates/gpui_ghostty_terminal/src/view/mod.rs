@@ -676,6 +676,90 @@ pub type PathResolver = Box<dyn Fn(&str) -> Option<std::path::PathBuf>>;
 /// output), never from a render/paint path.
 pub type SuggestionProvider = Box<dyn Fn(&str) -> Option<String>>;
 
+/// A local `file://` URL → on-disk path plus an optional 1-based line from a
+/// `#L42` / `#L42:7` fragment.
+///
+/// OSC 8 hyperlinks are not only for web URLs: tools that see a
+/// hyperlink-capable `TERM_PROGRAM` wrap the *file paths* they print in
+/// `\x1b]8;;file:///abs/path\x07…`. Claude Code does exactly this
+/// (`pathToFileURL(path).href`). Handing such a link to `cx.open_url` sends
+/// the file to whatever LaunchServices registered as its default app —
+/// i.e. an external editor — even though the host has its own open policy
+/// for path clicks. Converting the link back to a path lets it take the
+/// same [`OpenPathRequest`] route a bare path token takes.
+///
+/// `None` for any non-`file` scheme and for remote hosts
+/// (`file://otherbox/etc/passwd`), which stay with `cx.open_url`.
+fn file_url_to_path(url: &str) -> Option<(std::path::PathBuf, Option<u32>)> {
+    let rest = url.strip_prefix("file://")?;
+    // `file:///abs` → host is empty; `file://localhost/abs` is the same
+    // machine. Anything else names another host — not ours to open.
+    let slash = rest.find('/')?;
+    let (host, path) = rest.split_at(slash);
+    if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+        return None;
+    }
+
+    let (path, line) = match path.split_once('#') {
+        Some((path, fragment)) => (path, parse_line_fragment(fragment)),
+        None => (path, None),
+    };
+
+    let decoded = percent_decode(path)?;
+    if decoded.is_empty() || decoded.contains('\0') {
+        return None;
+    }
+    Some((std::path::PathBuf::from(decoded), line))
+}
+
+/// Should a clicked OSC 8 link open as a path instead of as a URL?
+///
+/// `Some((path, line))` → emit [`OpenPathRequest`]; `None` → `cx.open_url`.
+/// Requires a [`PathResolver`] to be installed (a host that never asked to
+/// handle paths would get a dead click instead) and the file to exist (a
+/// broken `file://` link is better off with the system's error than with
+/// silence). `exists` is injected so the decision is testable off-disk.
+fn hyperlink_click_target(
+    link: &str,
+    has_path_resolver: bool,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<(std::path::PathBuf, Option<u32>)> {
+    if !has_path_resolver {
+        return None;
+    }
+    let (path, line) = file_url_to_path(link)?;
+    exists(&path).then_some((path, line))
+}
+
+/// `L42`, `42`, `L42:7` → `Some(42)`; anything else → `None`.
+fn parse_line_fragment(fragment: &str) -> Option<u32> {
+    let digits = fragment.trim_start_matches(['L', 'l']);
+    let digits = digits.split(':').next()?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// Percent-decode a URL path into a UTF-8 string. `None` when an escape is
+/// malformed or the bytes aren't UTF-8 — a link we can't read is a link we
+/// don't claim.
+fn percent_decode(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = path.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Emitted when the user Cmd+clicks a file path that the installed
 /// [`PathResolver`] mapped to a real file. The host decides how to open it.
 #[derive(Clone, Debug)]
@@ -2001,6 +2085,20 @@ impl TerminalView {
         if event.button == MouseButton::Left && event.modifiers.platform {
             if let Some((col, row)) = self.mouse_position_to_cell(event.position, window) {
                 if let Some(link) = self.session.hyperlink_at(col, row) {
+                    // An OSC 8 link to a local file is a path click, not a
+                    // web click: route it through `OpenPathRequest` so the
+                    // host's open policy applies (see `file_url_to_path`).
+                    // Only for hosts that installed a `PathResolver` — the
+                    // rest never asked to handle paths, and a dead click
+                    // would be worse than LaunchServices.
+                    if let Some((path, line)) = hyperlink_click_target(
+                        &link,
+                        self.path_resolver.is_some(),
+                        |p: &std::path::Path| p.exists(),
+                    ) {
+                        cx.emit(OpenPathRequest { path, line });
+                        return;
+                    }
                     cx.open_url(&link);
                     return;
                 }
@@ -4803,10 +4901,97 @@ mod tests {
     use ghostty_vt::Rgb;
 
     use super::{
-        char_drawn_as_quad, extract_input_prefix, path_range_at_byte_index,
-        path_token_at_cell_in_wrapped_lines, strip_quad_glyphs_for_shaping, url_at_byte_index,
-        url_at_cell_in_wrapped_lines, url_spans_at_cell_in_wrapped_lines, window_position_to_local,
+        char_drawn_as_quad, extract_input_prefix, file_url_to_path, hyperlink_click_target,
+        path_range_at_byte_index, path_token_at_cell_in_wrapped_lines,
+        strip_quad_glyphs_for_shaping, url_at_byte_index, url_at_cell_in_wrapped_lines,
+        url_spans_at_cell_in_wrapped_lines, window_position_to_local,
     };
+
+    /// OSC 8 `file://` links are what Claude Code prints for every file path
+    /// it mentions once `TERM_PROGRAM` looks hyperlink-capable. They must
+    /// come back out as plain paths so the host opens them in its own
+    /// editor instead of handing them to LaunchServices.
+    #[test]
+    fn file_urls_become_paths() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            file_url_to_path("file:///Users/x/dev/app/main.py"),
+            Some((PathBuf::from("/Users/x/dev/app/main.py"), None))
+        );
+        // `localhost` is us; any other authority is another machine.
+        assert_eq!(
+            file_url_to_path("file://localhost/tmp/notes.md"),
+            Some((PathBuf::from("/tmp/notes.md"), None))
+        );
+        assert_eq!(file_url_to_path("file://otherbox/etc/passwd"), None);
+        // Non-`file` schemes stay web links.
+        assert_eq!(file_url_to_path("https://example.com/a.py"), None);
+        assert_eq!(file_url_to_path("mailto:x@example.com"), None);
+        // `pathToFileURL` escapes spaces and non-ASCII.
+        assert_eq!(
+            file_url_to_path("file:///tmp/my%20dir/%D1%84.py"),
+            Some((PathBuf::from("/tmp/my dir/ф.py"), None))
+        );
+        // Malformed escapes are not ours to guess at.
+        assert_eq!(file_url_to_path("file:///tmp/a%2.py"), None);
+        assert_eq!(file_url_to_path("file:///tmp/a%zz.py"), None);
+    }
+
+    /// A `#L42` fragment (VS Code / GitHub shape) carries the same 1-based
+    /// line a `path:42` token does, so the host can jump the cursor.
+    #[test]
+    fn file_url_line_fragment() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            file_url_to_path("file:///tmp/a.py#L42"),
+            Some((PathBuf::from("/tmp/a.py"), Some(42)))
+        );
+        assert_eq!(
+            file_url_to_path("file:///tmp/a.py#L42:7"),
+            Some((PathBuf::from("/tmp/a.py"), Some(42)))
+        );
+        assert_eq!(
+            file_url_to_path("file:///tmp/a.py#42"),
+            Some((PathBuf::from("/tmp/a.py"), Some(42)))
+        );
+        // A non-line fragment is dropped, the path still opens.
+        assert_eq!(
+            file_url_to_path("file:///tmp/a.py#section"),
+            Some((PathBuf::from("/tmp/a.py"), None))
+        );
+    }
+
+    /// The click itself: a local `file://` link becomes an `OpenPathRequest`
+    /// only for a host that handles paths and only for a file that is there.
+    /// Everything else keeps going to `cx.open_url` — including the case that
+    /// made this fix necessary, where handing the link to the system meant an
+    /// external editor for a file we can open ourselves.
+    #[test]
+    fn cmd_click_routes_local_file_links_to_the_host() {
+        use std::path::{Path, PathBuf};
+
+        let here = |_: &Path| true;
+        let gone = |_: &Path| false;
+
+        assert_eq!(
+            hyperlink_click_target("file:///tmp/a.py#L7", true, here),
+            Some((PathBuf::from("/tmp/a.py"), Some(7)))
+        );
+        // No resolver installed → the host never opted into path clicks.
+        assert_eq!(
+            hyperlink_click_target("file:///tmp/a.py", false, here),
+            None
+        );
+        // A `file://` link to nothing: let the system report it.
+        assert_eq!(hyperlink_click_target("file:///tmp/a.py", true, gone), None);
+        // Web links are untouched.
+        assert_eq!(
+            hyperlink_click_target("https://example.com/a.py", true, here),
+            None
+        );
+    }
 
     #[test]
     fn quad_glyphs_stripped_from_shaped_text() {
