@@ -1916,6 +1916,12 @@ impl TerminalView {
     /// Reads fresh from the VT on every call (not the paint-cycle
     /// `viewport_lines` cache), so it reflects the terminal's current
     /// screen state regardless of prepaint timing.
+    /// See `TerminalSession::reset_output_scan` — for a host that swaps the
+    /// pty under this view.
+    pub fn reset_output_scan(&mut self) {
+        self.session.reset_output_scan();
+    }
+
     pub fn viewport_text(&self) -> String {
         self.session.dump_viewport().unwrap_or_default()
     }

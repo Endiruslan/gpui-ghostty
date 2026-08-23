@@ -97,6 +97,15 @@ pub enum TerminalEvent {
     /// `indeterminate`, defaults `set` to 0 when absent). Agent-detection
     /// manifests match this verbatim string.
     ProgressReport { payload: String },
+    /// OSC 0 / OSC 2 — the program set the window title.
+    ///
+    /// Synthesised by `gpui_ghostty_terminal::TerminalSession`, which already
+    /// frames every OSC sequence in the stream, rather than by the C parser.
+    /// It exists so a host does not have to run a *second* byte scanner over
+    /// the same PTY batch for a fact this crate has already extracted — that
+    /// is exactly what mxds used to do (measured: 123 of 2185 profile samples
+    /// on the terminal data path, for a duplicate of work already done).
+    TitleChanged { title: String },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
