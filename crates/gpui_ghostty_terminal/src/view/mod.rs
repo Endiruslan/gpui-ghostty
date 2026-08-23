@@ -1696,6 +1696,38 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Feed PTY bytes without asking for a repaint — for a pane the host
+    /// knows is off-screen (an inactive dock tab).
+    ///
+    /// [`queue_output_bytes`] parks the bytes and calls `cx.notify()`, so the
+    /// VT is only ever fed from `Render::render`. That is the right shape for
+    /// a visible pane and the wrong one for a hidden tab: the notify redraws
+    /// the whole window (measured: 23 full frames a second for a tab nobody
+    /// can see) and the render is the only thing that would advance the
+    /// emulator at all. Here the emulator, the scrollback and the side
+    /// effects — shell-history capture, the OSC 9;4 cache agent detection
+    /// polls, clipboard writes — all advance on the caller's thread, and the
+    /// window stays asleep.
+    ///
+    /// `pending_output` is flushed first so bytes queued while the pane was
+    /// still visible cannot end up behind these ones.
+    pub fn feed_output_bytes_offscreen(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        SCROLL_STATS
+            .pty_input_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if !self.pending_output.is_empty() {
+            let pending = std::mem::take(&mut self.pending_output);
+            self.feed_output_bytes_to_session(&pending);
+        }
+        self.feed_output_bytes_to_session(bytes);
+        self.apply_side_effects(cx);
+        // Whatever row-level dirty set this batch produced is against a
+        // viewport cache that no paint will see; the first render after the
+        // pane comes back has to rebuild the cache wholesale rather than
+        // reconcile against one that never saw these bytes.
+        self.pending_refresh = true;
+    }
+
     pub fn queue_output_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         const MAX_PENDING_OUTPUT_BYTES: usize = 256 * 1024;
 
