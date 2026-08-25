@@ -37,11 +37,6 @@ pub struct TerminalSession {
     title: Option<String>,
     clipboard_write: Option<String>,
     parse_tail: Vec<u8>,
-    /// The OSC 0/2 title not yet handed to the host as an event — see
-    /// [`Self::drain_events`]. "Changed since last time", not "seen": the parse
-    /// carry is re-scanned by design, so the same sequence is observed more
-    /// than once whenever it lands near a read boundary.
-    pending_title_event: Option<String>,
     dsr_state: DsrScanState,
     osc_query_state: OscQueryScanState,
     transparent_default_bgs: Vec<Rgb>,
@@ -69,7 +64,6 @@ impl TerminalSession {
             title: None,
             clipboard_write: None,
             parse_tail: Vec::new(),
-            pending_title_event: None,
             dsr_state: DsrScanState::default(),
             osc_query_state: OscQueryScanState::default(),
             transparent_default_bgs: vec![initial_bg],
@@ -435,13 +429,6 @@ impl TerminalSession {
         }
 
         if let Some(title) = last_title {
-            // Only a *change* is an event: the carry is re-scanned on the next
-            // call (that is what makes every effect here idempotent), so the
-            // same title is seen again whenever it lands near a read boundary,
-            // and a host that relabels a tab must not be woken for it twice.
-            if self.title.as_deref() != Some(title.as_str()) {
-                self.pending_title_event = Some(title.clone());
-            }
             self.title = Some(title);
         }
         if let Some(clipboard) = last_clipboard {
@@ -573,26 +560,8 @@ impl TerminalSession {
     /// that needs the pre-boundary anchor (e.g. to capture the input line
     /// that was just submitted) must read [`Self::input_anchor`] (or
     /// anything derived from it) *before* calling `drain_events`, not after.
-    /// Drop the half-scanned tail carried between PTY reads.
-    ///
-    /// For a host that swaps the pty under a live session (mxds re-attaches a
-    /// pane to a new `zmx` client): the dead client's last bytes may sit
-    /// mid-sequence in the carry, and fusing them with the new one's first
-    /// bytes yields a title or a working directory that was never sent.
-    /// Only the *carry* goes — everything already parsed out of it stands.
-    pub fn reset_output_scan(&mut self) {
-        self.parse_tail.clear();
-    }
-
     pub fn drain_events(&mut self) -> Vec<ghostty_vt::TerminalEvent> {
-        let mut events = self.terminal.drain_events();
-        // Appended after the C drain, not merged into it: these two are framed
-        // by our own OSC scan (`update_state_from_output`), which has already
-        // run for every byte in this batch by the time anything drains.
-        if let Some(title) = self.pending_title_event.take() {
-            events.push(ghostty_vt::TerminalEvent::TitleChanged { title });
-        }
-        let events = events;
+        let events = self.terminal.drain_events();
         for event in &events {
             match event {
                 ghostty_vt::TerminalEvent::InputStart => {
@@ -819,120 +788,6 @@ mod state_scan_tests {
 
     fn session() -> TerminalSession {
         TerminalSession::new(TerminalConfig::default()).expect("terminal session")
-    }
-
-    /// Every title case mxds used to pin with a byte scanner of its own
-    /// (`terminal_ui::osc_title::TitleParser`, deleted when this became the one
-    /// place a title is framed): both terminators, OSC 1 ignored, a payload cut
-    /// by a read boundary, a terminator cut by one, several titles in a batch,
-    /// and a malformed sequence that must not poison the next.
-    #[test]
-    fn a_title_is_framed_the_way_the_host_scanner_used_to_frame_it() {
-        for (name, chunks, want) in [
-            (
-                "OSC 0, BEL",
-                vec![&b"foo\x1b]0;My Tab\x07bar"[..]],
-                Some("My Tab"),
-            ),
-            (
-                "OSC 2, ST",
-                vec![&b"\x1b]2;Window\x1b\\done"[..]],
-                Some("Window"),
-            ),
-            (
-                "OSC 1 is the icon name, not the title",
-                vec![&b"\x1b]1;icon\x07"[..]],
-                None,
-            ),
-            (
-                "payload split across reads",
-                vec![&b"\x1b]0;hel"[..], &b"lo\x07"[..]],
-                Some("hello"),
-            ),
-            (
-                "ST split across reads",
-                vec![&b"\x1b]2;x\x1b"[..], &b"\\"[..]],
-                Some("x"),
-            ),
-            (
-                "an unhandled OSC does not poison the next title",
-                vec![&b"\x1b]9;nope\x07\x1b]2;good\x07"[..]],
-                Some("good"),
-            ),
-            (
-                "last title in the batch wins",
-                vec![&b"\x1b]0;first\x07\x1b]0;second\x07"[..]],
-                Some("second"),
-            ),
-        ] {
-            let mut vt = session();
-            for chunk in chunks {
-                vt.feed(chunk).expect("feed");
-            }
-            assert_eq!(vt.title(), want, "{name}");
-        }
-    }
-
-    /// And the host hears about it exactly once per change — the parse carry is
-    /// re-scanned on the next read by design, so "seen again" must not become
-    /// "changed again" and relabel a tab on every batch.
-    #[test]
-    fn a_title_change_is_one_event_and_a_repeat_is_none() {
-        let mut vt = session();
-        vt.feed(b"\x1b]0;One\x07").expect("feed");
-        let first: Vec<_> = vt
-            .drain_events()
-            .into_iter()
-            .filter(|e| matches!(e, ghostty_vt::TerminalEvent::TitleChanged { .. }))
-            .collect();
-        assert_eq!(
-            first,
-            vec![ghostty_vt::TerminalEvent::TitleChanged {
-                title: "One".to_string()
-            }]
-        );
-
-        // Same title again, then nothing at all: neither may produce an event.
-        vt.feed(b"\x1b]0;One\x07").expect("feed");
-        vt.feed(b"plain output\n").expect("feed");
-        let repeats: Vec<_> = vt
-            .drain_events()
-            .into_iter()
-            .filter(|e| matches!(e, ghostty_vt::TerminalEvent::TitleChanged { .. }))
-            .collect();
-        assert!(
-            repeats.is_empty(),
-            "re-announced an unchanged title: {repeats:?}"
-        );
-
-        vt.feed(b"\x1b]0;Two\x07").expect("feed");
-        let changed: Vec<_> = vt
-            .drain_events()
-            .into_iter()
-            .filter(|e| matches!(e, ghostty_vt::TerminalEvent::TitleChanged { .. }))
-            .collect();
-        assert_eq!(
-            changed,
-            vec![ghostty_vt::TerminalEvent::TitleChanged {
-                title: "Two".to_string()
-            }]
-        );
-    }
-
-    /// A pty swap under a live pane (mxds re-attaching to a new `zmx` client)
-    /// drops the half-scanned carry: the dead client's last bytes must not fuse
-    /// with the new one's first into a title nobody sent.
-    #[test]
-    fn resetting_the_scan_drops_a_half_read_sequence() {
-        let mut vt = session();
-        vt.feed(b"\x1b]0;doomed").expect("feed");
-        vt.reset_output_scan();
-        vt.feed(b" title\x07").expect("feed");
-        assert_eq!(
-            vt.title(),
-            None,
-            "the carry survived the reset and completed a sequence from two clients"
-        );
     }
 
     /// The reattach bug (2026-07-28): a `zmx` re-attach replays the whole
