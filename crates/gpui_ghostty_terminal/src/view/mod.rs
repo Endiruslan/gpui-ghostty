@@ -1789,6 +1789,34 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Tell the terminal which colour scheme the host theme is now.
+    ///
+    /// A program that set DEC mode 2031 is told of the change as
+    /// `CSI ? 997 ; Ps n` — how a TUI that follows the host theme learns of a
+    /// switch without re-asking OSC 11. Nothing is drawn differently, so no
+    /// repaint is scheduled; pair with [`Self::set_default_colors`] for that.
+    /// Call it *after* the colour setters, so a re-query the report provokes
+    /// already reads the new colours.
+    ///
+    /// A view built without a [`TerminalInput`] (`new`, no pty) records the
+    /// scheme and drops the report — there is no program to tell, and
+    /// `CSI ? 996 n` still answers from the recorded value.
+    pub fn set_color_scheme(&mut self, scheme: crate::ColorScheme) {
+        let Some(report) = self.session.set_color_scheme(scheme) else {
+            return;
+        };
+        if let Some(input) = self.input.as_ref() {
+            input.send(report);
+        }
+    }
+
+    /// The pty behind this view was swapped for another (see
+    /// [`TerminalSession::reset_for_new_pty`]). Call before the new pty's
+    /// first bytes are fed.
+    pub fn reset_for_new_pty(&mut self) {
+        self.session.reset_for_new_pty();
+    }
+
     /// Override the cursor color (`Some`) or restore auto-contrast (`None`).
     pub fn set_cursor_color(&mut self, color: Option<Rgb>, cx: &mut Context<Self>) {
         self.session.set_cursor_color(color);

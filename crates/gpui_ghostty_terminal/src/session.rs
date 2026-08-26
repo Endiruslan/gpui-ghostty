@@ -1,6 +1,6 @@
 use ghostty_vt::{Error, Rgb, Terminal};
 
-use crate::TerminalConfig;
+use crate::{ColorScheme, TerminalConfig};
 
 pub struct TerminalSession {
     config: TerminalConfig,
@@ -36,8 +36,12 @@ pub struct TerminalSession {
     mouse_alternate_scroll: bool,
     title: Option<String>,
     clipboard_write: Option<String>,
+    /// DEC mode 2031: the program asked to be told, as `CSI ? 997 ; Ps n`,
+    /// whenever the colour scheme changes (Claude Code parses that report;
+    /// neovim and helix set the mode).
+    report_color_scheme: bool,
     parse_tail: Vec<u8>,
-    dsr_state: DsrScanState,
+    csi_query_state: CsiQueryScanState,
     osc_query_state: OscQueryScanState,
     transparent_default_bgs: Vec<Rgb>,
 }
@@ -63,8 +67,9 @@ impl TerminalSession {
             mouse_alternate_scroll: true,
             title: None,
             clipboard_write: None,
+            report_color_scheme: false,
             parse_tail: Vec::new(),
-            dsr_state: DsrScanState::default(),
+            csi_query_state: CsiQueryScanState::default(),
             osc_query_state: OscQueryScanState::default(),
             transparent_default_bgs: vec![initial_bg],
         })
@@ -201,6 +206,31 @@ impl TerminalSession {
         self.config.cursor_style = style;
     }
 
+    /// Which colour scheme the host theme is, as far as the terminal knows.
+    pub fn color_scheme(&self) -> ColorScheme {
+        self.config.color_scheme
+    }
+
+    /// Whether the program set DEC mode 2031 (colour-scheme change reports).
+    pub fn color_scheme_reports_enabled(&self) -> bool {
+        self.report_color_scheme
+    }
+
+    /// Tell the terminal which colour scheme the host theme is now.
+    ///
+    /// Returns the DEC mode 2031 report (`CSI ? 997 ; Ps n`) to write to the
+    /// pty when the scheme actually changed *and* the program asked to be told;
+    /// the caller owns the pty, so it does the write. `None` otherwise — a
+    /// repeat of the current scheme is not a change, and a program that never
+    /// set the mode must not receive unsolicited bytes.
+    pub fn set_color_scheme(&mut self, scheme: ColorScheme) -> Option<&'static [u8]> {
+        if self.config.color_scheme == scheme {
+            return None;
+        }
+        self.config.color_scheme = scheme;
+        self.report_color_scheme.then(|| scheme.report())
+    }
+
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste_enabled
     }
@@ -282,10 +312,26 @@ impl TerminalSession {
         // the window). OSC titles and OSC 52 clipboard writes were lost the
         // same way.
         self.parse_tail.extend_from_slice(bytes);
-        let buf = self.parse_tail.as_slice();
+        // Taken, not borrowed: RIS below resets flags on `self` mid-scan.
+        let tail = std::mem::take(&mut self.parse_tail);
+        let buf = tail.as_slice();
 
         let mut i = 0usize;
-        while i + 2 < buf.len() {
+        while i + 1 < buf.len() {
+            // RIS. Handled in this same pass, in stream order: a mode set
+            // *after* the reset must survive it and one set before must not,
+            // which a separate pass over the buffer could not get right. ESC
+            // restarts both CSI and OSC parsing, so `ESC c` never occurs
+            // inside another sequence. Two bytes, so it is also applied when
+            // it ends the chunk — a reset must not wait for the next read.
+            if buf[i] == 0x1b && buf[i + 1] == b'c' {
+                self.reset_modes();
+                i += 2;
+                continue;
+            }
+            if i + 2 >= buf.len() {
+                break;
+            }
             if buf[i] != 0x1b || buf[i + 1] != b'[' || buf[i + 2] != b'?' {
                 i += 1;
                 continue;
@@ -338,6 +384,7 @@ impl TerminalSession {
                             1007 => self.mouse_alternate_scroll = enabled,
                             2004 => self.bracketed_paste_enabled = enabled,
                             2026 => self.synchronized_output_active = enabled,
+                            2031 => self.report_color_scheme = enabled,
                             1000 => self.mouse_x10_enabled = enabled,
                             1002 => self.mouse_button_event_enabled = enabled,
                             1003 => self.mouse_any_event_enabled = enabled,
@@ -438,7 +485,9 @@ impl TerminalSession {
         // Now that the whole buffer has been scanned, keep only enough of its
         // tail to complete a sequence cut in half by the read boundary. The
         // carry is re-scanned on the next call, which is why every effect above
-        // is idempotent (flag assignments and last-wins title/clipboard).
+        // is idempotent (flag assignments and last-wins title/clipboard) and
+        // applied in buffer order (RIS included).
+        self.parse_tail = tail;
         let len = self.parse_tail.len();
         if len > CARRY_LIMIT {
             self.parse_tail.drain(0..len - CARRY_LIMIT);
@@ -459,16 +508,16 @@ impl TerminalSession {
 
         let mut seg_start = 0usize;
         for (i, &b) in bytes.iter().enumerate() {
-            let dsr = self.dsr_state.advance(b);
+            let csi = self.csi_query_state.advance(b);
             let osc = self.osc_query_state.advance(b);
-            if dsr.is_none() && osc.is_none() {
+            if csi.is_none() && osc.is_none() {
                 continue;
             }
 
             self.terminal.feed(&bytes[seg_start..=i])?;
             seg_start = i + 1;
 
-            if let Some(query) = dsr {
+            if let Some(query) = csi {
                 match query {
                     TerminalQuery::DeviceStatus => send(b"\x1b[0n"),
                     TerminalQuery::CursorPosition => {
@@ -476,21 +525,22 @@ impl TerminalSession {
                         let resp = format!("\x1b[{};{}R", row, col);
                         send(resp.as_bytes());
                     }
+                    TerminalQuery::ColorScheme => send(self.config.color_scheme.report()),
+                    TerminalQuery::PrimaryDeviceAttributes => send(DA1_RESPONSE),
+                    TerminalQuery::SecondaryDeviceAttributes => send(DA2_RESPONSE),
                 }
             }
 
             if let Some(query) = osc {
-                let rgb = match query {
-                    OscQuery::ForegroundColor => {
-                        let fg = self.config.default_fg;
-                        (fg.r, fg.g, fg.b)
-                    }
-                    OscQuery::BackgroundColor => {
-                        let bg = self.config.default_bg;
-                        (bg.r, bg.g, bg.b)
-                    }
+                let color = match query {
+                    OscQuery::Foreground => self.config.default_fg,
+                    OscQuery::Background => self.config.default_bg,
+                    // No explicit cursor colour means the cursor is drawn in
+                    // the foreground colour, so that is the honest answer
+                    // (ghostty's stream handler reports the same).
+                    OscQuery::Cursor => self.config.cursor_color.unwrap_or(self.config.default_fg),
                 };
-                let resp = osc_color_query_response(query, rgb);
+                let resp = osc_color_query_response(query, (color.r, color.g, color.b));
                 send(resp.as_bytes());
             }
         }
@@ -547,7 +597,43 @@ impl TerminalSession {
     /// Hard reset of terminal state. See [`ghostty_vt::Terminal::full_reset`].
     pub fn full_reset(&mut self) {
         self.terminal.full_reset();
+        self.reset_modes();
+    }
+
+    /// Put every mirrored DEC mode back to its power-on value — what RIS
+    /// (`ESC c`) does to the real modes inside ghostty. Also run on a pty swap
+    /// (see [`Self::reset_for_new_pty`]): a mode the *previous* shell's program
+    /// set must not outlive it. Mode 2031 is the one that makes this matter —
+    /// a stale flag there would have the host *write* `CSI ? 997 ; Ps n` into
+    /// a shell that never asked, once per theme switch, for as long as the
+    /// pane lives.
+    pub fn reset_modes(&mut self) {
+        self.bracketed_paste_enabled = false;
+        self.cursor_visible = true;
+        self.synchronized_output_active = false;
+        self.mouse_x10_enabled = false;
+        self.mouse_button_event_enabled = false;
+        self.mouse_any_event_enabled = false;
+        self.mouse_sgr_enabled = false;
+        self.alternate_screen_active = false;
         self.input_anchor = None;
+        self.application_cursor_keys = false;
+        self.mouse_alternate_scroll = true;
+        self.report_color_scheme = false;
+    }
+
+    /// The pty behind this session was swapped (a plain shell replacing a
+    /// dead zmx client, a re-attach after restart). Forget everything that
+    /// described the old stream: the mirrored modes, the half-parsed carry
+    /// and both query scanners — the dead client's last bytes must not fuse
+    /// with the new shell's first ones into a mode, a query or a reply. A
+    /// zmx re-attach replays the session's modes (measured: `?2031h` comes
+    /// back in the replay), so resetting first is right there too.
+    pub fn reset_for_new_pty(&mut self) {
+        self.reset_modes();
+        self.parse_tail.clear();
+        self.csi_query_state = CsiQueryScanState::default();
+        self.osc_query_state = OscQueryScanState::default();
     }
 
     /// Drain queued OSC / control events (notifications, command boundaries,
@@ -625,22 +711,52 @@ impl TerminalSession {
     }
 }
 
+/// A query in the pty output that the terminal — not the shell — must answer.
 #[derive(Clone, Copy, Debug)]
 enum TerminalQuery {
+    /// `CSI 5 n`.
     DeviceStatus,
+    /// `CSI 6 n`.
     CursorPosition,
+    /// `CSI ? 996 n` — the query half of DEC mode 2031.
+    ColorScheme,
+    /// `CSI c` / `CSI 0 c` (DA1).
+    PrimaryDeviceAttributes,
+    /// `CSI > c` / `CSI > 0 c` (DA2).
+    SecondaryDeviceAttributes,
 }
+
+/// DA1: VT220-level conformance (62) with colour text (22). The same identity
+/// ghostty reports without clipboard access, and the one zmx answers on our
+/// behalf while no client is attached — so a program sees one terminal
+/// whichever side happens to answer.
+const DA1_RESPONSE: &[u8] = b"\x1b[?62;22c";
+/// DA2: ghostty's own secondary attributes, which zmx also mirrors.
+const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OscQuery {
-    ForegroundColor,
-    BackgroundColor,
+    Foreground,
+    Background,
+    Cursor,
+}
+
+impl OscQuery {
+    fn for_ps(ps: u32) -> Option<OscQuery> {
+        match ps {
+            10 => Some(OscQuery::Foreground),
+            11 => Some(OscQuery::Background),
+            12 => Some(OscQuery::Cursor),
+            _ => None,
+        }
+    }
 }
 
 fn osc_color_query_response(query: OscQuery, (r, g, b): (u8, u8, u8)) -> String {
     let ps = match query {
-        OscQuery::ForegroundColor => 10,
-        OscQuery::BackgroundColor => 11,
+        OscQuery::Foreground => 10,
+        OscQuery::Background => 11,
+        OscQuery::Cursor => 12,
     };
 
     let r16 = u16::from(r) * 0x0101;
@@ -650,45 +766,115 @@ fn osc_color_query_response(query: OscQuery, (r, g, b): (u8, u8, u8)) -> String 
     format!("\x1b]{};rgb:{:04x}/{:04x}/{:04x}\x1b\\", ps, r16, g16, b16)
 }
 
+/// Byte-at-a-time recogniser for the CSI queries in [`TerminalQuery`]. Runs
+/// beside ghostty's own parser (which applies the sequence to the screen but,
+/// being read-only, never answers), so a query split across two pty reads is
+/// still seen whole.
 #[derive(Clone, Copy, Debug, Default)]
-enum DsrScanState {
+enum CsiQueryScanState {
     #[default]
     Idle,
     Esc,
-    Csi,
-    CsiQ,
-    Csi5,
-    CsiQ5,
-    Csi6,
-    CsiQ6,
+    /// Inside `CSI`, before the final byte. `marker` is the private prefix
+    /// (`?`, `>`, or 0 for none), `value` the one numeric parameter seen so
+    /// far. `multi` records a `;`: none of the queries answered here takes a
+    /// parameter list, and that is exactly what keeps a DA *response* echoed
+    /// back (`CSI ? 62 ; 22 c`) from reading as a query.
+    Csi {
+        marker: u8,
+        value: u32,
+        saw_digit: bool,
+        multi: bool,
+    },
 }
 
-impl DsrScanState {
+impl CsiQueryScanState {
     fn advance(&mut self, b: u8) -> Option<TerminalQuery> {
-        use DsrScanState::*;
+        use CsiQueryScanState::*;
 
-        let matched = match (*self, b) {
-            (Csi5, b'n') | (CsiQ5, b'n') => Some(TerminalQuery::DeviceStatus),
-            (Csi6, b'n') | (CsiQ6, b'n') => Some(TerminalQuery::CursorPosition),
-            _ => None,
+        let (next, matched) = match (*self, b) {
+            (_, 0x1b) => (Esc, None),
+            (Esc, b'[') => (
+                Csi {
+                    marker: 0,
+                    value: 0,
+                    saw_digit: false,
+                    multi: false,
+                },
+                None,
+            ),
+            (Esc, _) => (Idle, None),
+            (
+                Csi {
+                    marker: 0,
+                    saw_digit: false,
+                    multi: false,
+                    ..
+                },
+                b'?' | b'>',
+            ) => (
+                Csi {
+                    marker: b,
+                    value: 0,
+                    saw_digit: false,
+                    multi: false,
+                },
+                None,
+            ),
+            (
+                Csi {
+                    marker,
+                    value,
+                    multi,
+                    ..
+                },
+                d,
+            ) if d.is_ascii_digit() => (
+                Csi {
+                    marker,
+                    value: value.saturating_mul(10).saturating_add(u32::from(d - b'0')),
+                    saw_digit: true,
+                    multi,
+                },
+                None,
+            ),
+            (Csi { marker, .. }, b';') => (
+                Csi {
+                    marker,
+                    value: 0,
+                    saw_digit: false,
+                    multi: true,
+                },
+                None,
+            ),
+            (
+                Csi {
+                    marker,
+                    value,
+                    multi,
+                    ..
+                },
+                final_byte @ 0x40..=0x7e,
+            ) => (Idle, csi_query(marker, value, multi, final_byte)),
+            _ => (Idle, None),
         };
 
-        *self = match (*self, b) {
-            (_, 0x1b) => Esc,
-            (Esc, b'[') => Csi,
-            (Csi, b'?') => CsiQ,
-            (Csi, b'5') => Csi5,
-            (CsiQ, b'5') => CsiQ5,
-            (Csi, b'6') => Csi6,
-            (CsiQ, b'6') => CsiQ6,
-            (Csi5, b'n') => Idle,
-            (CsiQ5, b'n') => Idle,
-            (Csi6, b'n') => Idle,
-            (CsiQ6, b'n') => Idle,
-            _ => Idle,
-        };
-
+        *self = next;
         matched
+    }
+}
+
+fn csi_query(marker: u8, value: u32, multi: bool, final_byte: u8) -> Option<TerminalQuery> {
+    if multi {
+        return None;
+    }
+    match (final_byte, marker, value) {
+        (b'n', 0 | b'?', 5) => Some(TerminalQuery::DeviceStatus),
+        (b'n', 0 | b'?', 6) => Some(TerminalQuery::CursorPosition),
+        (b'n', b'?', 996) => Some(TerminalQuery::ColorScheme),
+        (b'c', 0, 0) => Some(TerminalQuery::PrimaryDeviceAttributes),
+        (b'c', b'>', 0) => Some(TerminalQuery::SecondaryDeviceAttributes),
+        _ => None,
     }
 }
 
@@ -717,16 +903,7 @@ impl OscQueryScanState {
         use OscQueryScanState::*;
 
         let matched = match (*self, b) {
-            (Query { ps }, 0x07) => match ps {
-                10 => Some(OscQuery::ForegroundColor),
-                11 => Some(OscQuery::BackgroundColor),
-                _ => None,
-            },
-            (StEscape { ps }, b'\\') => match ps {
-                10 => Some(OscQuery::ForegroundColor),
-                11 => Some(OscQuery::BackgroundColor),
-                _ => None,
-            },
+            (Query { ps }, 0x07) | (StEscape { ps }, b'\\') => OscQuery::for_ps(ps),
             _ => None,
         };
 
@@ -757,9 +934,10 @@ impl OscQueryScanState {
 }
 
 fn value_to_after_semicolon_state(ps: u32) -> OscQueryScanState {
-    match ps {
-        10 | 11 => OscQueryScanState::AfterSemicolon { ps },
-        _ => OscQueryScanState::Idle,
+    if OscQuery::for_ps(ps).is_some() {
+        OscQueryScanState::AfterSemicolon { ps }
+    } else {
+        OscQueryScanState::Idle
     }
 }
 

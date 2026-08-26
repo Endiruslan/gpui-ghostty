@@ -115,6 +115,7 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 - [x] Fix Tab focus escape: TerminalView should consume Tab/Shift-Tab when focused.
 - [x] Fix alt-screen exit stale viewport: map terminal dirty.clear to dirty rows.
 - [x] Profile `pty_terminal` performance with Instruments and document bottlenecks (notes: `docs/perf_instruments.md`).
+- [x] Answer the remaining terminal queries TUIs send: DA1/DA2, OSC 12, `CSI ? 996 n`, and push DEC mode 2031 colour-scheme reports on `set_color_scheme` (host theme switch).
 
 ## Future Work
 

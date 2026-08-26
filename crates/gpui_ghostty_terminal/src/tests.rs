@@ -1,7 +1,7 @@
 use gpui::{KeyBinding, KeyContext, Keymap, Keystroke, actions};
 use std::any::TypeId;
 
-use crate::{TerminalConfig, TerminalSession};
+use crate::{ColorScheme, TerminalConfig, TerminalSession};
 
 actions!(tab_shadow_test, [RootTab, TerminalTab]);
 
@@ -386,6 +386,267 @@ fn responds_to_osc_11_query_terminated_by_bel() {
 
     let expected = osc_color_response(11, (0x00, 0x00, 0x00));
     assert_eq!(response, expected.as_bytes());
+}
+
+#[test]
+fn responds_to_osc_12_cursor_color_query_with_foreground_when_unset() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    let mut response = Vec::new();
+
+    session
+        .feed_with_pty_responses(b"\x1b]12;?\x1b\\", |bytes| {
+            response.extend_from_slice(bytes);
+        })
+        .unwrap();
+
+    // No explicit cursor colour → the cursor is drawn in the foreground
+    // colour, so that is what a query learns (ghostty does the same).
+    let expected = osc_color_response(12, (0xFF, 0xFF, 0xFF));
+    assert_eq!(response, expected.as_bytes());
+}
+
+#[test]
+fn responds_to_osc_12_cursor_color_query_with_configured_cursor_color() {
+    let config = TerminalConfig {
+        cursor_color: Some(ghostty_vt::Rgb {
+            r: 0x11,
+            g: 0x22,
+            b: 0x33,
+        }),
+        ..TerminalConfig::default()
+    };
+    let mut session = TerminalSession::new(config).unwrap();
+    let mut response = Vec::new();
+
+    session
+        .feed_with_pty_responses(b"\x1b]12;?\x07", |bytes| {
+            response.extend_from_slice(bytes);
+        })
+        .unwrap();
+
+    let expected = osc_color_response(12, (0x11, 0x22, 0x33));
+    assert_eq!(response, expected.as_bytes());
+}
+
+#[test]
+fn responds_to_primary_device_attributes_query() {
+    for query in [&b"\x1b[c"[..], &b"\x1b[0c"[..]] {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut response = Vec::new();
+
+        session
+            .feed_with_pty_responses(query, |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+
+        // Same identity zmx reports on our behalf while no client is
+        // attached, so a program sees one terminal whichever side answers.
+        assert_eq!(response, b"\x1b[?62;22c", "query {:?}", query);
+    }
+}
+
+#[test]
+fn responds_to_secondary_device_attributes_query() {
+    for query in [&b"\x1b[>c"[..], &b"\x1b[>0c"[..]] {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut response = Vec::new();
+
+        session
+            .feed_with_pty_responses(query, |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+
+        assert_eq!(response, b"\x1b[>1;10;0c", "query {:?}", query);
+    }
+}
+
+#[test]
+fn device_attributes_responses_and_multi_param_csis_are_not_queries() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    let mut response = Vec::new();
+
+    session
+        .feed_with_pty_responses(
+            // A DA1 response echoed back, a DA2 response, a CSI with a
+            // non-zero parameter, a multi-parameter DSR-shaped sequence and
+            // a CSI 996 without the private marker: none is a query we answer.
+            b"\x1b[?62;22c\x1b[>1;10;0c\x1b[1c\x1b[?1;996n\x1b[996n",
+            |bytes| {
+                response.extend_from_slice(bytes);
+            },
+        )
+        .unwrap();
+
+    assert!(response.is_empty(), "unexpected response {:?}", response);
+}
+
+#[test]
+fn responds_to_dsr_996_color_scheme_query() {
+    let mut dark = TerminalSession::new(TerminalConfig::default()).unwrap();
+    let mut response = Vec::new();
+    dark.feed_with_pty_responses(b"\x1b[?996n", |bytes| {
+        response.extend_from_slice(bytes);
+    })
+    .unwrap();
+    assert_eq!(response, b"\x1b[?997;1n");
+
+    let mut light = TerminalSession::new(TerminalConfig {
+        color_scheme: ColorScheme::Light,
+        ..TerminalConfig::default()
+    })
+    .unwrap();
+    let mut response = Vec::new();
+    light
+        .feed_with_pty_responses(b"\x1b[?996n", |bytes| {
+            response.extend_from_slice(bytes);
+        })
+        .unwrap();
+    assert_eq!(response, b"\x1b[?997;2n");
+}
+
+#[test]
+fn responds_to_dsr_996_across_chunk_boundaries() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    let mut response = Vec::new();
+
+    for chunk in [&b"\x1b["[..], &b"?9"[..], &b"96"[..], &b"n"[..]] {
+        session
+            .feed_with_pty_responses(chunk, |bytes| {
+                response.extend_from_slice(bytes);
+            })
+            .unwrap();
+    }
+
+    assert_eq!(response, b"\x1b[?997;1n");
+}
+
+#[test]
+fn color_scheme_change_is_reported_only_while_mode_2031_is_set() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    assert_eq!(session.color_scheme(), ColorScheme::Dark);
+
+    // Mode off: a change is remembered but nothing is sent.
+    assert_eq!(session.set_color_scheme(ColorScheme::Light), None);
+    assert_eq!(session.color_scheme(), ColorScheme::Light);
+
+    session.feed(b"\x1b[?2031h").unwrap();
+    assert!(session.color_scheme_reports_enabled());
+
+    // Same scheme again: no change, no report.
+    assert_eq!(session.set_color_scheme(ColorScheme::Light), None);
+    assert_eq!(
+        session.set_color_scheme(ColorScheme::Dark),
+        Some(&b"\x1b[?997;1n"[..])
+    );
+    assert_eq!(
+        session.set_color_scheme(ColorScheme::Light),
+        Some(&b"\x1b[?997;2n"[..])
+    );
+
+    session.feed(b"\x1b[?2031l").unwrap();
+    assert!(!session.color_scheme_reports_enabled());
+    assert_eq!(session.set_color_scheme(ColorScheme::Dark), None);
+}
+
+#[test]
+fn mode_2031_is_tracked_inside_a_multi_mode_decset() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    session.feed(b"\x1b[?1049;2031h").unwrap();
+    assert!(session.color_scheme_reports_enabled());
+    assert!(session.alternate_screen_active());
+}
+
+fn replies(session: &mut TerminalSession, bytes: &[u8]) -> Vec<u8> {
+    let mut response = Vec::new();
+    session
+        .feed_with_pty_responses(bytes, |b| response.extend_from_slice(b))
+        .unwrap();
+    response
+}
+
+#[test]
+fn esc_restarts_a_half_parsed_csi_query() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    assert_eq!(
+        replies(&mut session, b"\x1b[?99\x1b[?996n"),
+        b"\x1b[?997;1n"
+    );
+}
+
+#[test]
+fn intermediate_or_unknown_bytes_abort_a_csi_query() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    // Space and `$` are intermediates, `<` is not a marker we know, a `?`
+    // after a digit is out of place, `?c` / `?0c` and `>1c` are not DA queries.
+    let out = replies(
+        &mut session,
+        b"\x1b[?996 n\x1b[5$n\x1b[<0c\x1b[5?6n\x1b[?c\x1b[?0c\x1b[>1c",
+    );
+    assert!(out.is_empty(), "unexpected response {:?}", out);
+}
+
+#[test]
+fn adjacent_osc_and_csi_queries_are_answered_in_order() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    let mut expected = osc_color_response(11, (0x00, 0x00, 0x00)).into_bytes();
+    expected.extend_from_slice(b"\x1b[?62;22c");
+    assert_eq!(replies(&mut session, b"\x1b]11;?\x07\x1b[c"), expected);
+}
+
+#[test]
+fn osc_13_query_is_not_answered() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    assert!(replies(&mut session, b"\x1b]13;?\x07").is_empty());
+}
+
+#[test]
+fn ris_clears_mode_2031_and_the_other_mirrored_modes() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    session.feed(b"\x1b[?2031h\x1b[?2004h\x1b[?1049h").unwrap();
+    assert!(session.color_scheme_reports_enabled());
+    assert!(session.bracketed_paste_enabled());
+    assert!(session.alternate_screen_active());
+
+    session.feed(b"\x1bc").unwrap();
+    assert!(!session.color_scheme_reports_enabled());
+    assert!(!session.bracketed_paste_enabled());
+    assert!(!session.alternate_screen_active());
+    // No program asked any more: a theme switch writes nothing to the pty.
+    assert_eq!(session.set_color_scheme(ColorScheme::Light), None);
+}
+
+#[test]
+fn a_mode_set_after_ris_in_the_same_chunk_survives_it() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    session.feed(b"\x1b[?2031h\x1bc\x1b[?2031h").unwrap();
+    assert!(session.color_scheme_reports_enabled());
+    // …and re-scanning the carried tail on the next feed keeps that order.
+    session.feed(b"x").unwrap();
+    assert!(session.color_scheme_reports_enabled());
+}
+
+#[test]
+fn full_reset_clears_mode_2031() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    session.feed(b"\x1b[?2031h").unwrap();
+    session.full_reset();
+    assert!(!session.color_scheme_reports_enabled());
+    assert_eq!(session.set_color_scheme(ColorScheme::Light), None);
+}
+
+#[test]
+fn reset_for_new_pty_forgets_modes_and_half_parsed_queries() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    // The dead client's last bytes: a mode and the head of a DSR.
+    assert!(replies(&mut session, b"\x1b[?2031h\x1b[?99").is_empty());
+    session.reset_for_new_pty();
+    assert!(!session.color_scheme_reports_enabled());
+    // The new shell's first bytes must not complete the old query.
+    assert!(replies(&mut session, b"6n").is_empty());
+    // A fresh, complete query still works.
+    assert_eq!(replies(&mut session, b"\x1b[?996n"), b"\x1b[?997;1n");
 }
 
 #[test]

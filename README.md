@@ -89,8 +89,10 @@ let config = TerminalConfig {
 This implementation includes common terminal behaviors needed by modern TUIs:
 
 - DSR replies (`CSI 5n` / `CSI 6n`) for cursor position/status queries
+- DA1/DA2 (`CSI c` / `CSI > c`) identity replies — the same VT220-class identity zmx reports on our behalf when no client is attached
 - OSC title tracking (OSC 0/2), OSC 52 clipboard write
-- OSC 10/11 default foreground/background queries
+- OSC 10/11/12 default foreground/background/cursor colour queries
+- Colour-scheme reporting: `CSI ? 996 n` answers dark/light, and a program that set DEC mode 2031 is told of a switch via `TerminalView::set_color_scheme` (`CSI ? 997 ; 1|2 n`) — how a TUI follows the host theme live
 - SGR mouse modes + scrollback navigation bindings
 - IME composition support (commit + preedit overlay)
 - DEC Special Graphics (ACS line drawing) + box drawing (procedural quads)

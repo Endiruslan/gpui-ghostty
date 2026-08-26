@@ -38,6 +38,30 @@ pub struct TerminalConfig {
     /// the terminal pane reveals whatever is painted behind it instead of a
     /// solid background. Non-default cell backgrounds are unaffected.
     pub background_alpha: f32,
+    /// Which colour scheme the host theme is — what a program learns from
+    /// `CSI ? 996 n` and, once it set DEC mode 2031, is told about on every
+    /// change (see [`crate::TerminalSession::set_color_scheme`]). Not derived
+    /// from `default_bg`: the host knows its theme, a luminance guess does not.
+    pub color_scheme: ColorScheme,
+}
+
+/// Dark or light, as DEC mode 2031 / `CSI ? 996 n` report it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColorScheme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl ColorScheme {
+    /// The `CSI ? 997 ; Ps n` report for this scheme (1 = dark, 2 = light) —
+    /// the answer to `CSI ? 996 n`, and what mode 2031 pushes on a change.
+    pub fn report(self) -> &'static [u8] {
+        match self {
+            ColorScheme::Dark => b"\x1b[?997;1n",
+            ColorScheme::Light => b"\x1b[?997;2n",
+        }
+    }
 }
 
 /// Cursor shape for [`TerminalConfig::cursor_style`].
@@ -74,6 +98,7 @@ impl Default for TerminalConfig {
             cursor_color: None,
             cursor_style: CursorStyle::Block,
             background_alpha: 1.0,
+            color_scheme: ColorScheme::Dark,
         }
     }
 }
