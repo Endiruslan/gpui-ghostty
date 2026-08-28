@@ -1,5 +1,6 @@
 mod config;
 mod font;
+mod paste;
 mod session;
 
 pub mod view;

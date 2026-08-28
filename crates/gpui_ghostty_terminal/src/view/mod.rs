@@ -1845,12 +1845,16 @@ impl TerminalView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        self.paste_text(&text, cx);
+    }
 
-        if self.session.bracketed_paste_enabled() {
-            self.send_input_parts(&[b"\x1b[200~", text.as_bytes(), b"\x1b[201~"], cx);
-        } else {
-            self.send_input_parts(&[text.as_bytes()], cx);
-        }
+    /// Inject `text` into the shell as a paste — the same bytes ⌘V sends,
+    /// so a program that enabled bracketed paste receives the whole text as
+    /// one block. Hosts use this to seed an agent's prompt with multi-line
+    /// text that must not submit on its first newline.
+    pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let bytes = crate::paste::paste_bytes(text, self.session.bracketed_paste_enabled());
+        self.send_input_parts(&[bytes.as_slice()], cx);
     }
 
     /// Copy the current selection (or the full visible viewport when nothing
