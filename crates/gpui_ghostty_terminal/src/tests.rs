@@ -676,6 +676,21 @@ fn ctrl_c_encodes_to_etx_even_without_key_char() {
 }
 
 #[test]
+fn cmd_arrows_and_backspace_map_to_emacs_line_editing_bytes() {
+    // Cmd+Left / Cmd+Right jump to the ends of the line, as everywhere else
+    // on macOS; the shell only understands the readline control bytes.
+    assert_eq!(crate::view::cmd_line_editing_byte("left"), Some(0x01));
+    assert_eq!(crate::view::cmd_line_editing_byte("right"), Some(0x05));
+    assert_eq!(crate::view::cmd_line_editing_byte("backspace"), Some(0x15));
+
+    // Everything else keeps travelling as a Cmd shortcut, not as input.
+    assert_eq!(crate::view::cmd_line_editing_byte("up"), None);
+    assert_eq!(crate::view::cmd_line_editing_byte("down"), None);
+    assert_eq!(crate::view::cmd_line_editing_byte("a"), None);
+    assert_eq!(crate::view::cmd_line_editing_byte("delete"), None);
+}
+
+#[test]
 fn does_not_skip_enter_key_when_ime_in_progress() {
     let enter = Keystroke::parse("enter").unwrap();
     assert!(enter.is_ime_in_progress());

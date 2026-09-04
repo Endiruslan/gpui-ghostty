@@ -232,6 +232,25 @@ pub(crate) fn ctrl_byte_for_keystroke(keystroke: &gpui::Keystroke) -> Option<u8>
     }
 }
 
+/// The control byte a Cmd+key line-editing shortcut sends to the shell.
+///
+/// macOS apps bind Cmd+Left/Right/Backspace to line editing, but a terminal
+/// has no escape sequence for any of it — readline and zle listen for the
+/// emacs control bytes instead. So we translate, exactly as Zed and iTerm2
+/// do (pattern from zed assets/keymaps/default-macos.json, the Terminal
+/// context: `"cmd-left": ["terminal::SendKeystroke", "ctrl-a"]`).
+pub(crate) fn cmd_line_editing_byte(key: &str) -> Option<u8> {
+    match key {
+        // Ctrl+A — beginning of line.
+        "left" => Some(0x01),
+        // Ctrl+E — end of line.
+        "right" => Some(0x05),
+        // Ctrl+U — kill line backward.
+        "backspace" => Some(0x15),
+        _ => None,
+    }
+}
+
 pub(crate) fn sgr_mouse_button_value(
     base_button: u8,
     motion: bool,
@@ -2372,18 +2391,14 @@ impl TerminalView {
         }
 
         if keystroke.modifiers.platform || keystroke.modifiers.function {
-            // Cmd+Backspace = kill line backward. Shells have no escape
-            // sequence for this, so send Ctrl+U like Zed and iTerm do
-            // (pattern from zed assets/keymaps/default-macos.json,
-            // terminal::SendText "\\u0015").
             if keystroke.modifiers.platform
                 && !keystroke.modifiers.shift
                 && !keystroke.modifiers.alt
                 && !keystroke.modifiers.control
-                && keystroke.key.as_str() == "backspace"
+                && let Some(byte) = cmd_line_editing_byte(keystroke.key.as_str())
                 && let Some(input) = self.input.as_ref()
             {
-                input.send(&[0x15]);
+                input.send(&[byte]);
                 return;
             }
             return;
