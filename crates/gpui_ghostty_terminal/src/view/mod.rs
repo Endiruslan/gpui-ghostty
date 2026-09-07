@@ -603,6 +603,177 @@ pub(crate) fn path_token_at_cell_in_wrapped_lines(
     (!spans.is_empty()).then_some((token, line, spans))
 }
 
+/// How many grid rows one path may be rebuilt from by
+/// [`hard_wrap_path_candidate`].
+const MAX_HARD_WRAP_ROWS: usize = 4;
+
+/// Byte range of the contiguous path-byte run around `idx` within one row.
+fn path_run_at(line: &str, idx: usize) -> Option<std::ops::Range<usize>> {
+    let bytes = line.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut i = idx.min(bytes.len() - 1);
+    if !is_path_byte(bytes[i]) && i > 0 && is_path_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    if !is_path_byte(bytes[i]) {
+        return None;
+    }
+    let mut start = i;
+    while start > 0 && is_path_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = i + 1;
+    while end < bytes.len() && is_path_byte(bytes[end]) {
+        end += 1;
+    }
+    Some(start..end)
+}
+
+/// Leading path-byte run of a row that was indented as a wrap continuation:
+/// whitespace, then path bytes. `None` when the row starts at column 1 —
+/// that is the terminal's own soft wrap, which [`join_wrapped_rows`] already
+/// joins — or when the indent is followed by nothing path-shaped.
+fn indented_continuation_run(line: &str) -> Option<std::ops::Range<usize>> {
+    let bytes = line.as_bytes();
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+    if start == 0 {
+        return None;
+    }
+    let mut end = start;
+    while end < bytes.len() && is_path_byte(bytes[end]) {
+        end += 1;
+    }
+    (end > start).then_some(start..end)
+}
+
+/// Does this run reach the end of its row, i.e. was the token cut off there?
+fn run_reaches_row_end(line: &str, run: &std::ops::Range<usize>) -> bool {
+    run.end == line.len()
+}
+
+/// A path token rebuilt across a *hard* wrap the writer performed itself.
+///
+/// [`join_wrapped_rows`] handles the terminal's own soft wrap, where the
+/// continuation starts at column 1. An agent that wraps its own markdown to
+/// the terminal width instead emits a real newline and indents the
+/// continuation (a list's hanging indent), so a long path arrives as two
+/// grid rows with the indent glued to the second half — and both halves
+/// resolve to nothing on their own. Claude Code prints file paths this way.
+///
+/// The run under the cursor grows upward while its row starts right after an
+/// indent and the row above was cut off at its end, and downward while it is
+/// itself cut off and the row below starts with an indent; at most
+/// [`MAX_HARD_WRAP_ROWS`] rows. `None` unless at least two rows joined —
+/// one row is [`path_token_at_cell_in_wrapped_lines`]'s job.
+///
+/// The join is lexical only: the caller's [`PathResolver`] decides whether
+/// what came out names a real file, so a wrong guess costs one `stat` and
+/// paints nothing.
+pub(crate) fn hard_wrap_path_candidate(
+    lines: &[String],
+    row: usize,
+    col: u16,
+) -> Option<(String, Option<u32>, LinkSpans)> {
+    let line = lines.get(row)?;
+    let local = byte_index_for_column_in_line(line, col).min(line.len().saturating_sub(1));
+    let run = path_run_at(line, local)?;
+
+    let mut segments: Vec<(usize, std::ops::Range<usize>)> = vec![(row, run)];
+
+    // Upward: this row is an indented continuation of a row cut off above.
+    let mut top = row;
+    while segments.len() < MAX_HARD_WRAP_ROWS && top > 0 {
+        let (top_row, top_run) = segments[0].clone();
+        let Some(indent) = indented_continuation_run(&lines[top_row]) else {
+            break;
+        };
+        if indent.start != top_run.start {
+            break;
+        }
+        let above = &lines[top - 1];
+        let Some(above_run) = path_run_at(above, above.len().saturating_sub(1)) else {
+            break;
+        };
+        if !run_reaches_row_end(above, &above_run) {
+            break;
+        }
+        segments.insert(0, (top - 1, above_run));
+        top -= 1;
+    }
+
+    // Downward: this row is cut off and the row below is an indented
+    // continuation.
+    let mut bottom = row;
+    while segments.len() < MAX_HARD_WRAP_ROWS {
+        let (bottom_row, bottom_run) = segments[segments.len() - 1].clone();
+        if !run_reaches_row_end(&lines[bottom_row], &bottom_run) {
+            break;
+        }
+        let Some(below) = lines.get(bottom + 1) else {
+            break;
+        };
+        let Some(indent) = indented_continuation_run(below) else {
+            break;
+        };
+        segments.push((bottom + 1, indent));
+        bottom += 1;
+    }
+
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let mut joined = String::new();
+    let mut segment_starts = Vec::with_capacity(segments.len());
+    for (seg_row, seg) in &segments {
+        segment_starts.push(joined.len());
+        joined.push_str(&lines[*seg_row][seg.clone()]);
+    }
+
+    // The joined string is one run of path bytes, so the single-line lexer
+    // does the rest: prose punctuation, `:LINE:COL`, the `looks_like_path`
+    // gate.
+    let (range, line_no) = path_range_at_byte_index(&joined, 0)?;
+
+    let mut spans = LinkSpans::new();
+    for (i, (seg_row, seg)) in segments.iter().enumerate() {
+        let seg_start = segment_starts[i];
+        let seg_end = seg_start + (seg.end - seg.start);
+        let start = range.start.clamp(seg_start, seg_end);
+        let end = range.end.clamp(seg_start, seg_end);
+        if start < end {
+            spans.push((
+                *seg_row,
+                seg.start + (start - seg_start)..seg.start + (end - seg_start),
+            ));
+        }
+    }
+    (!spans.is_empty()).then(|| (joined[range].to_string(), line_no, spans))
+}
+
+/// The file the cursor is over at (0-based `row`, 1-based `col`), resolved by
+/// the host: the plain (soft-wrap-joined) token first, then a token rebuilt
+/// across the writer's own hard wrap. One function so the Cmd+hover
+/// underline and the Cmd+click cannot disagree about what is a link.
+pub(crate) fn resolved_path_at_cell(
+    lines: &[String],
+    cols: usize,
+    row: usize,
+    col: u16,
+    resolve: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<(std::path::PathBuf, Option<u32>, LinkSpans)> {
+    if let Some((token, line, spans)) = path_token_at_cell_in_wrapped_lines(lines, cols, row, col)
+        && let Some(path) = resolve(&token)
+    {
+        return Some((path, line, spans));
+    }
+    let (token, line, spans) = hard_wrap_path_candidate(lines, row, col)?;
+    let path = resolve(&token)?;
+    Some((path, line, spans))
+}
+
 /// Extent of an OSC 8 hyperlink around cell (1-based `col`, `row`),
 /// expanded over neighbouring cells that carry the same URL — including
 /// wrapped continuations on adjacent rows (link runs to the row edge and
@@ -2038,13 +2209,14 @@ impl TerminalView {
             })
             .or_else(|| {
                 let resolver = self.path_resolver.as_ref()?;
-                let (token, _line, spans) = path_token_at_cell_in_wrapped_lines(
+                resolved_path_at_cell(
                     &self.viewport_lines,
                     self.session.cols() as usize,
                     row.saturating_sub(1) as usize,
                     col,
-                )?;
-                resolver(&token).map(|_| spans)
+                    |token| resolver(token),
+                )
+                .map(|(_path, _line, spans)| spans)
             })
         });
         if self.hovered_link != new {
@@ -2165,13 +2337,13 @@ impl TerminalView {
                 }
 
                 if let Some(resolver) = self.path_resolver.as_ref()
-                    && let Some((token, line, _spans)) = path_token_at_cell_in_wrapped_lines(
+                    && let Some((path, line, _spans)) = resolved_path_at_cell(
                         &self.viewport_lines,
                         self.session.cols() as usize,
                         row.saturating_sub(1) as usize,
                         col,
+                        |token| resolver(token),
                     )
-                    && let Some(path) = resolver(&token)
                 {
                     cx.emit(OpenPathRequest { path, line });
                     return;
@@ -4948,10 +5120,10 @@ mod tests {
     use ghostty_vt::Rgb;
 
     use super::{
-        char_drawn_as_quad, extract_input_prefix, file_url_to_path, hyperlink_click_target,
-        path_range_at_byte_index, path_token_at_cell_in_wrapped_lines,
-        strip_quad_glyphs_for_shaping, url_at_byte_index, url_at_cell_in_wrapped_lines,
-        url_spans_at_cell_in_wrapped_lines, window_position_to_local,
+        char_drawn_as_quad, extract_input_prefix, file_url_to_path, hard_wrap_path_candidate,
+        hyperlink_click_target, path_range_at_byte_index, path_token_at_cell_in_wrapped_lines,
+        resolved_path_at_cell, strip_quad_glyphs_for_shaping, url_at_byte_index,
+        url_at_cell_in_wrapped_lines, url_spans_at_cell_in_wrapped_lines, window_position_to_local,
     };
 
     /// OSC 8 `file://` links are what Claude Code prints for every file path
@@ -5203,6 +5375,113 @@ mod tests {
         let (token, _, spans) = path_token_at_cell_in_wrapped_lines(&lines, 20, 1, 3).unwrap();
         assert_eq!(token, "docs/very-long-name-here.md");
         assert_eq!(spans, vec![(0usize, 4..20), (1usize, 0..11)]);
+    }
+
+    /// An agent that wraps its own output to the terminal width emits a real
+    /// newline and indents the continuation, so a long path arrives split
+    /// across two rows with the indent glued to the second half. Neither half
+    /// names a file, which is why Cmd+click was dead on both of them
+    /// (measured on Claude Code output, 2026-09-07).
+    #[test]
+    fn hard_wrap_rebuilds_a_path_split_by_the_writers_own_newline() {
+        let lines = vec![
+            "- /tmp/repro/a-very-long-directory-name/models/s".to_string(),
+            "  taging/antifraud/stg_af_card_payments.sql:31 - key".to_string(),
+        ];
+        let want = "/tmp/repro/a-very-long-directory-name/models/staging/antifraud/stg_af_card_payments.sql";
+
+        // Clicking the first half joins downward…
+        let (token, line, spans) = hard_wrap_path_candidate(&lines, 0, 20).unwrap();
+        assert_eq!(token, want);
+        assert_eq!(line, Some(31));
+        assert_eq!(spans, vec![(0usize, 2..48), (1usize, 2..43)]);
+
+        // …and clicking the second half joins upward to the same path.
+        let (token, line, _) = hard_wrap_path_candidate(&lines, 1, 20).unwrap();
+        assert_eq!(token, want);
+        assert_eq!(line, Some(31));
+    }
+
+    #[test]
+    fn hard_wrap_joins_three_rows_and_one_direction_only() {
+        let three = vec![
+            "- /tmp/repro/a-very-long-directory-".to_string(),
+            "  name/models/staging/antifraud/stg_af_card_".to_string(),
+            "  payments.sql:31 - key".to_string(),
+        ];
+        let want = "/tmp/repro/a-very-long-directory-name/models/staging/antifraud/stg_af_card_payments.sql";
+        let (token, _, spans) = hard_wrap_path_candidate(&three, 1, 8).unwrap();
+        assert_eq!(token, want);
+        assert_eq!(spans.len(), 3);
+
+        // The row above ends in a space, so only the downward join applies.
+        let down_only = vec![
+            "intro text ".to_string(),
+            "  /tmp/repro/a-very-long-directory-name/models/staging/antifraud/stg_af_card_"
+                .to_string(),
+            "  payments.sql:31".to_string(),
+        ];
+        let (token, line, _) = hard_wrap_path_candidate(&down_only, 1, 10).unwrap();
+        assert_eq!(token, want);
+        assert_eq!(line, Some(31));
+    }
+
+    #[test]
+    fn hard_wrap_refuses_rows_that_are_not_continuations() {
+        // Continuation at column 1 is the terminal's own soft wrap —
+        // `join_wrapped_rows` owns that case, so this must not fire.
+        let soft = vec![
+            "- /tmp/repro/models/s".to_string(),
+            "taging/antifraud/a.sql".to_string(),
+        ];
+        assert_eq!(hard_wrap_path_candidate(&soft, 0, 20), None);
+
+        // The first row was not cut off: a space stands before its end.
+        let complete = vec![
+            "- /tmp/repro/x ".to_string(),
+            "  taging/antifraud/a.sql".to_string(),
+        ];
+        assert_eq!(hard_wrap_path_candidate(&complete, 0, 12), None);
+
+        // Nothing path-shaped under the cursor.
+        let prose = vec!["hello world".to_string(), "  again".to_string()];
+        assert_eq!(hard_wrap_path_candidate(&prose, 0, 3), None);
+    }
+
+    /// The join is lexical, so two unrelated paths in an indented list do get
+    /// glued — and the resolver is what refuses the result. Nothing is
+    /// underlined and nothing opens.
+    #[test]
+    fn resolved_path_prefers_the_plain_token_and_lets_the_resolver_refuse() {
+        let real = "/tmp/repro/models/staging/a.sql";
+        let resolve = |token: &str| -> Option<std::path::PathBuf> {
+            (token == real).then(|| std::path::PathBuf::from(token))
+        };
+
+        // One row: unchanged behaviour, and the plain token wins.
+        let one = vec![format!("- {real}:31 - key")];
+        let (path, line, spans) = resolved_path_at_cell(&one, 80, 0, 6, resolve).unwrap();
+        assert_eq!(path, std::path::PathBuf::from(real));
+        assert_eq!(line, Some(31));
+        assert_eq!(spans, vec![(0usize, 2..33)]);
+
+        // Split across the writer's own wrap: rebuilt, then resolved.
+        let split = vec![
+            "- /tmp/repro/models/sta".to_string(),
+            "  ging/a.sql:31 - key".to_string(),
+        ];
+        let (path, line, spans) = resolved_path_at_cell(&split, 80, 1, 8, resolve).unwrap();
+        assert_eq!(path, std::path::PathBuf::from(real));
+        assert_eq!(line, Some(31));
+        assert_eq!(spans, vec![(0usize, 2..23), (1usize, 2..12)]);
+
+        // Two unrelated paths glue into a path that does not exist.
+        let unrelated = vec![
+            "- /tmp/repro/nope.sql".to_string(),
+            "  /etc/hosts".to_string(),
+        ];
+        assert!(hard_wrap_path_candidate(&unrelated, 0, 12).is_some());
+        assert_eq!(resolved_path_at_cell(&unrelated, 80, 0, 12, resolve), None);
     }
 
     #[test]
