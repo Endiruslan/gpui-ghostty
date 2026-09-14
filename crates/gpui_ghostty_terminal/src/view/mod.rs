@@ -979,6 +979,26 @@ impl TerminalInput {
 /// from its `TerminalConfig.font_family` while keeping the rich fallback
 /// chain from `default_terminal_font()` (SF Mono, Cascadia, JetBrains,
 /// Noto CJK mono, emoji …).
+/// See [`TerminalView::scrollback_text`].
+fn scrollback_text(session: &TerminalSession, max_rows: u32) -> String {
+    let mut rows = Vec::with_capacity(max_rows.min(256) as usize);
+    for above in 0..max_rows {
+        match session.dump_screen_row(above) {
+            Ok(Some(row)) => rows.push(row),
+            _ => break,
+        }
+    }
+    let viewport = session.dump_viewport().unwrap_or_default();
+    let mut out =
+        String::with_capacity(rows.iter().map(|r| r.len() + 1).sum::<usize>() + viewport.len());
+    for row in rows.iter().rev() {
+        out.push_str(row.trim_end_matches('\n'));
+        out.push('\n');
+    }
+    out.push_str(&viewport);
+    out
+}
+
 fn font_for_session(session: &TerminalSession) -> gpui::Font {
     let mut font = crate::default_terminal_font();
     if let Some(family) = session.font_family() {
@@ -2108,6 +2128,17 @@ impl TerminalView {
     /// screen state regardless of prepaint timing.
     pub fn viewport_text(&self) -> String {
         self.session.dump_viewport().unwrap_or_default()
+    }
+
+    /// Up to `max_rows` scrollback rows above the viewport, oldest first, then
+    /// [`Self::viewport_text`].
+    ///
+    /// Rows count from the *viewport top*, so a pane the user scrolled back
+    /// reads from where the user is looking, not from the live bottom. Each
+    /// row is one FFI call and one allocation: call on demand, never from a
+    /// render path, and keep `max_rows` bounded.
+    pub fn scrollback_text(&self, max_rows: u32) -> String {
+        scrollback_text(&self.session, max_rows)
     }
 
     /// Latest OSC 9;4 report's raw payload — the text after "9;", verbatim
@@ -5118,6 +5149,39 @@ pub(crate) fn cell_metrics_with_overrides(
 #[cfg(test)]
 mod tests {
     use ghostty_vt::Rgb;
+
+    /// 100 numbered lines into a 24-row screen: the rows that scrolled off
+    /// come back in order ahead of the viewport, and `max_rows` bounds them.
+    #[test]
+    fn scrollback_text_returns_rows_above_viewport() {
+        let mut vt =
+            crate::TerminalSession::new(crate::TerminalConfig::default()).expect("session");
+        let mut bytes = Vec::new();
+        for i in 0..100 {
+            bytes.extend_from_slice(format!("line-{i:03}\r\n").as_bytes());
+        }
+        vt.feed(&bytes).expect("feed");
+
+        let all = super::scrollback_text(&vt, 1000);
+        let lines: Vec<&str> = all.lines().filter(|l| !l.trim().is_empty()).collect();
+        let expected: Vec<String> = (0..100).map(|i| format!("line-{i:03}")).collect();
+        assert_eq!(lines, expected, "full read: {all:?}");
+
+        let capped = super::scrollback_text(&vt, 10);
+        let first = capped.lines().next().unwrap_or_default();
+        let viewport_top = vt.dump_viewport().expect("viewport");
+        let viewport_first = viewport_top.lines().next().unwrap_or_default().to_string();
+        let top: usize = viewport_first["line-".len()..]
+            .trim()
+            .parse()
+            .expect("numbered row");
+        assert_eq!(
+            first.trim(),
+            format!("line-{:03}", top - 10),
+            "capped read: {capped:?}"
+        );
+        assert!(capped.ends_with(&viewport_top));
+    }
 
     use super::{
         char_drawn_as_quad, extract_input_prefix, file_url_to_path, hard_wrap_path_candidate,
