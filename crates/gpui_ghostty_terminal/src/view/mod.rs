@@ -1023,6 +1023,9 @@ pub struct TerminalView {
     last_window_title: Option<String>,
     input: Option<TerminalInput>,
     pending_output: Vec<u8>,
+    /// Output was fed by [`TerminalView::flush_pending_output`] since the last
+    /// render; that render treats it as its own pending output.
+    output_flushed_since_render: bool,
     pending_refresh: bool,
     selection: Option<ByteSelection>,
     /// Per-row byte ranges of the URL under the mouse while Cmd is held.
@@ -1173,6 +1176,7 @@ impl TerminalView {
             last_window_title: None,
             input: None,
             pending_output: Vec::new(),
+            output_flushed_since_render: false,
             pending_refresh: false,
             selection: None,
             hovered_link: None,
@@ -1245,6 +1249,7 @@ impl TerminalView {
             last_window_title: None,
             input: Some(input),
             pending_output: Vec::new(),
+            output_flushed_since_render: false,
             pending_refresh: false,
             selection: None,
             hovered_link: None,
@@ -2120,6 +2125,37 @@ impl TerminalView {
     /// history, or the current prefix was Esc-dismissed.
     pub fn suggestion_suffix(&self) -> Option<&str> {
         self.suggestion.as_ref().map(|(_, suffix)| suffix.as_str())
+    }
+
+    /// Feed output queued since the last render into the VT now.
+    ///
+    /// Output reaches the VT in `render`, and a view nobody draws (a pane in
+    /// a background tab) never renders, so a reader of [`Self::viewport_text`]
+    /// or [`Self::scrollback_text`] saw a screen frozen at its last paint.
+    /// Call this before reading a view that may be off screen.
+    pub fn flush_pending_output(&mut self, cx: &mut Context<Self>) {
+        if self.apply_pending_output(cx) {
+            self.output_flushed_since_render = true;
+        }
+    }
+
+    fn apply_pending_output(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pending_output.is_empty() {
+            return false;
+        }
+        let bytes = std::mem::take(&mut self.pending_output);
+        let sync_before = self.session.synchronized_output_active();
+        let touched_sync_mode = Self::has_synchronized_output_mode_change(&bytes);
+        self.feed_output_bytes_to_session(&bytes);
+        self.apply_side_effects(cx);
+        let sync_after = self.session.synchronized_output_active();
+
+        if sync_after || sync_before || touched_sync_mode {
+            self.pending_refresh = true;
+        } else {
+            self.reconcile_dirty_viewport_after_output();
+        }
+        true
     }
 
     /// Plain-text dump of the visible viewport, rows joined with `\n`.
@@ -5015,23 +5051,8 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         ensure_key_bindings(cx);
 
-        let had_pending_output = !self.pending_output.is_empty();
-        if had_pending_output {
-            let bytes = std::mem::take(&mut self.pending_output);
-            let sync_before = self.session.synchronized_output_active();
-            let touched_sync_mode = Self::has_synchronized_output_mode_change(&bytes);
-            self.feed_output_bytes_to_session(&bytes);
-            self.apply_side_effects(cx);
-            let sync_after = self.session.synchronized_output_active();
-
-            if sync_after {
-                self.pending_refresh = true;
-            } else if sync_before || touched_sync_mode {
-                self.pending_refresh = true;
-            } else {
-                self.reconcile_dirty_viewport_after_output();
-            }
-        }
+        let flushed_by_reader = std::mem::take(&mut self.output_flushed_since_render);
+        let had_pending_output = self.apply_pending_output(cx) || flushed_by_reader;
 
         // The alt screen has no scrollback. If we entered it while a sub-line
         // scroll offset / peek row lingered from the primary screen, drop them
