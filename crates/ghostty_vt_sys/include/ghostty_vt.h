@@ -74,9 +74,24 @@ int32_t ghostty_vt_terminal_take_viewport_scroll_delta(ghostty_vt_terminal_t ter
 ghostty_vt_bytes_t ghostty_vt_terminal_hyperlink_at(ghostty_vt_terminal_t terminal,
                                                     uint16_t col,
                                                     uint16_t row);
-ghostty_vt_bytes_t ghostty_vt_encode_key_named(const uint8_t* name,
-                                               size_t name_len,
-                                               uint16_t modifiers);
+/* Keyboard events use the native platform keycode when available (UINT32_MAX
+ * otherwise), plus layout text before shortcut normalization. */
+typedef struct {
+    const uint8_t *name;
+    size_t name_len;
+    const uint8_t *text;
+    size_t text_len;
+    uint32_t native_keycode;
+    uint32_t unshifted_codepoint;
+    uint16_t modifiers;
+    uint16_t consumed_modifiers;
+    uint8_t action; /* release=0, press=1, repeat=2 */
+    bool composing;
+} ghostty_vt_key_event_t;
+ghostty_vt_bytes_t ghostty_vt_terminal_encode_key(void *terminal, const ghostty_vt_key_event_t *event);
+uint8_t ghostty_vt_terminal_keyboard_flags(void *terminal);
+void ghostty_vt_terminal_reset_keyboard(void *terminal);
+
 void ghostty_vt_bytes_free(ghostty_vt_bytes_t bytes);
 
 #ifdef __cplusplus

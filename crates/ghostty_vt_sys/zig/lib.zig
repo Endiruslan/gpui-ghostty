@@ -820,16 +820,8 @@ export fn ghostty_vt_terminal_hyperlink_at(
     return .{ .ptr = duped.ptr, .len = duped.len };
 }
 
-export fn ghostty_vt_encode_key_named(
-    name_ptr: ?[*]const u8,
-    name_len: usize,
-    modifiers: u16,
-) callconv(.c) ghostty_vt_bytes_t {
-    if (name_ptr == null or name_len == 0) return .{ .ptr = null, .len = 0 };
-
-    const name = name_ptr.?[0..name_len];
-
-    const key_value: ghostty_input.Key = if (std.mem.eql(u8, name, "up"))
+fn namedKey(name: []const u8) ghostty_input.Key {
+    return if (std.mem.eql(u8, name, "up"))
         .arrow_up
     else if (std.mem.eql(u8, name, "down"))
         .arrow_down
@@ -851,71 +843,101 @@ export fn ghostty_vt_encode_key_named(
         .delete
     else if (std.mem.eql(u8, name, "backspace"))
         .backspace
-    else if (std.mem.eql(u8, name, "enter"))
+    else if ((std.mem.eql(u8, name, "enter") or std.mem.eql(u8, name, "return")))
         .enter
+    else if (std.mem.eql(u8, name, "numpad_enter") or std.mem.eql(u8, name, "kp_enter"))
+        .numpad_enter
+    else if (std.mem.eql(u8, name, "space"))
+        .space
+    else if (name.len == 1 and name[0] >= 'a' and name[0] <= 'z')
+        @enumFromInt(@intFromEnum(ghostty_input.Key.key_a) + name[0] - 'a')
     else if (std.mem.eql(u8, name, "tab"))
         .tab
     else if (std.mem.eql(u8, name, "escape"))
         .escape
     else if (name.len >= 2 and name[0] == 'f')
-        parse_function_key(name[1..]) orelse return .{ .ptr = null, .len = 0 }
+        parse_function_key(name[1..]) orelse .unidentified
     else
-        return .{ .ptr = null, .len = 0 };
+        .unidentified;
+}
 
-    var mods: ghostty_input.Mods = .{};
-    if ((modifiers & 0x0001) != 0) mods.shift = true;
-    if ((modifiers & 0x0002) != 0) mods.ctrl = true;
-    if ((modifiers & 0x0004) != 0) mods.alt = true;
-    if ((modifiers & 0x0008) != 0) mods.super = true;
+const ghostty_vt_key_event_t = extern struct {
+    name: [*]const u8,
+    name_len: usize,
+    text: [*]const u8,
+    text_len: usize,
+    native_keycode: u32,
+    unshifted_codepoint: u32,
+    modifiers: u16,
+    consumed_modifiers: u16,
+    action: u8,
+    composing: bool,
+};
 
+export fn ghostty_vt_terminal_reset_keyboard(ptr: ?*TerminalHandle) callconv(.c) void {
+    const h = ptr orelse return;
+    inline for (.{ .primary, .alternate }) |screen| {
+        if (h.terminal.screens.get(screen)) |scr| scr.kitty_keyboard = .{};
+    }
+    // A half-parsed sequence from a dead PTY must not consume new output.
+    h.stream.deinit();
+    h.handler.inner = terminal.ReadonlyHandler.init(&h.terminal);
+    h.stream = terminal.Stream(*Handler).initAlloc(h.alloc, &h.handler);
+    h.terminal.flags.modify_other_keys_2 = false;
+    h.terminal.modes.set(.cursor_keys, false);
+    h.terminal.modes.set(.keypad_keys, false);
+    h.terminal.modes.set(.ignore_keypad_with_numlock, true);
+    h.terminal.modes.set(.alt_esc_prefix, true);
+}
+
+export fn ghostty_vt_terminal_keyboard_flags(ptr: ?*TerminalHandle) callconv(.c) u8 {
+    const h = ptr orelse return 0;
+    return @intCast(h.terminal.screens.active.kitty_keyboard.current().int());
+}
+
+export fn ghostty_vt_terminal_encode_key(ptr: ?*TerminalHandle, raw: *const ghostty_vt_key_event_t) callconv(.c) ghostty_vt_bytes_t {
+    const h = ptr orelse return .{ .ptr = null, .len = 0 };
+    var key = namedKey(raw.name[0..raw.name_len]);
+    if (raw.native_keycode != std.math.maxInt(u32)) {
+        for (ghostty_input.keycodes.entries) |entry| {
+            if (entry.native == raw.native_keycode) {
+                key = entry.key;
+                break;
+            }
+        }
+    }
     const event: ghostty_input.KeyEvent = .{
-        .action = .press,
-        .key = key_value,
-        .mods = mods,
+        .key = key,
+        .action = std.meta.intToEnum(ghostty_input.Action, raw.action) catch return .{ .ptr = null, .len = 0 },
+        .mods = @bitCast(raw.modifiers),
+        .consumed_mods = @bitCast(raw.consumed_modifiers),
+        .utf8 = raw.text[0..raw.text_len],
+        .unshifted_codepoint = @intCast(raw.unshifted_codepoint),
+        .composing = raw.composing,
     };
-
-    // Ghostty 1.3: KeyEncoder struct became key_encode.encode(writer, ...).
-    var buf: [128]u8 = undefined;
-    var writer = std.Io.Writer.fixed(buf[0..]);
-    ghostty_input.key_encode.encode(
-        &writer,
-        event,
-        .{ .alt_esc_prefix = true },
-    ) catch return .{ .ptr = null, .len = 0 };
-    const encoded = writer.buffered();
-    if (encoded.len == 0) return .{ .ptr = null, .len = 0 };
-
-    const alloc = std.heap.c_allocator;
-    const duped = alloc.dupe(u8, encoded) catch return .{ .ptr = null, .len = 0 };
-    return .{ .ptr = duped.ptr, .len = duped.len };
+    // Same source of truth as Ghostty's Surface: never cache keyboard modes
+    // in the frontend. Push/pop, alternate screens and RIS all live here.
+    var options = ghostty_input.key_encode.Options.fromTerminal(&h.terminal);
+    options.macos_option_as_alt = .true;
+    var writer: std.Io.Writer.Allocating = .init(h.alloc);
+    defer writer.deinit();
+    // Zed / Warp compatibility for legacy shells only. Negotiated protocols
+    // must retain Shift+Enter's identity instead of turning it into Ctrl+J.
+    if (options.kitty_flags.int() == 0 and !options.modify_other_keys_state_2 and
+        key == .enter and event.mods.binding().int() == 1 and event.action != .release)
+    {
+        writer.writer.writeByte('\n') catch return .{ .ptr = null, .len = 0 };
+    } else {
+        ghostty_input.key_encode.encode(&writer.writer, event, options) catch return .{ .ptr = null, .len = 0 };
+    }
+    const result = writer.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = result.ptr, .len = result.len };
 }
 
 fn parse_function_key(digits: []const u8) ?ghostty_input.Key {
-    if (digits.len == 1) {
-        return switch (digits[0]) {
-            '1' => .f1,
-            '2' => .f2,
-            '3' => .f3,
-            '4' => .f4,
-            '5' => .f5,
-            '6' => .f6,
-            '7' => .f7,
-            '8' => .f8,
-            '9' => .f9,
-            else => null,
-        };
-    }
-
-    if (digits.len == 2 and digits[0] == '1') {
-        return switch (digits[1]) {
-            '0' => .f10,
-            '1' => .f11,
-            '2' => .f12,
-            else => null,
-        };
-    }
-
-    return null;
+    const n = std.fmt.parseInt(u8, digits, 10) catch return null;
+    if (n < 1 or n > 25) return null;
+    return @enumFromInt(@intFromEnum(ghostty_input.Key.f1) + n - 1);
 }
 
 const ghostty_vt_bytes_t = extern struct {

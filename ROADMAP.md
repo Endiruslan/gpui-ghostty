@@ -16,6 +16,9 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 
 ## Agent Work (Compacted)
 
+- [x] Route native keyboard events through Ghostty with per-session modes (Kitty, modifyOtherKeys, cursor/keypad); answer negotiation queries and retain legacy Shift+Enter LF only outside negotiated modes.
+- [x] Gate the adapter with upstream encoder tests, stream-boundary tests, native layout cases, and mxds real-PTY/zmx keyboard probes.
+
 - [x] M0: Workspace Bootstrap (Ghostty submodule, workspace layout, scripts, docs)
 - [x] M0.1: VT Core (Zig build + Rust sys + safe wrapper)
 - [x] M1.1: Viewport Scrolling (mouse wheel)

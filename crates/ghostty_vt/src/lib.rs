@@ -126,25 +126,67 @@ impl KeyModifiers {
     }
 }
 
-pub fn encode_key_named(name: &str, modifiers: KeyModifiers) -> Option<Vec<u8>> {
-    if name.is_empty() {
-        return None;
-    }
+/// A keyboard event before terminal protocol encoding. IME commits have text
+/// but no key; native keycodes retain keypad and left/right modifier identity.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyEvent<'a> {
+    pub key: &'a str,
+    pub text: &'a str,
+    pub modifiers: KeyModifiers,
+    pub consumed_modifiers: KeyModifiers,
+    pub native_keycode: Option<u32>,
+    pub unshifted_codepoint: Option<char>,
+    pub action: KeyAction,
+    pub composing: bool,
+    pub caps_lock: bool,
+    pub num_lock: bool,
+}
 
-    let bytes = unsafe {
-        ghostty_vt_sys::ghostty_vt_encode_key_named(name.as_ptr(), name.len(), modifiers.bits())
-    };
-    if bytes.ptr.is_null() || bytes.len == 0 {
-        return None;
-    }
-
-    let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
-    let out = slice.to_vec();
-    unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
-    Some(out)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KeyAction {
+    Release = 0,
+    #[default]
+    Press = 1,
+    Repeat = 2,
 }
 
 impl Terminal {
+    /// Forget the previous PTY's keyboard modes without erasing scrollback.
+    pub fn reset_keyboard(&mut self) {
+        unsafe { ghostty_vt_sys::ghostty_vt_terminal_reset_keyboard(self.ptr.as_ptr()) };
+    }
+
+    pub fn keyboard_flags(&self) -> u8 {
+        unsafe { ghostty_vt_sys::ghostty_vt_terminal_keyboard_flags(self.ptr.as_ptr()) }
+    }
+
+    /// Encode using THIS terminal's active keyboard modes, owned by Ghostty.
+    pub fn encode_key(&self, event: &KeyEvent<'_>) -> Vec<u8> {
+        let raw = ghostty_vt_sys::ghostty_vt_key_event_t {
+            name: event.key.as_ptr(),
+            name_len: event.key.len(),
+            text: event.text.as_ptr(),
+            text_len: event.text.len(),
+            native_keycode: event.native_keycode.unwrap_or(u32::MAX),
+            unshifted_codepoint: event.unshifted_codepoint.map_or(0, u32::from),
+            modifiers: event.modifiers.bits()
+                | (u16::from(event.caps_lock) << 4)
+                | (u16::from(event.num_lock) << 5),
+            consumed_modifiers: event.consumed_modifiers.bits(),
+            action: event.action as u8,
+            composing: event.composing,
+        };
+        let bytes =
+            unsafe { ghostty_vt_sys::ghostty_vt_terminal_encode_key(self.ptr.as_ptr(), &raw) };
+        if bytes.ptr.is_null() {
+            return Vec::new();
+        }
+        let out = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec();
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        out
+    }
+
     pub fn new(cols: u16, rows: u16) -> Result<Self, Error> {
         let ptr = unsafe { ghostty_vt_sys::ghostty_vt_terminal_new(cols, rows) };
         let ptr = NonNull::new(ptr).ok_or(Error::CreateFailed)?;

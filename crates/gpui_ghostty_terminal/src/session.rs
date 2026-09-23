@@ -1,4 +1,4 @@
-use ghostty_vt::{Error, Rgb, Terminal};
+use ghostty_vt::{Error, KeyEvent, Rgb, Terminal};
 
 use crate::{ColorScheme, TerminalConfig};
 
@@ -73,6 +73,14 @@ impl TerminalSession {
             osc_query_state: OscQueryScanState::default(),
             transparent_default_bgs: vec![initial_bg],
         })
+    }
+
+    pub fn encode_key(&self, event: &KeyEvent<'_>) -> Vec<u8> {
+        self.terminal.encode_key(event)
+    }
+
+    pub fn keyboard_flags(&self) -> u8 {
+        self.terminal.keyboard_flags()
     }
 
     pub fn cols(&self) -> u16 {
@@ -519,6 +527,10 @@ impl TerminalSession {
 
             if let Some(query) = csi {
                 match query {
+                    TerminalQuery::KeyboardFlags => {
+                        let response = format!("\x1b[?{}u", self.keyboard_flags());
+                        send(response.as_bytes());
+                    }
                     TerminalQuery::DeviceStatus => send(b"\x1b[0n"),
                     TerminalQuery::CursorPosition => {
                         let (col, row) = self.cursor_position().unwrap_or((1, 1));
@@ -630,6 +642,7 @@ impl TerminalSession {
     /// zmx re-attach replays the session's modes (measured: `?2031h` comes
     /// back in the replay), so resetting first is right there too.
     pub fn reset_for_new_pty(&mut self) {
+        self.terminal.reset_keyboard();
         self.reset_modes();
         self.parse_tail.clear();
         self.csi_query_state = CsiQueryScanState::default();
@@ -714,6 +727,7 @@ impl TerminalSession {
 /// A query in the pty output that the terminal — not the shell — must answer.
 #[derive(Clone, Copy, Debug)]
 enum TerminalQuery {
+    KeyboardFlags,
     /// `CSI 5 n`.
     DeviceStatus,
     /// `CSI 6 n`.
@@ -852,10 +866,10 @@ impl CsiQueryScanState {
                     marker,
                     value,
                     multi,
-                    ..
+                    saw_digit,
                 },
                 final_byte @ 0x40..=0x7e,
-            ) => (Idle, csi_query(marker, value, multi, final_byte)),
+            ) => (Idle, csi_query(marker, value, saw_digit, multi, final_byte)),
             _ => (Idle, None),
         };
 
@@ -864,11 +878,18 @@ impl CsiQueryScanState {
     }
 }
 
-fn csi_query(marker: u8, value: u32, multi: bool, final_byte: u8) -> Option<TerminalQuery> {
+fn csi_query(
+    marker: u8,
+    value: u32,
+    saw_digit: bool,
+    multi: bool,
+    final_byte: u8,
+) -> Option<TerminalQuery> {
     if multi {
         return None;
     }
     match (final_byte, marker, value) {
+        (b'u', b'?', 0) if !saw_digit => Some(TerminalQuery::KeyboardFlags),
         (b'n', 0 | b'?', 5) => Some(TerminalQuery::DeviceStatus),
         (b'n', 0 | b'?', 6) => Some(TerminalQuery::CursorPosition),
         (b'n', b'?', 996) => Some(TerminalQuery::ColorScheme),

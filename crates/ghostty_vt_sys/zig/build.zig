@@ -104,4 +104,20 @@ pub fn build(b: *std.Build) void {
     const lib_install = b.addInstallLibFile(lib.getEmittedBin(), "libghostty_vt.a");
     b.getInstallStep().dependOn(&include_step.step);
     b.getInstallStep().dependOn(&lib_install.step);
+    const keyboard_module = b.createModule(.{
+        .root_source_file = b.path("keyboard_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    keyboard_module.addImport("uucode", uucode_target.module("uucode"));
+    vt_options.add(b, keyboard_module);
+    keyboard_module.addAnonymousImport("unicode_tables", .{ .root_source_file = props_output });
+    keyboard_module.addAnonymousImport("symbols_tables", .{ .root_source_file = symbols_output });
+    const keyboard_tests = b.addTest(.{
+        .root_module = keyboard_module,
+        .filters = &.{ "kitty:", "legacy:", "ctrlseq:", "KittySequence:" },
+    });
+    keyboard_tests.linkLibC();
+    const run_keyboard_tests = b.addRunArtifact(keyboard_tests);
+    b.step("test-keyboard", "Run Ghostty's upstream keyboard encoder tests").dependOn(&run_keyboard_tests.step);
 }

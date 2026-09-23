@@ -670,12 +670,6 @@ fn sgr_mouse_encoding_helpers_match_expected_format() {
 }
 
 #[test]
-fn ctrl_c_encodes_to_etx_even_without_key_char() {
-    let ctrl_c = Keystroke::parse("ctrl-c").unwrap();
-    assert_eq!(crate::view::ctrl_byte_for_keystroke(&ctrl_c), Some(0x03));
-}
-
-#[test]
 fn cmd_arrows_and_backspace_map_to_emacs_line_editing_bytes() {
     // Cmd+Left / Cmd+Right jump to the ends of the line, as everywhere else
     // on macOS; the shell only understands the readline control bytes.
@@ -989,4 +983,58 @@ fn url_detected_inside_tool_call_prefix() {
         expected
     );
     assert_eq!(url_at_cell_in_wrapped_lines(&wrapped, cols, 1, 5), expected);
+}
+
+#[test]
+fn keyboard_queries_observe_every_transition_even_in_one_chunk() {
+    let bytes = b"\x1b[?u\x1b[>1u\x1b[?u\x1b[=8;2u\x1b[?u\x1b[=1;3u\x1b[?u\x1b[<u\x1b[?u";
+    for chunk_size in 1..=bytes.len() {
+        let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+        let mut replies = Vec::new();
+        for chunk in bytes.chunks(chunk_size) {
+            session
+                .feed_with_pty_responses(chunk, |b| replies.extend_from_slice(b))
+                .unwrap();
+        }
+        assert_eq!(
+            replies, b"\x1b[?0u\x1b[?1u\x1b[?9u\x1b[?8u\x1b[?0u",
+            "chunk size {chunk_size}"
+        );
+    }
+}
+
+#[test]
+fn keyboard_modes_do_not_leak_to_another_session() {
+    let mut first = TerminalSession::new(TerminalConfig::default()).unwrap();
+    let second = TerminalSession::new(TerminalConfig::default()).unwrap();
+    first.feed(b"\x1b[>31u").unwrap();
+    assert_eq!(first.keyboard_flags(), 31);
+    assert_eq!(second.keyboard_flags(), 0);
+    first.full_reset();
+    assert_eq!(first.keyboard_flags(), 0);
+}
+
+#[test]
+fn pty_swap_resets_keyboard_without_erasing_scrollback() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    session.feed(b"keep me\x1b[>31u\x1b[?1h\x1b[>31").unwrap();
+    session.reset_for_new_pty();
+    assert_eq!(session.keyboard_flags(), 0);
+    session.feed(b"u").unwrap();
+    assert_eq!(session.keyboard_flags(), 0);
+    assert!(session.dump_viewport().unwrap().contains("keep me"));
+    assert_eq!(
+        session.encode_key(&ghostty_vt::KeyEvent {
+            key: "up",
+            ..Default::default()
+        }),
+        b"\x1b[A"
+    );
+}
+
+#[test]
+fn echoed_keyboard_flags_are_not_another_query() {
+    let mut session = TerminalSession::new(TerminalConfig::default()).unwrap();
+    assert!(replies(&mut session, b"\x1b[?0u\x1b[?31u").is_empty());
+    assert_eq!(replies(&mut session, b"\x1b[?u"), b"\x1b[?0u");
 }

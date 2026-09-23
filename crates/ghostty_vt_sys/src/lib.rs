@@ -1,4 +1,18 @@
 #[repr(C)]
+pub struct ghostty_vt_key_event_t {
+    pub name: *const u8,
+    pub name_len: usize,
+    pub text: *const u8,
+    pub text_len: usize,
+    pub native_keycode: u32,
+    pub unshifted_codepoint: u32,
+    pub modifiers: u16,
+    pub consumed_modifiers: u16,
+    pub action: u8,
+    pub composing: bool,
+}
+
+#[repr(C)]
 pub struct ghostty_vt_bytes_t {
     pub ptr: *const u8,
     pub len: usize,
@@ -8,6 +22,13 @@ pub const PINNED_GHOSTTY_TAG: &str = "v1.2.3";
 pub const PINNED_ZIG_VERSION: &str = "0.14.1";
 
 unsafe extern "C" {
+    pub fn ghostty_vt_terminal_reset_keyboard(terminal: *mut core::ffi::c_void);
+    pub fn ghostty_vt_terminal_encode_key(
+        terminal: *mut core::ffi::c_void,
+        event: *const ghostty_vt_key_event_t,
+    ) -> ghostty_vt_bytes_t;
+    pub fn ghostty_vt_terminal_keyboard_flags(terminal: *mut core::ffi::c_void) -> u8;
+
     pub fn ghostty_vt_terminal_new(cols: u16, rows: u16) -> *mut core::ffi::c_void;
     pub fn ghostty_vt_terminal_free(terminal: *mut core::ffi::c_void);
 
@@ -104,12 +125,6 @@ unsafe extern "C" {
         terminal: *mut core::ffi::c_void,
         col: u16,
         row: u16,
-    ) -> ghostty_vt_bytes_t;
-
-    pub fn ghostty_vt_encode_key_named(
-        name: *const u8,
-        name_len: usize,
-        modifiers: u16,
     ) -> ghostty_vt_bytes_t;
 
     pub fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t);

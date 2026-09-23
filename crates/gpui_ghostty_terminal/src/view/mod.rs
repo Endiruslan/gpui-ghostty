@@ -1,5 +1,7 @@
 use super::TerminalSession;
-use ghostty_vt::{KeyModifiers, Rgb, StyleRun, encode_key_named};
+use ghostty_vt::{KeyAction, KeyEvent, Rgb, StyleRun};
+
+mod keyboard;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     EntityInputHandler, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, IntoElement,
@@ -203,33 +205,6 @@ pub(crate) fn should_skip_key_down_for_ime(has_input: bool, keystroke: &gpui::Ke
         keystroke.key.as_str(),
         "enter" | "return" | "kp_enter" | "numpad_enter"
     )
-}
-
-pub(crate) fn ctrl_byte_for_keystroke(keystroke: &gpui::Keystroke) -> Option<u8> {
-    let candidate = keystroke
-        .key_char
-        .as_deref()
-        .or_else(|| (!keystroke.key.is_empty()).then_some(keystroke.key.as_str()))?;
-
-    if candidate == "space" {
-        return Some(0x00);
-    }
-
-    let bytes = candidate.as_bytes();
-    if bytes.len() != 1 {
-        return None;
-    }
-
-    let b = bytes[0];
-    if (b'@'..=b'_').contains(&b) {
-        Some(b & 0x1f)
-    } else if b.is_ascii_lowercase() {
-        Some(b - b'a' + 1)
-    } else if b.is_ascii_uppercase() {
-        Some(b - b'A' + 1)
-    } else {
-        None
-    }
 }
 
 /// The control byte a Cmd+key line-editing shortcut sends to the shell.
@@ -1042,6 +1017,8 @@ pub struct TerminalView {
     /// Skips re-scanning when the mouse moves within one cell.
     last_hover_cell: Option<(u16, u16)>,
     marked_text: Option<SharedString>,
+    // Only release keys whose press reached the PTY (not IME or app shortcuts).
+    pressed_keys: smallvec::SmallVec<[u32; 16]>,
     marked_selected_range_utf16: Range<usize>,
     font: gpui::Font,
     /// Whether the cursor should currently be drawn. When blink is enabled,
@@ -1184,6 +1161,7 @@ impl TerminalView {
             last_mouse_position: None,
             last_hover_cell: None,
             marked_text: None,
+            pressed_keys: smallvec::SmallVec::new(),
             marked_selected_range_utf16: 0..0,
             font,
             cursor_blink_on: true,
@@ -1210,24 +1188,46 @@ impl TerminalView {
         .with_refreshed_viewport()
     }
 
-    fn on_tab(&mut self, _: &Tab, _window: &mut Window, cx: &mut Context<Self>) {
-        self.send_tab(false, cx);
+    fn on_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_tab(false, window, cx);
     }
 
-    fn on_tab_prev(&mut self, _: &TabPrev, _window: &mut Window, cx: &mut Context<Self>) {
-        self.send_tab(true, cx);
+    fn on_tab_prev(&mut self, _: &TabPrev, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_tab(true, window, cx);
     }
 
-    fn send_tab(&mut self, reverse: bool, cx: &mut Context<Self>) {
-        if reverse {
-            self.send_input_parts(&[b"\x1b[Z"], cx);
-            return;
+    fn send_tab(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_pending_output(cx);
+        if !reverse && self.session.keyboard_flags() == 0 {
+            if let Some((_, suffix)) = self.suggestion.take() {
+                self.send_input_parts(&[suffix.as_bytes()], cx);
+                return;
+            }
         }
-        if let Some((_, suffix)) = self.suggestion.take() {
-            self.send_input_parts(&[suffix.as_bytes()], cx);
-            return;
+        let native = window.keyboard_event();
+        let key = gpui::Keystroke {
+            key: "tab".into(),
+            key_char: None,
+            modifiers: gpui::Modifiers {
+                shift: reverse,
+                ..Default::default()
+            },
+        };
+        let bytes = keyboard::encode(
+            &self.session,
+            &key,
+            native.as_ref(),
+            if native.as_ref().is_some_and(|n| n.is_repeat) {
+                KeyAction::Repeat
+            } else {
+                KeyAction::Press
+            },
+            false,
+        );
+        if !bytes.is_empty() {
+            self.track_keyboard_press(native.as_ref());
         }
-        self.send_input_parts(&[b"\t"], cx);
+        self.send_input_parts(&[&bytes], cx);
     }
 
     pub fn new_with_input(
@@ -1257,6 +1257,7 @@ impl TerminalView {
             last_mouse_position: None,
             last_hover_cell: None,
             marked_text: None,
+            pressed_keys: smallvec::SmallVec::new(),
             marked_selected_range_utf16: 0..0,
             font,
             cursor_blink_on: true,
@@ -1448,7 +1449,12 @@ impl TerminalView {
             return;
         }
 
-        self.send_input_parts(&[text.as_bytes()], cx);
+        self.apply_pending_output(cx);
+        let bytes = self.session.encode_key(&KeyEvent {
+            text,
+            ..Default::default()
+        });
+        self.send_input_parts(&[&bytes], cx);
     }
 
     fn send_input_parts(&mut self, parts: &[&[u8]], cx: &mut Context<Self>) {
@@ -1965,6 +1971,7 @@ impl TerminalView {
     /// normally. To make the shell *re-emit* the prompt right away, host
     /// can additionally send `\n` or `Ctrl+L` after calling this.
     pub fn reset_terminal(&mut self, cx: &mut Context<Self>) {
+        self.pressed_keys.clear();
         self.session.full_reset();
         self.refresh_viewport();
         self.peek_layout = None;
@@ -2029,6 +2036,7 @@ impl TerminalView {
     /// [`TerminalSession::reset_for_new_pty`]). Call before the new pty's
     /// first bytes are fed.
     pub fn reset_for_new_pty(&mut self) {
+        self.pressed_keys.clear();
         self.session.reset_for_new_pty();
     }
 
@@ -2300,6 +2308,26 @@ impl TerminalView {
     ) {
         if let Some(position) = self.last_mouse_position {
             self.update_link_hover(position, event.modifiers.platform, window, cx);
+        }
+        self.apply_pending_output(cx);
+        if self.session.keyboard_flags() & 8 != 0 {
+            if let Some(native) = window.keyboard_event() {
+                let pressed = native.is_down;
+                let bytes = self.session.encode_key(&KeyEvent {
+                    native_keycode: Some(native.keycode),
+                    modifiers: keyboard::modifiers(native.modifiers),
+                    caps_lock: native.capslock,
+                    action: if pressed {
+                        KeyAction::Press
+                    } else {
+                        KeyAction::Release
+                    },
+                    ..Default::default()
+                });
+                if !bytes.is_empty() {
+                    self.send_input_parts(&[&bytes], cx);
+                }
+            }
         }
     }
 
@@ -2613,7 +2641,24 @@ impl TerminalView {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn track_keyboard_press(&mut self, native: Option<&gpui::NativeKeyboardEvent>) {
+        if let Some(native) = native {
+            if !self.pressed_keys.contains(&native.keycode) {
+                self.pressed_keys.push(native.keycode);
+            }
+        }
+    }
+
+    /// Programmatic named keys use exactly the same per-session encoder as
+    /// physical input, without running local UI shortcuts or completion.
+    pub fn send_keystroke(&mut self, key: &gpui::Keystroke, cx: &mut Context<Self>) {
+        self.apply_pending_output(cx);
+        let bytes = keyboard::encode(&self.session, key, None, KeyAction::Press, false);
+        self.send_input_parts(&[&bytes], cx);
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_pending_output(cx);
         let raw_keystroke = event.keystroke.clone();
         if should_skip_key_down_for_ime(self.input.is_some(), &raw_keystroke) {
             return;
@@ -2629,7 +2674,7 @@ impl TerminalView {
             // byte still reaches the pty via the normal encode path below.
         }
 
-        if keystroke.modifiers.platform || keystroke.modifiers.function {
+        if keystroke.modifiers.platform && self.session.keyboard_flags() == 0 {
             if keystroke.modifiers.platform
                 && !keystroke.modifiers.shift
                 && !keystroke.modifiers.alt
@@ -2645,122 +2690,88 @@ impl TerminalView {
 
         let scroll_step = (self.session.rows() as i32 / 2).max(1);
 
-        if let Some(input) = self.input.as_ref() {
-            if keystroke.modifiers.shift {
-                match keystroke.key.as_str() {
-                    "home" => {
-                        let _ = self.session.scroll_viewport_top();
-                        self.sync_viewport_scroll_tracking();
-                        self.apply_side_effects(cx);
-                        self.schedule_viewport_refresh(cx);
-                        return;
-                    }
-                    "end" => {
-                        let _ = self.session.scroll_viewport_bottom();
-                        self.sync_viewport_scroll_tracking();
-                        self.apply_side_effects(cx);
-                        self.schedule_viewport_refresh(cx);
-                        return;
-                    }
-                    "pageup" | "page_up" | "page-up" => {
-                        let _ = self.session.scroll_viewport(-scroll_step);
-                        self.sync_viewport_scroll_tracking();
-                        self.apply_side_effects(cx);
-                        self.schedule_viewport_refresh(cx);
-                        return;
-                    }
-                    "pagedown" | "page_down" | "page-down" => {
-                        let _ = self.session.scroll_viewport(scroll_step);
-                        self.sync_viewport_scroll_tracking();
-                        self.apply_side_effects(cx);
-                        self.schedule_viewport_refresh(cx);
-                        return;
-                    }
-                    _ => {}
+        if (self.input.is_none() || keystroke.modifiers.shift) && self.session.keyboard_flags() == 0
+        {
+            match keystroke.key.as_str() {
+                "home" => {
+                    let _ = self.session.scroll_viewport_top();
+                    self.sync_viewport_scroll_tracking();
+                    self.apply_side_effects(cx);
+                    self.schedule_viewport_refresh(cx);
+                    return;
                 }
+                "end" => {
+                    let _ = self.session.scroll_viewport_bottom();
+                    self.sync_viewport_scroll_tracking();
+                    self.apply_side_effects(cx);
+                    self.schedule_viewport_refresh(cx);
+                    return;
+                }
+                "pageup" | "page_up" | "page-up" => {
+                    let _ = self.session.scroll_viewport(-scroll_step);
+                    self.sync_viewport_scroll_tracking();
+                    self.apply_side_effects(cx);
+                    self.schedule_viewport_refresh(cx);
+                    return;
+                }
+                "pagedown" | "page_down" | "page-down" => {
+                    let _ = self.session.scroll_viewport(scroll_step);
+                    self.sync_viewport_scroll_tracking();
+                    self.apply_side_effects(cx);
+                    self.schedule_viewport_refresh(cx);
+                    return;
+                }
+                _ => {}
             }
+        }
 
-            if keystroke.modifiers.control
-                && let Some(b) = ctrl_byte_for_keystroke(&keystroke)
-            {
-                input.send(&[b]);
+        let native = window.keyboard_event();
+        let bytes = keyboard::encode(
+            &self.session,
+            &keystroke,
+            native.as_ref(),
+            if event.is_held || native.as_ref().is_some_and(|n| n.is_repeat) {
+                KeyAction::Repeat
+            } else {
+                KeyAction::Press
+            },
+            self.marked_text.is_some(),
+        );
+        if !bytes.is_empty() {
+            self.track_keyboard_press(native.as_ref());
+            self.send_input_parts(&[&bytes], cx);
+            // Pattern from GPUI dispatch_keystroke: handled keys must stop
+            // propagation, otherwise AppKit inserts the same text via IME.
+            cx.stop_propagation();
+        }
+    }
+
+    fn on_key_up(&mut self, event: &gpui::KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_pending_output(cx);
+        let native = window.keyboard_event();
+        if let Some(native) = native.as_ref() {
+            let Some(index) = self
+                .pressed_keys
+                .iter()
+                .position(|code| *code == native.keycode)
+            else {
                 return;
-            }
-
-            if keystroke.modifiers.alt
-                && let Some(text) = keystroke.key_char.as_deref()
-            {
-                input.send(&[0x1b]);
-                input.send(text.as_bytes());
-                return;
-            }
-
-            let modifiers = KeyModifiers {
-                shift: keystroke.modifiers.shift,
-                control: keystroke.modifiers.control,
-                alt: keystroke.modifiers.alt,
-                super_key: false,
             };
-            if let Some(encoded) = encode_key_named(&keystroke.key, modifiers) {
-                input.send(&encoded);
-                return;
-            }
+            self.pressed_keys.swap_remove(index);
+        }
+        if self.session.keyboard_flags() & 2 == 0 {
             return;
         }
-
-        match keystroke.key.as_str() {
-            "home" => {
-                let _ = self.session.scroll_viewport_top();
-                self.sync_viewport_scroll_tracking();
-                self.apply_side_effects(cx);
-                self.schedule_viewport_refresh(cx);
-                return;
-            }
-            "end" => {
-                let _ = self.session.scroll_viewport_bottom();
-                self.sync_viewport_scroll_tracking();
-                self.apply_side_effects(cx);
-                self.schedule_viewport_refresh(cx);
-                return;
-            }
-            "pageup" | "page_up" | "page-up" => {
-                let _ = self.session.scroll_viewport(-scroll_step);
-                self.sync_viewport_scroll_tracking();
-                self.apply_side_effects(cx);
-                self.schedule_viewport_refresh(cx);
-                return;
-            }
-            "pagedown" | "page_down" | "page-down" => {
-                let _ = self.session.scroll_viewport(scroll_step);
-                self.sync_viewport_scroll_tracking();
-                self.apply_side_effects(cx);
-                self.schedule_viewport_refresh(cx);
-                return;
-            }
-            _ => {}
-        }
-
-        let modifiers = KeyModifiers {
-            shift: keystroke.modifiers.shift,
-            control: keystroke.modifiers.control,
-            alt: keystroke.modifiers.alt,
-            super_key: false,
-        };
-        if let Some(encoded) = encode_key_named(&keystroke.key, modifiers) {
-            let _ = self.session.feed(&encoded);
-            self.apply_side_effects(cx);
-            self.schedule_viewport_refresh(cx);
-            return;
-        }
-
-        if keystroke.key == "backspace" {
-            if let Some(input) = self.input.as_ref() {
-                input.send(&[0x7f]);
-                return;
-            }
-            let _ = self.session.feed(&[0x08]);
-            self.apply_side_effects(cx);
-            self.schedule_viewport_refresh(cx);
+        let bytes = keyboard::encode(
+            &self.session,
+            &event.keystroke,
+            native.as_ref(),
+            KeyAction::Release,
+            self.marked_text.is_some(),
+        );
+        if !bytes.is_empty() {
+            self.send_input_parts(&[&bytes], cx);
+            cx.stop_propagation();
         }
     }
 
@@ -5103,6 +5114,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::on_tab))
             .on_action(cx.listener(Self::on_tab_prev))
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
