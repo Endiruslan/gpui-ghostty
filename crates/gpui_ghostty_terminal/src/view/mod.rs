@@ -5132,6 +5132,13 @@ impl Render for TerminalView {
             .text_color(gpui::white())
             .font(self.font.clone())
             .whitespace_nowrap()
+            // Set the pointer on the terminal's own hitbox, as Zed does in
+            // terminal_view/src/terminal_element.rs; the host may default to IBeam.
+            .cursor(if self.session.alternate_screen_active() {
+                gpui::CursorStyle::Arrow
+            } else {
+                gpui::CursorStyle::IBeam
+            })
             // Pointer cursor while a Cmd+hovered link is underlined — same
             // affordance as iTerm / Terminal.app.
             .when(self.hovered_link.is_some(), |this| {
