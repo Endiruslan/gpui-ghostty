@@ -16,6 +16,8 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 
 ## Agent Work (Compacted)
 
+- [x] Preserve macOS Cmd line-editing bindings under Kitty, matching Ghostty defaults; covered by mxds app-action/PTY and native keyboard regression checks.
+
 - [x] Route native keyboard events through Ghostty with per-session modes (Kitty, modifyOtherKeys, cursor/keypad); answer negotiation queries and retain legacy Shift+Enter LF only outside negotiated modes.
 - [x] Gate the adapter with upstream encoder tests, stream-boundary tests, native layout cases, and mxds real-PTY/zmx keyboard probes.
 

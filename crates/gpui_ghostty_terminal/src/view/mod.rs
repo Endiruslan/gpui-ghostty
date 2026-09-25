@@ -211,7 +211,9 @@ pub(crate) fn should_skip_key_down_for_ime(has_input: bool, keystroke: &gpui::Ke
 ///
 /// macOS apps bind Cmd+Left/Right/Backspace to line editing, but a terminal
 /// has no escape sequence for any of it — readline and zle listen for the
-/// emacs control bytes instead. So we translate, exactly as Zed and iTerm2
+/// emacs control bytes instead. Keep these bindings even with Kitty enabled,
+/// as Ghostty does in src/config/Config.zig ("Natural text editing").
+/// So we translate, exactly as Zed and iTerm2
 /// do (pattern from zed assets/keymaps/default-macos.json, the Terminal
 /// context: `"cmd-left": ["terminal::SendKeystroke", "ctrl-a"]`).
 pub(crate) fn cmd_line_editing_byte(key: &str) -> Option<u8> {
@@ -2674,18 +2676,20 @@ impl TerminalView {
             // byte still reaches the pty via the normal encode path below.
         }
 
-        if keystroke.modifiers.platform && self.session.keyboard_flags() == 0 {
-            if keystroke.modifiers.platform
-                && !keystroke.modifiers.shift
+        if keystroke.modifiers.platform {
+            if !keystroke.modifiers.shift
                 && !keystroke.modifiers.alt
                 && !keystroke.modifiers.control
                 && let Some(byte) = cmd_line_editing_byte(keystroke.key.as_str())
                 && let Some(input) = self.input.as_ref()
             {
                 input.send(&[byte]);
+                cx.stop_propagation();
                 return;
             }
-            return;
+            if self.session.keyboard_flags() == 0 {
+                return;
+            }
         }
 
         let scroll_step = (self.session.rows() as i32 / 2).max(1);
