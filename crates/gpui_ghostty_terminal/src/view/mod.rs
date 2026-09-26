@@ -1111,6 +1111,66 @@ pub struct TerminalView {
     /// [`Self::apply_side_effects`], not rebuilt on every
     /// [`Self::osc_progress`] call. Empty before the first report.
     osc_progress: String,
+    /// A finished selection was announced with
+    /// [`SelectionEvent::Committed`] and nothing has retracted it yet. The
+    /// next press, keystroke, scroll or resize emits
+    /// [`SelectionEvent::Cleared`] exactly once.
+    selection_committed: bool,
+    /// Whether the last viewport refresh saw the alternate screen. A
+    /// selection is carried across a refresh only when this and the current
+    /// screen are both the alternate one — see [`Self::carry_selection`].
+    refreshed_on_alt_screen: bool,
+}
+
+/// A finished terminal-side selection, captured the moment the mouse was
+/// released. A TUI may repaint the selected cells a frame later, so the host
+/// works from this copy and never re-reads the grid.
+#[derive(Clone, Debug)]
+pub struct SelectionSnapshot {
+    /// The selected text, exactly what Copy would put on the clipboard.
+    pub text: String,
+    /// The full text of every viewport row the selection touches.
+    pub lines: Vec<String>,
+    /// The selection as a byte range of `lines.join("\n")`.
+    pub range_in_lines: Range<usize>,
+    /// Window coordinates of the bottom edge of the selection's last cell —
+    /// where a host hangs an affordance for it.
+    pub anchor: gpui::Point<Pixels>,
+    /// The selection was made on the alternate screen (a fullscreen TUI).
+    pub alternate_screen: bool,
+}
+
+/// The lifecycle of a finished (mouse-released) local selection.
+#[derive(Clone, Debug)]
+pub enum SelectionEvent {
+    /// The user finished dragging out a non-empty selection.
+    Committed(SelectionSnapshot),
+    /// The last committed selection no longer stands: the user pressed the
+    /// mouse again, typed, scrolled, or the grid was resized or reset.
+    Cleared,
+}
+
+/// `(row, byte within row)` of a viewport byte index under `offsets`.
+fn viewport_grid_point(offsets: &[usize], index: usize) -> (usize, usize) {
+    let row = offsets.partition_point(|&o| o <= index).saturating_sub(1);
+    let start = offsets.get(row).copied().unwrap_or(0);
+    (row, index.saturating_sub(start))
+}
+
+/// The viewport byte index of a `(row, byte)` grid point in a viewport laid
+/// out as `lines` / `offsets`: the byte is clamped to the row's text and
+/// floored to a char boundary. `None` when the row no longer exists.
+fn viewport_index_at(
+    lines: &[String],
+    offsets: &[usize],
+    (row, byte): (usize, usize),
+) -> Option<usize> {
+    let line = lines.get(row)?;
+    let mut byte = byte.min(line.len());
+    while !line.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    Some(offsets.get(row)? + byte)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1186,6 +1246,8 @@ impl TerminalView {
             dismissed_prefix: None,
             last_input_snapshot: None,
             osc_progress: String::new(),
+            selection_committed: false,
+            refreshed_on_alt_screen: false,
         }
         .with_refreshed_viewport()
     }
@@ -1282,6 +1344,8 @@ impl TerminalView {
             dismissed_prefix: None,
             last_input_snapshot: None,
             osc_progress: String::new(),
+            selection_committed: false,
+            refreshed_on_alt_screen: false,
         }
         .with_refreshed_viewport()
     }
@@ -1463,6 +1527,7 @@ impl TerminalView {
         if parts.is_empty() {
             return;
         }
+        self.retract_committed_selection(cx);
 
         // Auto-snap to live: any user input (typed character, key combo,
         // paste) jumps the viewport back to the active screen so the user
@@ -1630,7 +1695,10 @@ impl TerminalView {
     fn refresh_viewport(&mut self) {
         let viewport = self.session.dump_viewport().unwrap_or_default();
         self.viewport_lines = split_viewport_lines(&viewport);
-        self.viewport_line_offsets = Self::compute_viewport_line_offsets(&self.viewport_lines);
+        let old_offsets = std::mem::replace(
+            &mut self.viewport_line_offsets,
+            Self::compute_viewport_line_offsets(&self.viewport_lines),
+        );
         self.viewport_total_len = Self::compute_viewport_total_len(&self.viewport_lines);
         self.viewport_style_runs = (0..self.session.rows())
             .map(|row| {
@@ -1641,7 +1709,7 @@ impl TerminalView {
             .collect();
         self.line_layouts.clear();
         self.line_layout_key = None;
-        self.selection = None;
+        self.selection = self.carry_selection(&old_offsets);
         // Viewport text changed — peek row above may also have shifted.
         // It'll be re-fetched lazily in prepaint when needed.
         self.peek_dirty = true;
@@ -1770,10 +1838,109 @@ impl TerminalView {
             }
         }
 
-        self.viewport_line_offsets = Self::compute_viewport_line_offsets(&self.viewport_lines);
+        let old_offsets = std::mem::replace(
+            &mut self.viewport_line_offsets,
+            Self::compute_viewport_line_offsets(&self.viewport_lines),
+        );
         self.viewport_total_len = Self::compute_viewport_total_len(&self.viewport_lines);
-        self.selection = None;
+        self.selection = self.carry_selection(&old_offsets);
         true
+    }
+
+    /// The selection to keep after the viewport was re-read, given the line
+    /// offsets it was made against.
+    ///
+    /// On the alternate screen the grid never scrolls, so a selection keeps
+    /// naming the same cells while a fullscreen TUI (Claude Code, Codex)
+    /// repaints them — a spinner tick must not wipe the Shift-drag the user
+    /// is in the middle of, nor the one they just finished. On the primary
+    /// screen output scrolls the text out from under the cells, so the
+    /// selection is dropped there, as it always was. Crossing between the
+    /// two screens drops it as well: the cells now hold another screen.
+    fn carry_selection(&mut self, old_offsets: &[usize]) -> Option<ByteSelection> {
+        let alt = self.session.alternate_screen_active();
+        let was_alt = std::mem::replace(&mut self.refreshed_on_alt_screen, alt);
+        let selection = self.selection?;
+        if !(alt && was_alt) {
+            return None;
+        }
+        let map = |index| {
+            viewport_index_at(
+                &self.viewport_lines,
+                &self.viewport_line_offsets,
+                viewport_grid_point(old_offsets, index),
+            )
+        };
+        Some(ByteSelection {
+            anchor: map(selection.anchor)?,
+            active: map(selection.active)?,
+        })
+    }
+
+    /// Emit [`SelectionEvent::Cleared`] if a committed selection stands.
+    fn retract_committed_selection(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.selection_committed) {
+            cx.emit(SelectionEvent::Cleared);
+        }
+    }
+
+    /// Snapshot the current selection for [`SelectionEvent::Committed`].
+    /// `None` when nothing (or only whitespace) is selected.
+    fn selection_snapshot(&self, window: &mut Window) -> Option<SelectionSnapshot> {
+        let range = self.selection?.range();
+        let range =
+            range.start.min(self.viewport_total_len)..range.end.min(self.viewport_total_len);
+        if range.is_empty() || self.viewport_lines.is_empty() {
+            return None;
+        }
+        let text = self.viewport_slice(range.clone());
+        if text.trim().is_empty() {
+            return None;
+        }
+        let offsets = &self.viewport_line_offsets;
+        let last_ix = self.viewport_lines.len() - 1;
+        let first_row = viewport_grid_point(offsets, range.start).0.min(last_ix);
+        // `end - 1`: a selection that stops at column 0 of a row ends on the
+        // row above it.
+        let last_row = viewport_grid_point(offsets, range.end - 1)
+            .0
+            .clamp(first_row, last_ix);
+        let lines: Vec<String> = self.viewport_lines[first_row..=last_row].to_vec();
+        let joined_len = lines.iter().map(String::len).sum::<usize>() + lines.len() - 1;
+        let base = offsets[first_row];
+        let range_in_lines =
+            (range.start - base).min(joined_len)..(range.end - base).min(joined_len);
+
+        let last_line = &self.viewport_lines[last_row];
+        let mut end_in_row = range
+            .end
+            .saturating_sub(offsets[last_row])
+            .min(last_line.len());
+        while !last_line.is_char_boundary(end_in_row) {
+            end_in_row -= 1;
+        }
+        let (cell_width, cell_height) = cell_metrics_with_overrides(
+            window,
+            &self.font,
+            self.session.font_size(),
+            self.session.line_height_ratio(),
+        )?;
+        let x = match self.line_layouts.get(last_row) {
+            Some(Some(line)) => line.x_for_index(end_in_row),
+            _ => px(cell_width * last_line[..end_in_row].chars().count() as f32),
+        };
+        let y = px(cell_height * (last_row + 1) as f32 + self.pixel_offset);
+        let origin = self
+            .last_bounds
+            .map(|bounds| bounds.origin)
+            .unwrap_or_else(|| point(px(0.0), px(0.0)));
+        Some(SelectionSnapshot {
+            text,
+            lines,
+            range_in_lines,
+            anchor: point(origin.x + x, origin.y + y),
+            alternate_screen: self.session.alternate_screen_active(),
+        })
     }
 
     fn schedule_viewport_refresh(&mut self, cx: &mut Context<Self>) {
@@ -1983,10 +2150,12 @@ impl TerminalView {
         self.pixel_offset = 0.0;
         self.scroll_pos_dirty = true;
         self.selection = None;
+        self.retract_committed_selection(cx);
         cx.notify();
     }
 
     pub fn resize_terminal(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
+        self.retract_committed_selection(cx);
         let _ = self.session.resize(cols, rows);
         self.sync_viewport_scroll_tracking();
         self.pending_refresh = true;
@@ -2105,6 +2274,15 @@ impl TerminalView {
         self.selection
             .map(|s| !s.range().is_empty())
             .unwrap_or(false)
+    }
+
+    /// Drop the selection highlight (and retract a committed one) — e.g.
+    /// once a host has acted on it.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.retract_committed_selection(cx);
+        if self.selection.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// Toggle the "Copy on Select" behaviour at runtime — when on, every
@@ -2397,6 +2575,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window, cx);
+        self.retract_committed_selection(cx);
 
         if event.first_mouse {
             return;
@@ -2540,6 +2719,12 @@ impl TerminalView {
                     // shouldn't trigger this; only Left is the "select"
                     // gesture in our model.
                     self.copy_selection_to_clipboard(cx);
+                }
+                if event.button == MouseButton::Left
+                    && let Some(snapshot) = self.selection_snapshot(window)
+                {
+                    self.selection_committed = true;
+                    cx.emit(SelectionEvent::Committed(snapshot));
                 }
                 cx.notify();
             }
@@ -2807,6 +2992,7 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.retract_committed_selection(cx);
         let cell_h = cell_metrics_with_overrides(
             window,
             &self.font,
@@ -3233,6 +3419,8 @@ impl TerminalView {
 impl gpui::EventEmitter<ghostty_vt::TerminalEvent> for TerminalView {}
 
 impl gpui::EventEmitter<OpenPathRequest> for TerminalView {}
+
+impl gpui::EventEmitter<SelectionEvent> for TerminalView {}
 
 impl EntityInputHandler for TerminalView {
     fn text_for_range(
@@ -5193,6 +5381,52 @@ pub(crate) fn cell_metrics_with_overrides(
 #[cfg(test)]
 mod tests {
     use ghostty_vt::Rgb;
+
+    fn offsets(lines: &[&str]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for line in lines {
+            out.push(at);
+            at += line.len() + 1;
+        }
+        out
+    }
+
+    /// A byte index resolves to its row and the byte within it; the index of
+    /// a row's newline is the byte just past its text.
+    #[test]
+    fn viewport_grid_point_splits_an_index_into_row_and_byte() {
+        let offsets = offsets(&["abc", "", "defgh"]);
+        assert_eq!(super::viewport_grid_point(&offsets, 0), (0, 0));
+        assert_eq!(super::viewport_grid_point(&offsets, 3), (0, 3));
+        assert_eq!(super::viewport_grid_point(&offsets, 4), (1, 0));
+        assert_eq!(super::viewport_grid_point(&offsets, 5), (2, 0));
+        assert_eq!(super::viewport_grid_point(&offsets, 8), (2, 3));
+    }
+
+    /// A TUI repaint that changes a row's length keeps the selection on the
+    /// same row: the byte is clamped to the new text, floored to a char
+    /// boundary, and a row that vanished drops it.
+    #[test]
+    fn viewport_index_at_follows_a_repainted_row() {
+        let old = offsets(&["spinner ⠋ working", "result line"]);
+        let new_lines: Vec<String> = vec!["spinner ⠙".into(), "result line, longer".into()];
+        let new = offsets(&["spinner ⠙", "result line, longer"]);
+
+        let point = super::viewport_grid_point(&old, old[1] + 6);
+        assert_eq!(
+            super::viewport_index_at(&new_lines, &new, point),
+            Some(new[1] + 6)
+        );
+        // Byte 9 sat inside the three-byte braille glyph; past the end of the
+        // shorter row it clamps to the row's length.
+        assert_eq!(super::viewport_index_at(&new_lines, &new, (0, 9)), Some(8));
+        assert_eq!(
+            super::viewport_index_at(&new_lines, &new, (0, 30)),
+            Some(new_lines[0].len())
+        );
+        assert_eq!(super::viewport_index_at(&new_lines, &new, (2, 0)), None);
+    }
 
     /// 100 numbered lines into a 24-row screen: the rows that scrolled off
     /// come back in order ahead of the viewport, and `max_rows` bounds them.
