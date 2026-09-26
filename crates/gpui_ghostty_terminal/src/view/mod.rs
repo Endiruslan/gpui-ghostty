@@ -1120,6 +1120,10 @@ pub struct TerminalView {
     /// selection is carried across a refresh only when this and the current
     /// screen are both the alternate one — see [`Self::carry_selection`].
     refreshed_on_alt_screen: bool,
+    /// Shift was held when the current local selection was started — the
+    /// gesture a host may treat as "select to act on", as opposed to an
+    /// ordinary select-to-copy drag. Reported in [`SelectionSnapshot`].
+    selection_with_shift: bool,
 }
 
 /// A finished terminal-side selection, captured the moment the mouse was
@@ -1138,6 +1142,8 @@ pub struct SelectionSnapshot {
     pub anchor: gpui::Point<Pixels>,
     /// The selection was made on the alternate screen (a fullscreen TUI).
     pub alternate_screen: bool,
+    /// Shift was held when the selection was started.
+    pub with_shift: bool,
 }
 
 /// The lifecycle of a finished (mouse-released) local selection.
@@ -1248,6 +1254,7 @@ impl TerminalView {
             osc_progress: String::new(),
             selection_committed: false,
             refreshed_on_alt_screen: false,
+            selection_with_shift: false,
         }
         .with_refreshed_viewport()
     }
@@ -1346,6 +1353,7 @@ impl TerminalView {
             osc_progress: String::new(),
             selection_committed: false,
             refreshed_on_alt_screen: false,
+            selection_with_shift: false,
         }
         .with_refreshed_viewport()
     }
@@ -1940,6 +1948,7 @@ impl TerminalView {
             range_in_lines,
             anchor: point(origin.x + x, origin.y + y),
             alternate_screen: self.session.alternate_screen_active(),
+            with_shift: self.selection_with_shift,
         })
     }
 
@@ -2642,6 +2651,7 @@ impl TerminalView {
             if event.button == MouseButton::Left
                 && let Some(index) = self.mouse_position_to_viewport_index(event.position, window)
             {
+                self.selection_with_shift = event.modifiers.shift;
                 let point = ByteSelection {
                     anchor: index,
                     active: index,
