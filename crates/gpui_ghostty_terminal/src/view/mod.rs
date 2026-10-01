@@ -1269,11 +1269,11 @@ impl TerminalView {
 
     fn send_tab(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.apply_pending_output(cx);
-        if !reverse && self.session.keyboard_flags() == 0 {
-            if let Some((_, suffix)) = self.suggestion.take() {
-                self.send_input_parts(&[suffix.as_bytes()], cx);
-                return;
-            }
+        if tab_takes_suggestion(&self.session, reverse)
+            && let Some((_, suffix)) = self.suggestion.take()
+        {
+            self.send_input_parts(&[suffix.as_bytes()], cx);
+            return;
         }
         let native = window.keyboard_event();
         let key = gpui::Keystroke {
@@ -1998,17 +1998,6 @@ impl TerminalView {
         }
     }
 
-    /// True when the viewport's bottom edge touches the live screen — i.e.
-    /// we're not scrolled up into scrollback. Same formula the paint code
-    /// uses to gate cursor visibility, but read fresh from the session
-    /// rather than the paint-cycle `scroll_pos` cache: `apply_side_effects`
-    /// (and thus this) runs on feed, before that cache is refreshed.
-    fn at_live_bottom(&self) -> bool {
-        self.session.scroll_position().is_none_or(|p| {
-            u64::from(p.viewport_top) + u64::from(p.viewport_rows) >= u64::from(p.total_rows)
-        })
-    }
-
     /// Text the user has typed at the prompt so far: grid content from the
     /// input anchor to the cursor, restricted to a single row. `None` when
     /// there's no anchor, input has wrapped/gone multiline, the cursor
@@ -2035,7 +2024,7 @@ impl TerminalView {
 
     fn compute_suggestion(&mut self, prefix: Option<String>) -> Option<(String, String)> {
         let provider = self.suggestion_provider.as_ref()?;
-        if self.session.alternate_screen_active() || !self.at_live_bottom() {
+        if self.session.alternate_screen_active() || !at_live_bottom(&self.session) {
             return None;
         }
         let prefix = prefix?;
@@ -4151,6 +4140,22 @@ pub(crate) fn byte_index_for_column_in_line(line: &str, col: u16) -> usize {
     line.len()
 }
 
+/// True when the viewport's bottom edge touches the live screen — i.e.
+/// we're not scrolled up into scrollback. Same formula the paint code uses
+/// to gate cursor visibility, but read fresh from the session rather than
+/// the paint-cycle `scroll_pos` cache: `apply_side_effects` (and thus this)
+/// runs on feed, before that cache is refreshed.
+fn at_live_bottom(session: &TerminalSession) -> bool {
+    session.scroll_position().is_none_or(|p| {
+        u64::from(p.viewport_top) + u64::from(p.viewport_rows) >= u64::from(p.total_rows)
+    })
+}
+
+/// Does this Tab accept the ghost suggestion rather than reach the shell?
+fn tab_takes_suggestion(session: &TerminalSession, reverse: bool) -> bool {
+    !reverse && session.keyboard_flags() == 0 && at_live_bottom(session)
+}
+
 /// See [`TerminalView::current_input_prefix`].
 fn input_prefix(session: &TerminalSession) -> Option<String> {
     let anchor = session.input_anchor()?;
@@ -5512,6 +5517,26 @@ mod tests {
             super::next_input_snapshot(None, Some("echo \\\\")).as_deref(),
             Some("echo \\\\")
         );
+    }
+
+    /// Scrolled back, the ghost text is not drawn, so Tab must not insert
+    /// it: it reaches the shell as a plain Tab.
+    #[test]
+    fn tab_takes_suggestion_only_at_live_bottom() {
+        let mut vt =
+            crate::TerminalSession::new(crate::TerminalConfig::default()).expect("session");
+        let mut bytes = Vec::new();
+        for i in 0..100 {
+            bytes.extend_from_slice(format!("line-{i:03}\r\n").as_bytes());
+        }
+        vt.feed(&bytes).expect("feed");
+        assert!(super::tab_takes_suggestion(&vt, false));
+        assert!(!super::tab_takes_suggestion(&vt, true));
+
+        vt.scroll_viewport(-10).expect("scroll back");
+        assert!(!super::tab_takes_suggestion(&vt, false));
+        vt.scroll_viewport_bottom().expect("scroll to bottom");
+        assert!(super::tab_takes_suggestion(&vt, false));
     }
 
     use super::{
