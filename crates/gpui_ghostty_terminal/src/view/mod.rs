@@ -2015,16 +2015,7 @@ impl TerminalView {
     /// sits mid-line (user navigated left), or the row can't be modeled in
     /// v1 — see [`extract_input_prefix`].
     fn current_input_prefix(&self) -> Option<String> {
-        let anchor = self.session.input_anchor()?;
-        let cursor = self.session.cursor_position()?;
-        // `dump_viewport_row` takes a 0-based row index; `input_anchor` /
-        // `cursor_position` are 1-based — same convention the cursor-paint
-        // code uses (`row.saturating_sub(1)` there).
-        let line = self
-            .session
-            .dump_viewport_row(anchor.1.saturating_sub(1))
-            .ok()?;
-        extract_input_prefix(anchor, cursor, &line)
+        input_prefix(&self.session)
     }
 
     /// Recompute the autosuggest state and the input-capture snapshot.
@@ -2032,22 +2023,8 @@ impl TerminalView {
     /// never from render/paint. Provider calls only ever happen here.
     fn refresh_suggestion(&mut self, cx: &mut Context<Self>) {
         let prefix = self.current_input_prefix();
-        match prefix.as_deref() {
-            Some(p) if !p.is_empty() => {
-                self.last_input_snapshot = Some(p.to_string());
-            }
-            Some(_) => {
-                // Prefix extracted cleanly but is empty — input was erased
-                // (backspaced to nothing, or Ctrl+C cleared the line).
-                // Nothing to capture; clear any stale snapshot so a
-                // subsequent Enter doesn't record a phantom history entry.
-                self.last_input_snapshot = None;
-            }
-            None => {
-                // Row-bail (e.g. anchor/cursor/row lookup failed this
-                // frame) — keep whatever snapshot we already have.
-            }
-        }
+        self.last_input_snapshot =
+            next_input_snapshot(self.last_input_snapshot.take(), prefix.as_deref());
 
         let had = self.suggestion.is_some();
         self.suggestion = self.compute_suggestion(prefix);
@@ -4174,6 +4151,36 @@ pub(crate) fn byte_index_for_column_in_line(line: &str, col: u16) -> usize {
     line.len()
 }
 
+/// See [`TerminalView::current_input_prefix`].
+fn input_prefix(session: &TerminalSession) -> Option<String> {
+    let anchor = session.input_anchor()?;
+    let cursor = session.cursor_position()?;
+    // `dump_viewport_row` takes a 0-based row index; `input_anchor` /
+    // `cursor_position` are 1-based — same convention the cursor-paint
+    // code uses (`row.saturating_sub(1)` there).
+    let line = session.dump_viewport_row(anchor.1.saturating_sub(1)).ok()?;
+    extract_input_prefix(anchor, cursor, &line)
+}
+
+/// The input-capture snapshot after one [`TerminalView::refresh_suggestion`],
+/// from the one before it and the prefix read now.
+fn next_input_snapshot(prev: Option<String>, prefix: Option<&str>) -> Option<String> {
+    match prefix {
+        // An odd run of trailing backslashes continues the line: Enter will
+        // open a `> ` row, and this row alone is not the command.
+        Some(p) if p.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1 => None,
+        Some(p) if !p.is_empty() => Some(p.to_string()),
+        // Prefix extracted cleanly but is empty — input was erased
+        // (backspaced to nothing, or Ctrl+C cleared the line). Nothing to
+        // capture; clear any stale snapshot so a subsequent Enter doesn't
+        // record a phantom history entry.
+        Some(_) => None,
+        // Row-bail (e.g. anchor/cursor/row lookup failed this frame) — keep
+        // whatever snapshot we already have.
+        None => prev,
+    }
+}
+
 /// Pure core of [`TerminalView::current_input_prefix`] — split out so it's
 /// unit-testable without a live `TerminalSession`/GPUI context. `anchor`
 /// and `cursor` are 1-based `(col, row)`, matching
@@ -5469,6 +5476,42 @@ mod tests {
             "capped read: {capped:?}"
         );
         assert!(capped.ends_with(&viewport_top));
+    }
+
+    /// A command continued with a trailing `\\` is not one line, and its
+    /// first line is not a command: by `CommandStart` the snapshot is gone.
+    /// Feeds a real session in the order `apply_side_effects` reads it —
+    /// prefix first, then `drain_events`.
+    #[test]
+    fn continued_first_line_is_not_captured() {
+        let mut vt =
+            crate::TerminalSession::new(crate::TerminalConfig::default()).expect("session");
+        let mut snapshot = None;
+        let mut captured = Vec::new();
+        for chunk in [
+            &b"\x1b]133;A\x07$ \x1b]133;B\x07"[..],
+            b"echo a \\",
+            b"\r\n> ",
+            b"b\r\n\x1b]133;C\x07",
+        ] {
+            vt.feed(chunk).expect("feed");
+            snapshot = super::next_input_snapshot(snapshot, super::input_prefix(&vt).as_deref());
+            for event in vt.drain_events() {
+                match event {
+                    ghostty_vt::TerminalEvent::CommandStart { .. } => {
+                        captured.push(snapshot.take())
+                    }
+                    ghostty_vt::TerminalEvent::InputStart => snapshot = None,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(captured, [None]);
+        // An escaped backslash ends a real command.
+        assert_eq!(
+            super::next_input_snapshot(None, Some("echo \\\\")).as_deref(),
+            Some("echo \\\\")
+        );
     }
 
     use super::{
