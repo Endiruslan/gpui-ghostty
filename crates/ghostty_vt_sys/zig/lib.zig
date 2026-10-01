@@ -657,6 +657,37 @@ export fn ghostty_vt_terminal_dump_screen_row(
     return .{ .ptr = slice.ptr, .len = slice.len };
 }
 
+/// The active screen's text plus up to `rows_above_active` scrollback rows
+/// above it, in one dump — counted from the live bottom, so the result does
+/// not depend on where the viewport is scrolled.
+export fn ghostty_vt_terminal_dump_active_tail(
+    terminal_ptr: ?*anyopaque,
+    rows_above_active: u32,
+) callconv(.c) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    const screen = handle.terminal.screens.active;
+
+    const active_top: terminal.Pin = screen.pages.getTopLeft(.active);
+    const tl = switch (active_top.upOverflow(rows_above_active)) {
+        .offset => |p| p,
+        .overflow => |o| o.end,
+    };
+    const br = screen.pages.getBottomRight(.active) orelse return .{ .ptr = null, .len = 0 };
+
+    const alloc = std.heap.c_allocator;
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    errdefer builder.deinit();
+    screen.dumpString(&builder.writer, .{
+        .tl = tl,
+        .br = br,
+        .unwrap = false,
+    }) catch return .{ .ptr = null, .len = 0 };
+
+    const slice = builder.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
 export fn ghostty_vt_terminal_dump_screen_row_style_runs(
     terminal_ptr: ?*anyopaque,
     rows_above_viewport_top: u32,

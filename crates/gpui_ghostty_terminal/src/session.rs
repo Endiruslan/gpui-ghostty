@@ -593,6 +593,11 @@ impl TerminalSession {
         self.terminal.dump_screen_row(rows_above)
     }
 
+    /// See [`ghostty_vt::Terminal::dump_active_tail`].
+    pub fn dump_active_tail(&self, rows_above_active: u32) -> Result<String, Error> {
+        self.terminal.dump_active_tail(rows_above_active)
+    }
+
     pub fn dump_screen_row_style_runs(
         &self,
         rows_above: u32,

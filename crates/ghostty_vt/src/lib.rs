@@ -363,6 +363,26 @@ impl Terminal {
         Ok(Some(s))
     }
 
+    /// The active screen plus up to `rows_above_active` scrollback rows above
+    /// it, oldest first, as one string. Counts from the live bottom, so it
+    /// reads the same wherever the viewport is scrolled, and does not move it.
+    pub fn dump_active_tail(&self, rows_above_active: u32) -> Result<String, Error> {
+        let bytes = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_dump_active_tail(
+                self.ptr.as_ptr(),
+                rows_above_active,
+            )
+        };
+        if bytes.ptr.is_null() {
+            return Err(Error::DumpFailed);
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let s = String::from_utf8_lossy(slice).into_owned();
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Ok(s)
+    }
+
     /// Same as [`dump_screen_row`] but returns the per-cell style runs.
     /// Returns `Ok(None)` if no row at that offset.
     pub fn dump_screen_row_style_runs(

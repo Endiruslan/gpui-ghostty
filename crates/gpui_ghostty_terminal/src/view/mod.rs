@@ -958,22 +958,7 @@ impl TerminalInput {
 /// Noto CJK mono, emoji …).
 /// See [`TerminalView::scrollback_text`].
 fn scrollback_text(session: &TerminalSession, max_rows: u32) -> String {
-    let mut rows = Vec::with_capacity(max_rows.min(256) as usize);
-    for above in 0..max_rows {
-        match session.dump_screen_row(above) {
-            Ok(Some(row)) => rows.push(row),
-            _ => break,
-        }
-    }
-    let viewport = session.dump_viewport().unwrap_or_default();
-    let mut out =
-        String::with_capacity(rows.iter().map(|r| r.len() + 1).sum::<usize>() + viewport.len());
-    for row in rows.iter().rev() {
-        out.push_str(row.trim_end_matches('\n'));
-        out.push('\n');
-    }
-    out.push_str(&viewport);
-    out
+    session.dump_active_tail(max_rows).unwrap_or_default()
 }
 
 fn font_for_session(session: &TerminalSession) -> gpui::Font {
@@ -2329,13 +2314,13 @@ impl TerminalView {
         self.session.dump_viewport().unwrap_or_default()
     }
 
-    /// Up to `max_rows` scrollback rows above the viewport, oldest first, then
-    /// [`Self::viewport_text`].
+    /// Up to `max_rows` scrollback rows above the live screen, oldest first,
+    /// then the live screen itself.
     ///
-    /// Rows count from the *viewport top*, so a pane the user scrolled back
-    /// reads from where the user is looking, not from the live bottom. Each
-    /// row is one FFI call and one allocation: call on demand, never from a
-    /// render path, and keep `max_rows` bounded.
+    /// Counts from the live bottom, never from the viewport: a pane the user
+    /// scrolled back reads the same as one they did not, and the read does
+    /// not move their viewport. One FFI call that copies every row it returns:
+    /// call on demand, never from a render path, and keep `max_rows` bounded.
     pub fn scrollback_text(&self, max_rows: u32) -> String {
         scrollback_text(&self.session, max_rows)
     }
@@ -5537,6 +5522,27 @@ mod tests {
         assert!(!super::tab_takes_suggestion(&vt, false));
         vt.scroll_viewport_bottom().expect("scroll to bottom");
         assert!(super::tab_takes_suggestion(&vt, false));
+    }
+
+    /// A pane the user scrolled back reads the same as one at the live
+    /// bottom, and the read leaves the user where they were.
+    #[test]
+    fn scrollback_text_ignores_where_the_user_scrolled() {
+        let mut vt =
+            crate::TerminalSession::new(crate::TerminalConfig::default()).expect("session");
+        let mut bytes = Vec::new();
+        for i in 0..100 {
+            bytes.extend_from_slice(format!("line-{i:03}\r\n").as_bytes());
+        }
+        vt.feed(&bytes).expect("feed");
+        let live = super::scrollback_text(&vt, 30);
+        let live_all = super::scrollback_text(&vt, 1000);
+
+        vt.scroll_viewport(-20).expect("scroll back");
+        let top = vt.scroll_position().expect("position").viewport_top;
+        assert_eq!(super::scrollback_text(&vt, 30), live);
+        assert_eq!(super::scrollback_text(&vt, 1000), live_all);
+        assert_eq!(vt.scroll_position().expect("position").viewport_top, top);
     }
 
     use super::{

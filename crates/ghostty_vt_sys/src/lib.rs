@@ -97,6 +97,11 @@ unsafe extern "C" {
         rows_above_viewport_top: u32,
     ) -> ghostty_vt_bytes_t;
 
+    pub fn ghostty_vt_terminal_dump_active_tail(
+        terminal: *mut core::ffi::c_void,
+        rows_above_active: u32,
+    ) -> ghostty_vt_bytes_t;
+
     pub fn ghostty_vt_terminal_dump_screen_row_style_runs(
         terminal: *mut core::ffi::c_void,
         rows_above_viewport_top: u32,
