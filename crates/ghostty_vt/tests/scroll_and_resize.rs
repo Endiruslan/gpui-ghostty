@@ -29,3 +29,26 @@ fn resize_does_not_break_dump_or_feed() {
     let s = t.dump_viewport().unwrap();
     assert!(s.contains("after-resize"));
 }
+
+/// A pane keeps Ghostty's own default history (10 MB), not libghostty's
+/// 10 000-byte `Terminal.Options` default, which held ~800 rows: after
+/// `seq 1 20000` everything but the last ~800 lines was gone. 10 MB is
+/// ~8 900 rows: history is allocated in standard pages sized for 215
+/// columns whatever the pane's width, so the ceiling is a row count, the
+/// same one Ghostty itself has with its default `scrollback-limit`.
+#[test]
+fn scrollback_keeps_ghostty_default_history() {
+    let mut t = ghostty_vt::Terminal::new(80, 24).unwrap();
+
+    for i in 0..8_000 {
+        t.feed(format!("line-{i:05}\r\n").as_bytes()).unwrap();
+    }
+
+    t.scroll_viewport_top().unwrap();
+    let top = t.dump_viewport().unwrap();
+    assert!(
+        top.starts_with("line-00000"),
+        "oldest retained row is not the first line: {:?}",
+        top.lines().next()
+    );
+}

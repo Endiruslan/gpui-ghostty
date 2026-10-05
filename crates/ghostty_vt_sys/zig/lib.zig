@@ -43,6 +43,12 @@ const TerminalHandle = struct {
             // grapheme-clustered widths (Claude Code, etc.) render misaligned
             // tables. `default_modes` also seeds the RIS reset default.
             .default_modes = .{ .grapheme_cluster = true },
+            // History ceiling in BYTES, per terminal. libghostty's own
+            // `Terminal.Options` default is 10_000 bytes (~700 short rows);
+            // Ghostty the app passes its `scrollback-limit` config instead,
+            // whose default is 10_000_000 (vendor/ghostty/src/config/
+            // Config.zig:1385, termio/Termio.zig:245). Same value as Ghostty.
+            .max_scrollback = 10_000_000,
         });
         errdefer {
             var tmp = t;
