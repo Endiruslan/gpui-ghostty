@@ -32,8 +32,8 @@ fn reconcile(t: &mut Terminal, rows: u16, lines: &mut Vec<String>) {
                 *lines = full_dump(t);
             } else if delta > 0 {
                 lines.rotate_left(d);
-                for i in rows_us - d..rows_us {
-                    lines[i].clear();
+                for line in &mut lines[rows_us - d..rows_us] {
+                    line.clear();
                 }
             } else {
                 lines.rotate_right(d);
