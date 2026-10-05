@@ -27,6 +27,11 @@ pub struct Terminal {
     ptr: NonNull<c_void>,
 }
 
+/// Opens a faint run in [`Terminal::dump_active_tail`] (SO).
+pub const FAINT_OPEN: char = '\u{0E}';
+/// Closes a faint run in [`Terminal::dump_active_tail`] (SI).
+pub const FAINT_CLOSE: char = '\u{0F}';
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
     pub r: u8,
@@ -366,6 +371,12 @@ impl Terminal {
     /// The active screen plus up to `rows_above_active` scrollback rows above
     /// it, oldest first, as one string. Counts from the live bottom, so it
     /// reads the same wherever the viewport is scrolled, and does not move it.
+    ///
+    /// Text drawn faint (SGR 2) is bracketed by [`FAINT_OPEN`] … [`FAINT_CLOSE`]
+    /// — C0 controls, which a cell can never hold. A run never spans a line:
+    /// it closes before the `\n`. Programs draw their own ghost text this way
+    /// (Claude Code's and Codex's input placeholders and suggestions), so a
+    /// reader can tell it from what was typed.
     pub fn dump_active_tail(&self, rows_above_active: u32) -> Result<String, Error> {
         let bytes = unsafe {
             ghostty_vt_sys::ghostty_vt_terminal_dump_active_tail(

@@ -663,9 +663,16 @@ export fn ghostty_vt_terminal_dump_screen_row(
     return .{ .ptr = slice.ptr, .len = slice.len };
 }
 
+/// Brackets of a faint (SGR 2) run in `dump_active_tail`'s output. Neither
+/// byte can be cell content — C0 controls are executed, never printed.
+const FAINT_OPEN: u8 = 0x0E; // SO
+const FAINT_CLOSE: u8 = 0x0F; // SI
+
 /// The active screen's text plus up to `rows_above_active` scrollback rows
 /// above it, in one dump — counted from the live bottom, so the result does
-/// not depend on where the viewport is scrolled.
+/// not depend on where the viewport is scrolled. Every run of bytes that came
+/// from a faint cell is bracketed by FAINT_OPEN / FAINT_CLOSE; a run never
+/// spans a newline (it closes before the `\n`).
 export fn ghostty_vt_terminal_dump_active_tail(
     terminal_ptr: ?*anyopaque,
     rows_above_active: u32,
@@ -683,14 +690,39 @@ export fn ghostty_vt_terminal_dump_active_tail(
 
     const alloc = std.heap.c_allocator;
     var builder: std.Io.Writer.Allocating = .init(alloc);
-    errdefer builder.deinit();
-    screen.dumpString(&builder.writer, .{
-        .tl = tl,
-        .br = br,
-        .unwrap = false,
-    }) catch return .{ .ptr = null, .len = 0 };
+    defer builder.deinit();
+    var pins: std.ArrayList(terminal.Pin) = .empty;
+    defer pins.deinit(alloc);
 
-    const slice = builder.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    // Screen.dumpString's formatter, plus the pin each byte came from.
+    var formatter: terminal.formatter.ScreenFormatter = .init(screen, .{
+        .emit = .plain,
+        .unwrap = false,
+        .trim = false,
+    });
+    formatter.content = .{ .selection = terminal.Selection.init(tl, br, false) };
+    formatter.pin_map = .{ .alloc = alloc, .map = &pins };
+    formatter.format(&builder.writer) catch return .{ .ptr = null, .len = 0 };
+
+    const text = builder.written();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    out.ensureTotalCapacity(alloc, text.len) catch return .{ .ptr = null, .len = 0 };
+    var open = false;
+    for (text, 0..) |byte, i| {
+        const faint = byte != '\n' and i < pins.items.len and blk: {
+            const pin = pins.items[i];
+            break :blk pin.style(pin.rowAndCell().cell).flags.faint;
+        };
+        if (faint != open) {
+            out.append(alloc, if (faint) FAINT_OPEN else FAINT_CLOSE) catch return .{ .ptr = null, .len = 0 };
+            open = faint;
+        }
+        out.append(alloc, byte) catch return .{ .ptr = null, .len = 0 };
+    }
+    if (open) out.append(alloc, FAINT_CLOSE) catch return .{ .ptr = null, .len = 0 };
+
+    const slice = out.toOwnedSlice(alloc) catch return .{ .ptr = null, .len = 0 };
     return .{ .ptr = slice.ptr, .len = slice.len };
 }
 

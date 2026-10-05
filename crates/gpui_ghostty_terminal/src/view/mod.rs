@@ -2321,6 +2321,8 @@ impl TerminalView {
     /// scrolled back reads the same as one they did not, and the read does
     /// not move their viewport. One FFI call that copies every row it returns:
     /// call on demand, never from a render path, and keep `max_rows` bounded.
+    /// Faint runs come bracketed in [`ghostty_vt::FAINT_OPEN`] …
+    /// [`ghostty_vt::FAINT_CLOSE`]; see [`ghostty_vt::Terminal::dump_active_tail`].
     pub fn scrollback_text(&self, max_rows: u32) -> String {
         scrollback_text(&self.session, max_rows)
     }
