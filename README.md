@@ -17,8 +17,8 @@ This repository is a minimal, pinned, and testable embedded terminal stack:
 
 ## Version Pinning
 
-- Ghostty is vendored at `vendor/ghostty` and pinned to tag `v1.2.3`.
-- Zig is pinned to `0.14.1` (required to build the vendored Ghostty core).
+- Ghostty is vendored at `vendor/ghostty` and pinned to tag `v1.3.1`.
+- Zig is pinned to `0.15.2` (required to build the vendored Ghostty core).
 - GPUI is consumed from Zed pinned to commit `6016d0b8c6a22e586158d3b6f810b3cebb136118`.
 
 ## Build Prerequisites
