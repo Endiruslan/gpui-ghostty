@@ -16,6 +16,8 @@ Deliver a maintainable Rust workspace that bootstraps an embedded terminal contr
 
 ## Agent Work (Compacted)
 
+- [x] Preserve UTF-8 offsets when replacing quad-drawn borders for shaping. Verified 107 component tests, clippy, and live mxds split: drag/double-click highlight the key exactly and copy only the key.
+
 - [x] Show an arrow pointer on the alternate screen and restore IBeam on the primary screen; preserve Cmd-hover link pointers. Verified live with cursor screenshots and the terminal component test suite.
 
 - [x] Preserve macOS Cmd line-editing bindings under Kitty, matching Ghostty defaults; covered by mxds app-action/PTY and native keyboard regression checks.

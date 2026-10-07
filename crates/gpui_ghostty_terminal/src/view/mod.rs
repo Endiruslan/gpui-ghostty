@@ -3981,14 +3981,22 @@ pub(crate) fn char_drawn_as_quad(ch: char) -> bool {
 }
 
 /// Replace quad-drawn glyphs (see [`char_drawn_as_quad`]) with spaces for text
-/// shaping. All such chars are single-width, so replacing them with a space
-/// keeps columns and style-run indices aligned. Returns the input borrowed
+/// shaping. EN SPACE is single-width and three UTF-8 bytes, just like every
+/// quad-drawn glyph. Preserve byte offsets as well as columns: hit testing,
+/// selection, links and the cursor share indices with the original VT text.
+/// Returns the input borrowed
 /// when the row has no such glyphs (the common case) to avoid an allocation.
 fn strip_quad_glyphs_for_shaping(line: &str) -> std::borrow::Cow<'_, str> {
     if line.chars().any(char_drawn_as_quad) {
         std::borrow::Cow::Owned(
             line.chars()
-                .map(|ch| if char_drawn_as_quad(ch) { ' ' } else { ch })
+                .map(|ch| {
+                    if char_drawn_as_quad(ch) {
+                        '\u{2002}'
+                    } else {
+                        ch
+                    }
+                })
                 .collect(),
         )
     } else {
@@ -5658,7 +5666,10 @@ mod tests {
         // A table row: borders become spaces, columns preserved, flag kept.
         let row = "\u{1F1EB}\u{1F1F7}France │ 41 │";
         let stripped = strip_quad_glyphs_for_shaping(row);
-        assert_eq!(stripped.as_ref(), "\u{1F1EB}\u{1F1F7}France   41  ");
+        assert_eq!(
+            stripped.as_ref(),
+            "\u{1F1EB}\u{1F1F7}France \u{2002} 41 \u{2002}"
+        );
         assert_eq!(stripped.chars().count(), row.chars().count());
         // No box glyph survives in the shaped text.
         assert!(!stripped.chars().any(|c| char_drawn_as_quad(c)));
@@ -5668,6 +5679,26 @@ mod tests {
             strip_quad_glyphs_for_shaping("plain text"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn quad_shaping_preserves_selection_byte_offsets() {
+        let row = "│ MXDS-TEST-1234-ABCD-5678 │ gifted │ null │";
+        let shaped = strip_quad_glyphs_for_shaping(row);
+        let start = shaped.find("MXDS-").unwrap();
+        let end = start + "MXDS-TEST-1234-ABCD-5678".len();
+        assert_eq!(row.get(start..end), Some("MXDS-TEST-1234-ABCD-5678"));
+        assert_eq!(row.find("gifted"), shaped.find("gifted"));
+        assert_eq!(row.find("null"), shaped.find("null"));
+        for ch in ('\u{2500}'..='\u{259f}').filter(|ch| char_drawn_as_quad(*ch)) {
+            let original = ch.to_string();
+            let replacement = strip_quad_glyphs_for_shaping(&original);
+            assert_eq!(replacement.len(), original.len());
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(replacement.as_ref()),
+                1
+            );
+        }
     }
 
     #[test]
