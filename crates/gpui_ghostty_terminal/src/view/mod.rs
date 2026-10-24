@@ -3559,7 +3559,9 @@ fn paint_terminal_contents(
     // at `bounds.top() - line_height` and get the same shift, so it lands at
     // `bounds.top() - line_height + pixel_offset` — partially revealed from the
     // top edge. The caller clips to the bleed-expanded paint bounds.
-    let dy = prepaint.pixel_offset;
+    // Snapped to a device pixel like the row height, so a scrolled row's
+    // edges stay exact and adjacent rows still tile without a seam.
+    let dy = crate::snap_to_device_pixel(prepaint.pixel_offset, window.scale_factor());
     let translate = |q: &mut PaintQuad| {
         q.bounds.origin.y += dy;
     };
@@ -4579,7 +4581,10 @@ impl Element for TerminalTextElement {
         style.color = hsla_from_rgb(default_fg);
         let rem_size = window.rem_size();
         let font_size = style.font_size.to_pixels(rem_size);
-        let line_height = style.line_height.to_pixels(style.font_size, rem_size);
+        let line_height = crate::device_pixel_line_height(
+            style.line_height.to_pixels(style.font_size, rem_size),
+            window.scale_factor(),
+        );
 
         let run_font = style.font();
         let run_color = style.color;
@@ -5375,7 +5380,10 @@ pub(crate) fn cell_metrics_with_overrides(
 
     let rem_size = window.rem_size();
     let font_size = style.font_size.to_pixels(rem_size);
-    let line_height = style.line_height.to_pixels(style.font_size, rem_size);
+    let line_height = crate::device_pixel_line_height(
+        style.line_height.to_pixels(style.font_size, rem_size),
+        window.scale_factor(),
+    );
 
     let run = style.to_run(1);
     let lines = window
