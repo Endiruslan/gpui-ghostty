@@ -936,6 +936,15 @@ pub struct OpenPathRequest {
     pub line: Option<u32>,
 }
 
+/// Emitted instead of `cx.open_url` when the user Cmd+Shift+clicks a web link
+/// and the host asked for these with [`TerminalView::set_open_links_in_app`]:
+/// the host opens the link itself (mxds: in a browser tab of its own). A plain
+/// Cmd+click still goes to the system browser.
+#[derive(Clone, Debug)]
+pub struct OpenUrlInAppRequest {
+    pub url: String,
+}
+
 pub struct TerminalInput {
     send: Box<TerminalSendFn>,
 }
@@ -997,6 +1006,9 @@ pub struct TerminalView {
     /// Host-injected file-path validator. `None` (default) = path links off;
     /// Cmd+hover/click then behaves exactly as before this feature.
     path_resolver: Option<PathResolver>,
+    /// Whether Cmd+Shift+click on a web link emits [`OpenUrlInAppRequest`]
+    /// instead of opening the system browser. Off by default.
+    open_links_in_app: bool,
     /// Last mouse position seen by `on_mouse_move`, so a bare Cmd press /
     /// release (no motion) can recompute the hover state.
     last_mouse_position: Option<gpui::Point<Pixels>>,
@@ -1211,6 +1223,7 @@ impl TerminalView {
             selection: None,
             hovered_link: None,
             path_resolver: None,
+            open_links_in_app: false,
             last_mouse_position: None,
             last_hover_cell: None,
             marked_text: None,
@@ -1310,6 +1323,7 @@ impl TerminalView {
             selection: None,
             hovered_link: None,
             path_resolver: None,
+            open_links_in_app: false,
             last_mouse_position: None,
             last_hover_cell: None,
             marked_text: None,
@@ -2258,6 +2272,22 @@ impl TerminalView {
         self.path_resolver = resolver;
     }
 
+    /// Make Cmd+Shift+click on a web link emit [`OpenUrlInAppRequest`] for the
+    /// host to open, instead of handing it to the system browser.
+    pub fn set_open_links_in_app(&mut self, on: bool) {
+        self.open_links_in_app = on;
+    }
+
+    /// Where a Cmd+clicked web link goes: the host, for a Cmd+Shift+click it
+    /// asked for, else the system browser.
+    fn open_web_link(&self, url: String, shift: bool, cx: &mut Context<Self>) {
+        if shift && self.open_links_in_app {
+            cx.emit(OpenUrlInAppRequest { url });
+        } else {
+            cx.open_url(&url);
+        }
+    }
+
     /// Install (or clear) the host-injected autosuggest history lookup.
     /// `None` disables ghost-text suggestions entirely and clears any
     /// suggestion currently shown.
@@ -2560,7 +2590,7 @@ impl TerminalView {
                         cx.emit(OpenPathRequest { path, line });
                         return;
                     }
-                    cx.open_url(&link);
+                    self.open_web_link(link, event.modifiers.shift, cx);
                     return;
                 }
 
@@ -2570,7 +2600,7 @@ impl TerminalView {
                     row.saturating_sub(1) as usize,
                     col,
                 ) {
-                    cx.open_url(&url);
+                    self.open_web_link(url, event.modifiers.shift, cx);
                     return;
                 }
 
@@ -2591,7 +2621,7 @@ impl TerminalView {
             if let Some(index) = self.mouse_position_to_viewport_index(event.position, window)
                 && let Some(url) = self.url_at_viewport_index(index)
             {
-                cx.open_url(&url);
+                self.open_web_link(url, event.modifiers.shift, cx);
                 return;
             }
         }
@@ -3382,6 +3412,7 @@ impl TerminalView {
 impl gpui::EventEmitter<ghostty_vt::TerminalEvent> for TerminalView {}
 
 impl gpui::EventEmitter<OpenPathRequest> for TerminalView {}
+impl gpui::EventEmitter<OpenUrlInAppRequest> for TerminalView {}
 
 impl gpui::EventEmitter<SelectionEvent> for TerminalView {}
 
