@@ -5272,7 +5272,7 @@ impl Element for TerminalTextElement {
             // A terminal-wide scene layer with no opaque fill clears to black on
             // translucent macOS windows. Use only a content mask in that mode so
             // skipped default-background pixels reveal the host's root sheet.
-            window.with_content_mask(Some(gpui::ContentMask { bounds: paint_clip }), |window| {
+            window.with_content_mask(Some(gpui::ContentMask::new(paint_clip)), |window| {
                 paint_terminal_contents(bounds, default_bg, bg_alpha, prepaint, window, cx);
             });
         } else {
